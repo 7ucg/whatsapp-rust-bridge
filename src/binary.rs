@@ -1,11 +1,12 @@
 use js_sys::{Array, Object, Uint8Array};
+use compact_str::CompactString;
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::mem;
 use std::rc::Rc;
 use wacore_binary::{
     marshal::{marshal_ref, unmarshal_ref},
-    node::{NodeContentRef, NodeRef, ValueRef},
+    node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef},
     util::unpack,
 };
 use wasm_bindgen::prelude::*;
@@ -64,7 +65,10 @@ pub(crate) fn js_to_node_ref(val: &EncodingNode) -> Result<NodeRef<'static>, JsV
             continue;
         };
 
-        attrs.push((Cow::Owned(key), ValueRef::String(Cow::Owned(value_str))));
+        attrs.push((
+            NodeStr::from(CompactString::from(key.as_str())),
+            ValueRef::String(NodeStr::from(CompactString::from(value_str.as_str()))),
+        ));
     }
 
     let content_js = val.content();
@@ -72,7 +76,7 @@ pub(crate) fn js_to_node_ref(val: &EncodingNode) -> Result<NodeRef<'static>, JsV
     let content = if content_js.is_undefined() {
         Ok(None)
     } else if let Some(string_value) = content_js.as_string() {
-        Ok(Some(NodeContentRef::String(Cow::Owned(string_value))))
+        Ok(Some(NodeContentRef::String(NodeStr::from(CompactString::from(string_value.as_str())))))
     } else if content_js.is_instance_of::<Uint8Array>() {
         let byte_array: Uint8Array = content_js.unchecked_into();
         let len = byte_array.length() as usize;
@@ -88,12 +92,16 @@ pub(crate) fn js_to_node_ref(val: &EncodingNode) -> Result<NodeRef<'static>, JsV
                 js_to_node_ref(&child_node)
             })
             .collect::<Result<Vec<NodeRef<'static>>, _>>()?;
-        Ok(Some(NodeContentRef::Nodes(Box::new(nodes))))
+        Ok(Some(NodeContentRef::Nodes(Box::from(nodes.into_boxed_slice()))))
     } else {
         Err(JsValue::from_str("Invalid content type"))
     };
 
-    Ok(NodeRef::new(Cow::Owned(val.tag()), attrs, content?))
+    Ok(NodeRef::new(
+        NodeStr::from(CompactString::from(val.tag().as_str())),
+        AttrsRef::from_vec(attrs),
+        content?,
+    ))
 }
 
 #[wasm_bindgen(typescript_custom_section)]
@@ -122,14 +130,11 @@ impl InternalBinaryNode {
     }
 
     #[inline]
-    fn convert_attrs(attrs: &[(Cow<'_, str>, ValueRef<'_>)]) -> Attrs {
+    fn convert_attrs(attrs: &[(NodeStr<'_>, ValueRef<'_>)]) -> Attrs {
         let obj = Object::new();
         for (k, v) in attrs.iter() {
-            let js_value = match v.as_str() {
-                Some(s) => JsValue::from_str(s),
-                None => JsValue::from_str(&v.to_string()),
-            };
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(k), &js_value);
+            let js_value = JsValue::from_str(&v.as_str());
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(k.as_ref()), &js_value);
         }
         obj.unchecked_into()
     }
@@ -192,7 +197,7 @@ impl InternalBinaryNode {
             return attrs.clone();
         }
 
-        let attrs = Self::convert_attrs(&self.node_ref().attrs);
+        let attrs = Self::convert_attrs(self.node_ref().attrs.as_slice());
         *cached = Some(attrs.clone());
         attrs
     }
@@ -218,7 +223,7 @@ impl InternalBinaryNode {
                 u8arr.copy_from(bytes_ref);
                 Some(u8arr.unchecked_into())
             }
-            Some(NodeContentRef::String(s)) => Some(JsValue::from_str(s).unchecked_into()),
+            Some(NodeContentRef::String(s)) => Some(JsValue::from_str(s.as_ref()).unchecked_into()),
             Some(NodeContentRef::Nodes(nodes)) => {
                 let arr = Array::new_with_length(nodes.len() as u32);
                 for (i, node_ref) in nodes.iter().enumerate() {

@@ -61,6 +61,52 @@ Public keys: 33 bytes (0x05 prefix + 32 bytes). Private keys: 32 bytes. Signatur
 | Signed pre-key | `generateSignedPreKey(identityKP, keyId)` | `wa_generate_signed_pre_key(idPriv, id, pub, priv, sig, &kid)` | `KeyHelper.generateSignedPreKey(idPriv, keyId)` → 129 bytes |
 | Serialise identity KP | `_serializeIdentityKeyPair(kp)` | — | — |
 
+## JID (TypeScript only)
+
+### Parse / Encode
+| Function | Description |
+|---|---|
+| `parseJid(str)` | → `{ user, server, agent, device }` |
+| `encodeJid(info)` | → canonical JID string |
+
+### Constructors
+| Function | Description |
+|---|---|
+| `jidUser(phone)` | `"123@s.whatsapp.net"` |
+| `jidUserDevice(phone, device)` | with explicit device ID |
+| `jidGroup(id)` | `"id@g.us"` |
+| `jidNewsletter(id)` | `"id@newsletter"` |
+| `jidLid(lid)` | `"lid@lid"` |
+| `jidStatusBroadcast()` | `"status@broadcast"` |
+
+### Type checks
+| Function | Returns |
+|---|---|
+| `isUserJid(str)` | `s.whatsapp.net` |
+| `isLidJid(str)` | `lid` server |
+| `isGroupJid(str)` | `g.us` |
+| `isBroadcastListJid(str)` | broadcast (not status) |
+| `isStatusBroadcastJid(str)` | `status@broadcast` |
+| `isNewsletterJid(str)` | newsletter/channel |
+| `isADJid(str)` | multi-device (device > 0) |
+| `isBotJid(str)` | WhatsApp bot |
+| `isMessengerJid(str)` | Meta Messenger bridge |
+| `isHostedJid(str)` | Cloud API / hosted device |
+| `areSameUser(a, b)` | same user ignoring device |
+
+### Accessors
+| Function | Description |
+|---|---|
+| `jidGetUser(str)` | user / phone part |
+| `jidGetServer(str)` | server domain |
+| `jidGetDevice(str)` | device ID |
+| `jidNormalizedUser(str)` | strip device: `"123:5@s.whatsapp.net"` → `"123@s.whatsapp.net"` |
+| `jidWithDevice(str, device)` | return JID with new device ID |
+| `jidUserBase(str)` | strip `:device` from user part |
+
+### Server constants (functions)
+`jidServerUser()` · `jidServerGroup()` · `jidServerBroadcast()` · `jidServerLid()` · `jidServerNewsletter()` · `jidServerMessenger()` · `jidServerBot()` · `jidServerHosted()`
+
 ## Binary protocol
 
 | Function | TypeScript | C | Java |
@@ -71,6 +117,8 @@ Public keys: 33 bytes (0x05 prefix + 32 bytes). Private keys: 32 bytes. Signatur
 C and Java exchange JSON. TypeScript uses typed `BinaryNode` objects. See [usage-c.md](usage-c.md#binary-nodes) for the JSON schema.
 
 ## Noise Session (TypeScript only)
+
+### Noise XX (standard)
 
 | Method | Description |
 |---|---|
@@ -88,6 +136,24 @@ C and Java exchange JSON. TypeScript uses typed `BinaryNode` objects. See [usage
 | `.isFinished` | Whether handshake is complete |
 | `.bufferedBytes` | Bytes buffered in frame decoder |
 | `.clearBuffer()` | Clear frame decoder buffer |
+
+### Noise IK (fast reconnect)
+
+```ts
+new NoiseIkSession(staticPub, staticPriv, serverStaticPub, payload, prologue)
+.buildClientHello()   → Uint8Array   // send this
+.readServerHello(bytes, routingInfo?)
+  // → { success: true,  session: NoiseSession }
+  // → { success: false, fallback: NoiseXxFallbackSession }
+```
+
+### Noise XXfallback (IK rejected)
+
+```ts
+// returned automatically from NoiseIkSession.readServerHello
+fallback.buildClientFinish()   → Uint8Array   // send this
+fallback.finish()              → NoiseSession  // ready to use
+```
 
 ## Signal Protocol (TypeScript only)
 
@@ -125,25 +191,34 @@ new GroupCipher(storage: SignalStorage, groupId: string, sender: ProtocolAddress
 
 | Function | Description |
 |---|---|
-| `expandAppStateKeys(keyData)` | Expand 32-byte key into 5 sub-keys |
+| `expandAppStateKeys(keyData)` | Expand 32-byte key → 5 sub-keys (`ExpandedAppStateKeys`) |
+| `decodeAppStateRecord(recordBytes, keys, keyId, op, validateMacs)` | Decrypt one record → `DecodedMutation` |
+| `encodeAppStateMutation(op, indexBytes, actionBytes, keys, keyId, iv)` | Encrypt mutation → `EncodedMutation` |
+| `collectAppStateKeyIds(snapshotBytes, patchesBytes[])` | Extract key IDs needed → `Uint8Array[]` |
 | `generateIndexMac(indexBytes, key)` | HMAC for patch index |
 | `generateContentMac(op, data, keyId, key)` | HMAC for patch content |
 | `generateSnapshotMac(ltHash, version, name, key)` | Snapshot integrity MAC |
 | `generatePatchMac(snapMac, valueMacs, version, name, key)` | Patch integrity MAC |
-| `new LTHashAntiTampering()` | LTHash tamper detection |
+| `new LTHashAntiTampering()` | LTHash tamper detection singleton |
 | `.subtractThenAdd(base, subtract[], add[])` | Update LTHash state |
-| `new LTHashState()` | Mutable LTHash state |
+| `new LTHashState()` | Mutable versioned LTHash state |
+| `.setValueMac(indexMacB64, valueMac)` | Add/update entry |
+| `.getValueMac(indexMacB64)` | Lookup entry |
+| `.deleteValueMac(indexMacB64)` | Remove entry |
+| `.hasValueMac(indexMacB64)` | Check entry existence |
+| `.hash` / `.version` | Current hash bytes / patch version |
+| `.clone()` | Deep clone state |
 
 ## Misc (TypeScript only)
 
 | Function | Description |
 |---|---|
-| `getWAConnHeader()` | 4-byte WebSocket connection header |
-| `getEnabledFeatures()` | `{ audio, image, sticker }` feature flags |
-| `getPreKeyMessageIdentityKey(ct)` | Extract identity key from PreKey message |
-| `setLogger(logger)` / `updateLogger(logger)` | Set/update Rust-side logger |
-| `hasLogger()` | Whether a logger is set |
-| `logMessage(level, msg)` | Emit a log message through the Rust logger |
+| `getWAConnHeader()` | 4-byte WebSocket connection header (`WA\x04\x00`) |
+| `getEnabledFeatures()` | `{ audio, image, sticker }` — runtime feature flags |
+| `getPreKeyMessageIdentityKey(ct)` | Extract sender identity key from PreKeySignalMessage |
+| `setLogger(logger)` / `updateLogger(logger)` | Set/replace Rust-side logger |
+| `hasLogger()` | Whether a logger is currently set |
+| `logMessage(level, msg)` | Emit a log entry through the Rust logger |
 
 ## C error codes
 

@@ -1,4 +1,5 @@
 pub mod appstate;
+pub mod jid;
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod binary;

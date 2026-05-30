@@ -1,0 +1,31 @@
+[package]
+name = "wacore-appstate"
+version = "0.6.0"
+edition = "2024"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+license = "MIT"
+repository = "https://github.com/jlucaso1/whatsapp-rust"
+description = "Appstate for WhatsApp protocol"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["simd"]
+simd = ["wacore-binary/simd"]
+
+[dependencies]
+anyhow           = { version = "1.0", default-features = false }
+bytemuck         = { version = "1.22", default-features = false }
+hex              = { version = "0.4", default-features = false, features = ["alloc"] }
+hkdf             = { version = "0.13.0", default-features = false }
+log              = "0.4"
+prost            = { version = "0.14.3", default-features = false, features = ["std"] }
+serde            = { version = "1.0", features = ["derive", "rc"] }
+serde-big-array  = "0.5"
+serde_json       = { version = "1.0", default-features = false, features = ["alloc"] }
+sha2             = { version = "0.11.0", default-features = false }
+thiserror        = "2.0.17"
+wacore-binary    = { path = "../binary", default-features = false, features = ["serde"] }
+wacore-libsignal = { path = "../libsignal" }
+waproto          = { path = "../../waproto" }

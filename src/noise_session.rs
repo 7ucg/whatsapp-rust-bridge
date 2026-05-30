@@ -1,8 +1,10 @@
 use js_sys::Uint8Array;
-use wacore_binary::consts::NOISE_START_PATTERN as NOISE_MODE;
+use wacore_binary::consts::NOISE_PATTERN_XX as NOISE_MODE;
 use wacore_binary::marshal::marshal_ref;
 use wacore_noise::framing::{FrameDecoder, encode_frame_into};
+use wacore_noise::{IkFallbackInputs, IkHandshakeState, IkServerHelloOutcome, XxFallbackHandshakeState};
 use wacore_noise::{NoiseCipher, NoiseHandshake, build_handshake_header};
+use wacore_libsignal::core::curve::KeyPair as CoreKeyPair;
 use wasm_bindgen::prelude::*;
 
 use crate::binary::{EncodingNode, decode_node, js_to_node_ref};
@@ -87,8 +89,10 @@ impl NoiseSession {
                 .ok_or_else(|| JsValue::from_str("Decryption cipher not initialized"))?;
             let counter = self.read_counter;
             self.read_counter += 1;
+            let mut buf = ciphertext.to_vec();
             cipher
-                .decrypt_with_counter(counter, ciphertext)
+                .decrypt_in_place_with_counter(counter, &mut buf)
+                .map(|_| buf)
                 .map_err(|e| JsValue::from_str(&format!("Decryption failed: {}", e)))
         } else {
             self.handshake
@@ -288,5 +292,183 @@ impl NoiseSession {
         let result = Uint8Array::new_with_length(encrypted_key.len() as u32);
         result.copy_from(&encrypted_key);
         Ok(result)
+    }
+}
+
+// ── NoiseIkSession ────────────────────────────────────────────────────────────
+
+/// Noise_IK_25519_AESGCM_SHA256 handshake — faster reconnect using a cached
+/// server static key. Falls back to XX automatically if the server rejects.
+///
+/// Usage:
+///   const ik = new NoiseIkSession(staticPub32, staticPriv32, serverStaticPub32, payload, prologue);
+///   const clientHello = ik.buildClientHello();
+///   // send clientHello framed over the wire, then:
+///   const result = ik.readServerHello(serverHelloBytes);
+///   if (result.fallback) {
+///     // use result.fallback (NoiseSession) to continue as XX fallback
+///   } else {
+///     // IK succeeded — use result.writeCipher / readCipher
+///   }
+#[wasm_bindgen]
+pub struct NoiseIkSession {
+    state: Option<IkHandshakeState>,
+    prologue: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl NoiseIkSession {
+    /// Create a new IK session.
+    /// @param staticPub      Client's static public key (33 bytes, 0x05 prefix)
+    /// @param staticPriv     Client's static private key (32 bytes)
+    /// @param serverStaticPub Server's static public key (32 bytes, no prefix)
+    /// @param clientPayload  The payload to send 0-RTT (e.g. client hello proto)
+    /// @param prologue       Noise prologue bytes (WA header)
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        static_pub: &[u8],
+        static_priv: &[u8],
+        server_static_pub: &[u8],
+        client_payload: Vec<u8>,
+        prologue: &[u8],
+    ) -> Result<NoiseIkSession, JsValue> {
+        let pub_key = wacore_libsignal::core::curve::PublicKey::deserialize(static_pub)
+            .map_err(|e| JsValue::from_str(&format!("Invalid static pub key: {}", e)))?;
+        let priv_key = wacore_libsignal::core::curve::PrivateKey::deserialize(static_priv)
+            .map_err(|e| JsValue::from_str(&format!("Invalid static priv key: {}", e)))?;
+        let kp = CoreKeyPair { public_key: pub_key, private_key: priv_key };
+
+        let server_pub: [u8; 32] = server_static_pub
+            .try_into()
+            .map_err(|_| JsValue::from_str("Server static pub key must be 32 bytes"))?;
+
+        let state = IkHandshakeState::new(kp, server_pub, client_payload, prologue)
+            .map_err(|e| JsValue::from_str(&format!("IkHandshakeState::new failed: {}", e)))?;
+
+        Ok(NoiseIkSession { state: Some(state), prologue: prologue.to_vec() })
+    }
+
+    /// Build the IK ClientHello bytes (framed, ready to send).
+    #[wasm_bindgen(js_name = buildClientHello)]
+    pub fn build_client_hello(&mut self) -> Result<Uint8Array, JsValue> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("IK session already consumed"))?;
+        let bytes = state
+            .build_client_hello()
+            .map_err(|e| JsValue::from_str(&format!("buildClientHello failed: {}", e)))?;
+        let arr = Uint8Array::new_with_length(bytes.len() as u32);
+        arr.copy_from(&bytes);
+        Ok(arr)
+    }
+
+    /// Process the server's response.
+    /// Returns a JS object: `{ success: true, writeCipher, readCipher }` on IK success,
+    /// or `{ success: false, fallbackSession: NoiseSession }` when the server requests XX fallback.
+    #[wasm_bindgen(js_name = readServerHello)]
+    pub fn read_server_hello(
+        &mut self,
+        response_bytes: &[u8],
+        routing_info: Option<Vec<u8>>,
+    ) -> Result<JsValue, JsValue> {
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| JsValue::from_str("IK session already consumed"))?;
+
+        match state
+            .read_server_hello(response_bytes)
+            .map_err(|e| JsValue::from_str(&format!("readServerHello failed: {}", e)))?
+        {
+            IkServerHelloOutcome::Continue(outcome) => {
+                // IK succeeded — return the two ciphers as a plain JS object
+                let obj = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(&obj, &"success".into(), &JsValue::TRUE);
+
+                // We can't expose NoiseCipher directly — store them in a completed NoiseSession
+                // by constructing one with is_finished = true
+                let session = NoiseSession::from_ciphers(outcome.write_cipher, outcome.read_cipher, routing_info);
+                let _ = js_sys::Reflect::set(&obj, &"session".into(), &JsValue::from(session));
+                Ok(obj.into())
+            }
+            IkServerHelloOutcome::Fallback(fallback_inputs) => {
+                let obj = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(&obj, &"success".into(), &JsValue::FALSE);
+                let fallback = NoiseXxFallbackSession::new(*fallback_inputs, &self.prologue, routing_info)?;
+                let _ = js_sys::Reflect::set(&obj, &"fallback".into(), &JsValue::from(fallback));
+                Ok(obj.into())
+            }
+        }
+    }
+}
+
+// ── NoiseSession::from_ciphers (internal constructor) ────────────────────────
+
+impl NoiseSession {
+    fn from_ciphers(
+        enc_cipher: NoiseCipher,
+        dec_cipher: NoiseCipher,
+        routing_info: Option<Vec<u8>>,
+    ) -> NoiseSession {
+        let (intro_header, _) = build_handshake_header(routing_info.as_deref());
+        NoiseSession {
+            handshake: None,
+            enc_cipher: Some(enc_cipher),
+            dec_cipher: Some(dec_cipher),
+            read_counter: 0,
+            write_counter: 0,
+            is_finished: true,
+            intro_header: Some(intro_header),
+            frame_decoder: FrameDecoder::new(),
+            encode_scratch: Vec::with_capacity(4096),
+        }
+    }
+}
+
+// ── NoiseXxFallbackSession ────────────────────────────────────────────────────
+
+/// Noise XXfallback session — used when an IK attempt is rejected by the server.
+/// Reuses the ephemeral already on the wire to avoid an extra round-trip.
+#[wasm_bindgen]
+pub struct NoiseXxFallbackSession {
+    state: Option<XxFallbackHandshakeState>,
+    routing_info: Option<Vec<u8>>,
+}
+
+#[wasm_bindgen]
+impl NoiseXxFallbackSession {
+    fn new(inputs: IkFallbackInputs, prologue: &[u8], routing_info: Option<Vec<u8>>) -> Result<Self, JsValue> {
+        let state = XxFallbackHandshakeState::from_ik_failure(inputs, prologue)
+            .map_err(|e| JsValue::from_str(&format!("XxFallback init failed: {}", e)))?;
+        Ok(Self { state: Some(state), routing_info })
+    }
+
+    /// Build the client finish message (send this over the wire).
+    #[wasm_bindgen(js_name = buildClientFinish)]
+    pub fn build_client_finish(&mut self) -> Result<Uint8Array, JsValue> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("XxFallback already consumed"))?;
+        let bytes = state
+            .build_client_finish()
+            .map_err(|e| JsValue::from_str(&format!("buildClientFinish failed: {}", e)))?;
+        let arr = Uint8Array::new_with_length(bytes.len() as u32);
+        arr.copy_from(&bytes);
+        Ok(arr)
+    }
+
+    /// Finalize the handshake — returns a ready `NoiseSession`.
+    #[wasm_bindgen(js_name = finish)]
+    pub fn finish(&mut self) -> Result<NoiseSession, JsValue> {
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| JsValue::from_str("XxFallback already consumed"))?;
+        let outcome = state
+            .finish()
+            .map_err(|e| JsValue::from_str(&format!("XxFallback finish failed: {}", e)))?;
+        Ok(NoiseSession::from_ciphers(outcome.write_cipher, outcome.read_cipher, self.routing_info.take()))
     }
 }

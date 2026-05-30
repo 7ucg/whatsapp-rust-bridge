@@ -3,17 +3,18 @@
 ## Overview
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     Rust core  (src/)                        │
-│                                                              │
-│  crypto.rs   curve.rs   binary.rs   noise_session.rs         │
-│  key_helper.rs   session_builder/cipher.rs   appstate.rs     │
-│  group_cipher.rs   storage_adapter.rs   logger.rs            │
-│                                                              │
-│  Dependencies (git — jlucaso1/whatsapp-rust)                 │
-│    wacore-binary   wacore-libsignal   wacore-noise           │
-│    wacore-appstate   waproto                                  │
-└──────────────┬─────────────────┬───────────────┬────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        Rust workspace                            │
+│                                                                  │
+│  src/          WASM bindings (wasm_bindgen) — public JS/TS API  │
+│                crypto, curve, binary, noise, signal, jid, ...   │
+│                                                                  │
+│  internal/     Protocol crates (self-contained, no git deps)    │
+│    wacore/appstate  wacore/binary  wacore/libsignal              │
+│    wacore/noise     wacore/derive  waproto                       │
+│                                                                  │
+│  native/       C-ABI + JNI bridge                               │
+└──────────────┬─────────────────┬───────────────┬────────────────┘
                │                 │               │
   wasm32-unknown-unknown   x86_64-windows   aarch64-linux (etc.)
       wasm_bindgen           cdylib            cdylib + jni
@@ -21,45 +22,62 @@
        ┌───────▼────────┐  ┌─────▼──────┐ ┌─────▼──────────┐
        │  pkg/  dist/   │  │  .dll/.so  │ │  .dll/.so      │
        │  JS + WASM     │  │  + .h      │ │  Java_* symbols│
-       │  TypeScript     │  │            │ │  .java wrappers│
+       │  TypeScript    │  │            │ │  .java wrappers│
        └────────────────┘  └────────────┘ └────────────────┘
 ```
 
 ## Crate layout
 
-### Root crate (`Cargo.toml`)
+### Root package (`src/` + `Cargo.toml`)
 
-Compiled to `wasm32-unknown-unknown` with `wasm_bindgen`. Every public function is annotated with `#[wasm_bindgen]` or `#[wasm_bindgen(js_name = camelCase)]`.
-
-Key source files:
+Compiled to `wasm32-unknown-unknown` with `wasm_bindgen`. Every public function is annotated with `#[wasm_bindgen]`.
 
 | File | Responsibility |
 |---|---|
 | `src/lib.rs` | Re-exports, `getWAConnHeader`, `getEnabledFeatures` |
 | `src/crypto.rs` | AES-GCM/CBC/CTR, HMAC-SHA256, HKDF, SHA-256, MD5 |
 | `src/curve.rs` | Curve25519 keygen, DH, sign, verify |
+| `src/jid.rs` | JID parse/encode/construct/inspect (full API) |
 | `src/key_helper.rs` | Pre-keys, signed pre-keys, registration ID |
 | `src/binary.rs` | WhatsApp binary protocol encode/decode (`InternalBinaryNode`) |
-| `src/noise_session.rs` | Noise XX handshake + framing |
+| `src/noise_session.rs` | Noise XX, IK, XXfallback handshake + framing |
 | `src/session_builder.rs` | Signal session establishment |
 | `src/session_cipher.rs` | Signal message encrypt/decrypt |
 | `src/group_cipher.rs` | Group messaging (sender-key) |
-| `src/appstate.rs` | App-state sync (LTHash, patch/snapshot MACs) |
-| `src/storage_adapter.rs` | JS-side Signal storage adapter |
+| `src/appstate.rs` | App-state sync: expand keys, encode/decode records, LTHash, MACs |
+| `src/storage_adapter.rs` | JS-side Signal storage bridge (all traits incl. `sender_key_lock`) |
+| `src/protocol_address.rs` | `ProtocolAddress` |
+| `src/sender_key_name.rs` | `SenderKeyName` |
+| `src/session_record.rs` | `SessionRecord` |
+| `src/group_types.rs` | `SenderKeyRecord`, `SenderKeyDistributionMessage` |
 | `src/logger.rs` | Bridged logger |
+| `src/audio.rs` | Waveform + duration (feature = `audio`) |
+| `src/image_utils.rs` | Thumbnails (feature = `image`) |
+| `src/sticker_metadata.rs` | WebP EXIF (feature = `sticker`) |
 
-### Native crate (`native/Cargo.toml`)
+### Internal crates (`internal/`)
 
-Compiled to `cdylib` for the host platform (or a cross-target). No `wasm_bindgen` — pure C ABI.
+Self-contained protocol implementations — no external git dependencies.
+
+| Crate | Responsibility |
+|---|---|
+| `wacore-binary` | WhatsApp binary protocol, JID types, constants, build-time token maps |
+| `wacore-libsignal` | Signal protocol: sessions, pre-keys, group cipher, ratchet, crypto primitives |
+| `wacore-noise` | Noise XX / IK / XXfallback handshake, frame encoder/decoder, edge routing |
+| `wacore-appstate` | App-state sync: key expansion, LTHash, patch/snapshot encode+decode+validate |
+| `wacore-derive` | Internal proc-macro helpers |
+| `waproto` | Protobuf definitions (WhatsApp Version 2.3000.1040457520) |
+
+### Native crate (`native/`)
+
+Compiled to `cdylib` for the host platform or any cross-target.
 
 | Directory | Responsibility |
 |---|---|
-| `native/src/ffi/` | `#[unsafe(no_mangle)] extern "C"` exports (`wa_*`) |
-| `native/src/jni_bridge/` | `extern "system"` JNI exports (`Java_*`) |
+| `native/src/ffi/` | `extern "C"` exports (`wa_*`) — C ABI |
+| `native/src/jni_bridge/` | `extern "system"` JNI exports (`Java_*`) — gated by `--features jni` |
 | `native/include/` | `whatsapp_bridge.h` — C header |
 | `native/java/` | Java wrapper classes + `NativeLoader` |
-
-The JNI build is gated behind the `jni` feature flag in `native/Cargo.toml`.
 
 ---
 
@@ -67,93 +85,56 @@ The JNI build is gated behind the `jni` feature flag in `native/Cargo.toml`.
 
 ### Initialization
 
-`dist/index.js` (produced by `ts/index.ts`) embeds the WASM bytes as a base64 string via a build-time macro in `dist/macro.js`. On `require()` / `import`, the WASM is decoded and instantiated synchronously with `initSync`. No async init step is needed by consumers.
-
-```
-require("whatsapp-rust-bridge-baron")
-  └─ dist/index.js
-       ├─ macro.js          base64-encoded .wasm bytes
-       └─ pkg/whatsapp_rust_bridge.js   wasm-bindgen glue
-            └─ pkg/whatsapp_rust_bridge_bg.wasm
-```
+`dist/index.js` embeds the WASM bytes as base64 at build time via `dist/macro.js`. On `require()` / `import`, `initSync` is called automatically — no async init step needed by consumers.
 
 ### Zero-copy binary decoding
 
-`InternalBinaryNode` (Rust) keeps a reference-counted `Rc<[u8]>` owner of the unpacked wire bytes. Child nodes are `NodeRef<'static>` views into that buffer created via `unsafe mem::transmute`. This avoids cloning the payload on every attribute / content access.
-
-JS getters are lazily cached in `UnsafeCell<Option<...>>` fields — safe because WASM is single-threaded.
+`InternalBinaryNode` keeps a reference-counted `Rc<[u8]>` owner. Child nodes are `NodeRef<'static>` views via `unsafe mem::transmute`. Getters are lazily cached in `UnsafeCell` (safe — WASM is single-threaded).
 
 ---
 
-## Native / C layer
+## Proto regeneration
 
-### Memory model
-
-All C functions write into caller-provided output buffers. The convention is:
-
-```c
-int32_t wa_foo(
-    const uint8_t* in,  size_t in_len,
-    uint8_t*       out, size_t* out_len   // [in] capacity, [out] bytes written
-);
+```powershell
+cargo build -p waproto --features generate
 ```
 
-`WA_ERR_OUTPUT_SMALL` is returned when `*out_len < required`. The required size is written into `*out_len` so callers can retry with a correctly-sized buffer.
-
-No heap allocations are returned to the caller. All output lives in the caller's buffer.
-
-### JNI layer
-
-JNI exports mirror the C exports 1:1 but use JNI types (`jbyteArray`, `jint`, etc.). Multi-value returns (key pair, signed pre-key) are packed into a single `byte[]`:
-
-| Return | Layout |
-|---|---|
-| `generateKeyPair()` | `[33 pubKey \| 32 privKey]` = 65 bytes |
-| `generatePreKey()` | `[33 pubKey \| 32 privKey]` = 65 bytes |
-| `generateSignedPreKey()` | `[33 pubKey \| 32 privKey \| 64 sig]` = 129 bytes |
-
-Helper methods (`pubKeyFrom`, `privKeyFrom`, `signatureFrom`) extract the fields by offset.
-
----
-
-## Dependency graph
-
-```
-whatsapp-rust-bridge (WASM)
-├── wacore-binary      binary protocol encode/decode
-├── wacore-libsignal   Signal protocol (curve, sessions)
-├── wacore-noise       Noise XX handshake
-├── wacore-appstate    app-state sync
-├── waproto            protobuf types
-├── aes / aes-gcm / cbc / ctr / hkdf / hmac / sha2 / md5
-├── rand / curve25519-dalek
-├── wasm-bindgen / js-sys / tsify-next
-└── serde / serde_bytes / serde_json
-
-whatsapp-native-bridge (native)
-├── wacore-binary / wacore-libsignal / wacore-appstate
-├── aes / aes-gcm / cbc / ctr / hkdf / hmac / sha2 / md5
-├── rand / rand_core / curve25519-dalek
-├── base64 / compact_str / serde / serde_json
-└── jni  (optional — feature = "jni")
-```
+- Requires `protoc-bin-vendored` (bundled via Cargo)
+- Proto uses `syntax = "proto2"` — WhatsApp enums don't start at 0 (proto3 rejects this)
+- `build.rs` renames the generated `proto.rs` → `whatsapp.rs`
+- Field attribute paths use `.proto.` prefix (matches `package proto;` in the `.proto` file)
 
 ---
 
 ## Build pipeline
 
 ```
-wasm-pack build
-  └─ cargo build --target wasm32-unknown-unknown --release
-       └─ produces pkg/*.wasm + pkg/*.js + pkg/*.d.ts
+.\build-all.ps1           # all three targets
+  -SkipWasm               # C + JNI only
+  -SkipC -SkipJni         # WASM/TS only
+  -Target <triple>        # cross-compile
+  -Debug                  # debug profile for native
 
-npm run build:ts
-  └─ tsc ts/index.ts → dist/index.js + dist/*.d.ts
-
-cargo build --release --target <host>
-  └─ produces native/target/<triple>/release/whatsapp_bridge.{dll,so,dylib}
-
-cargo build --release --target <host> --features jni
-  └─ produces the same library with additional Java_* symbols
-     build-all.ps1 copies it to release-jni/ to avoid overwriting the C build
+wasm-pack build → pkg/    wasm + JS glue
+tsc → dist/               TypeScript
+cargo build → dist-native/c/    C library
+cargo build --features jni → dist-native/jni/   JNI library
 ```
+
+---
+
+## Dependency graph
+
+```
+waproto ◄─────────────────────────────────────────┐
+   ▲                                               │
+   │                                               │
+wacore-binary ──► wacore-appstate                  │
+   │                    ▲                          │
+   │                    │                          │
+   └──► wacore-noise ───┘                          │
+              │                                    │
+              └──► wacore-libsignal ───────────────┘
+```
+
+All internal crates are `wasm32`-only dependencies of `wacore-noise`; the root crate and `wacore-libsignal` are usable on both native and wasm32.

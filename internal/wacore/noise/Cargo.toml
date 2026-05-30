@@ -1,0 +1,35 @@
+[package]
+name = "wacore-noise"
+version = "0.6.0"
+edition = "2024"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+license = "MIT"
+repository = "https://github.com/jlucaso1/whatsapp-rust"
+description = "Noise Protocol implementation for WhatsApp with AES-256-GCM"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+test-util = []
+danger-skip-cert-chain-verify = []
+
+[dependencies]
+anyhow           = { version = "1.0", default-features = false }
+bytes            = { version = "1.5", default-features = false }
+hkdf             = { version = "0.13.0", default-features = false }
+log              = "0.4"
+prost            = { version = "0.14.3", default-features = false, features = ["std"] }
+rand             = { version = "0.10", features = ["thread_rng"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+sha2             = { version = "0.11.0", default-features = false }
+thiserror        = "2.0.17"
+wacore-binary    = { path = "../binary" }
+wacore-libsignal = { path = "../libsignal" }
+waproto          = { path = "../../waproto" }
+
+[dev-dependencies]
+prost            = { version = "0.14.3", default-features = false, features = ["std"] }
+waproto          = { path = "../../waproto" }

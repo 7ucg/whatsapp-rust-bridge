@@ -1,19 +1,21 @@
 use aes::Aes256;
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
+    KeyInit,
+    aead::{Aead, Payload},
     Aes256Gcm, Nonce,
 };
 use cbc::{
-    cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7},
     Decryptor as CbcDecryptor,
     Encryptor as CbcEncryptor,
+    cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7},
 };
 use ctr::{Ctr128BE, cipher::StreamCipher};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use hmac::KeyInit as HmacKeyInit;
 use js_sys::Uint8Array;
 use md5::Md5;
-use rand::{TryRngCore, rngs::OsRng};
+use rand_core::{OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tsify_next::Tsify;
@@ -56,7 +58,7 @@ pub fn sha256(buffer: &[u8]) -> Uint8Array {
 
 #[wasm_bindgen(js_name = hmacSign)]
 pub fn hmac_sign(buffer: &[u8], key: &[u8]) -> Result<Uint8Array, JsValue> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key)
         .map_err(|_| JsValue::from_str("Invalid HMAC key length"))?;
     mac.update(buffer);
     Ok(to_uint8array(&mac.finalize().into_bytes()))
@@ -131,7 +133,8 @@ pub fn aes_encrypt_gcm(
     }
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let nonce = Nonce::from_slice(iv);
+    let nonce_arr = Nonce::try_from(iv).map_err(|_| JsValue::from_str("AES-GCM IV must be 12 bytes"))?;
+    let nonce = &nonce_arr;
     let payload = Payload {
         msg: plaintext,
         aad: additional_data,
@@ -161,7 +164,8 @@ pub fn aes_decrypt_gcm(
     }
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let nonce = Nonce::from_slice(iv);
+    let nonce_arr = Nonce::try_from(iv).map_err(|_| JsValue::from_str("AES-GCM IV must be 12 bytes"))?;
+    let nonce = &nonce_arr;
     let payload = Payload {
         msg: ciphertext_with_tag,
         aad: additional_data,
@@ -200,7 +204,7 @@ fn aes_decrypt_cbc_iv(buffer: &[u8], key: &[u8], iv: &[u8]) -> Result<Uint8Array
     let decryptor = Aes256CbcDec::new_from_slices(key, iv)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     let plaintext = decryptor
-        .decrypt_padded_vec_mut::<Pkcs7>(buffer)
+        .decrypt_padded_vec::<Pkcs7>(buffer)
         .map_err(|_| JsValue::from_str("AES-CBC decryption failed (bad padding?)"))?;
     Ok(to_uint8array(&plaintext))
 }
@@ -217,7 +221,7 @@ pub fn aes_encrypt(buffer: &[u8], key: &[u8]) -> Result<Uint8Array, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     let ciphertext = Aes256CbcEnc::new_from_slices(key, &iv)
         .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .encrypt_padded_vec_mut::<Pkcs7>(buffer);
+        .encrypt_padded_vec::<Pkcs7>(buffer);
     let mut result = Vec::with_capacity(16 + ciphertext.len());
     result.extend_from_slice(&iv);
     result.extend_from_slice(&ciphertext);
@@ -235,7 +239,7 @@ pub fn aes_encrypt_with_iv(buffer: &[u8], key: &[u8], iv: &[u8]) -> Result<Uint8
     }
     let ciphertext = Aes256CbcEnc::new_from_slices(key, iv)
         .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .encrypt_padded_vec_mut::<Pkcs7>(buffer);
+        .encrypt_padded_vec::<Pkcs7>(buffer);
     Ok(to_uint8array(&ciphertext))
 }
 

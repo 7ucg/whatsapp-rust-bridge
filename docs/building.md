@@ -10,8 +10,8 @@
 | cbindgen *(optional)* | Regenerate C header | `cargo install cbindgen` |
 | cargo-ndk *(optional)* | Android cross-compile | `cargo install cargo-ndk` |
 
-The `wasm32-unknown-unknown` target is installed automatically by wasm-pack.  
-The host native target (`x86_64-pc-windows-msvc`, etc.) must be installed:
+The `wasm32-unknown-unknown` target is installed automatically by wasm-pack.
+The host native target must be installed:
 
 ```powershell
 rustup target add x86_64-pc-windows-msvc   # Windows
@@ -53,7 +53,7 @@ cd native
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-Output: `native/target/<triple>/release/whatsapp_bridge.dll` (or `.so` / `.dylib`)
+Output: `dist-native/c/whatsapp_bridge.dll` (or `.so` / `.dylib`)
 
 ### Java / JNI
 
@@ -62,36 +62,41 @@ cd native
 cargo build --release --target x86_64-pc-windows-msvc --features jni
 ```
 
-The JNI build produces the same `.dll`/`.so` but with `Java_com_whatsapp_bridge_*` symbols.  
-The build script copies it to `native/target/<triple>/release-jni/` to avoid overwriting the C-only binary.
+Output: `dist-native/jni/whatsapp_bridge.dll` + `dist-native/jni/java/...`
 
-### Regenerate C header (optional)
+## Proto regeneration
+
+When `internal/waproto/src/whatsapp.proto` is updated:
 
 ```powershell
-cbindgen --config native/cbindgen.toml --crate whatsapp-native-bridge --output native/include/whatsapp_bridge.h
+cargo build -p waproto --features generate
 ```
 
-The header is already committed and kept in sync manually.
+- Uses `protoc-bin-vendored` — no separate protoc install needed
+- `build.rs` renames `proto.rs` → `whatsapp.rs` automatically
+- Proto syntax is `proto2` (WhatsApp enums don't start at 0)
+- After regeneration, check `internal/wacore/libsignal/src/` for breaking field type changes
 
 ## Cross-compilation targets
 
-| Platform | Target triple | Notes |
-|---|---|---|
-| Windows x64 | `x86_64-pc-windows-msvc` | default on Windows |
-| Windows arm64 | `aarch64-pc-windows-msvc` | |
-| Linux x64 | `x86_64-unknown-linux-gnu` | |
-| Linux arm64 | `aarch64-unknown-linux-gnu` | needs `gcc-aarch64-linux-gnu` |
-| macOS x64 | `x86_64-apple-darwin` | |
-| macOS arm64 | `aarch64-apple-darwin` | default on Apple Silicon |
-| Android arm64 | `aarch64-linux-android` | needs NDK + cargo-ndk |
-| Android x86_64 | `x86_64-linux-android` | emulator / x86 device |
+| Platform | Target triple |
+|---|---|
+| Windows x64 | `x86_64-pc-windows-msvc` |
+| Windows arm64 | `aarch64-pc-windows-msvc` |
+| Linux x64 | `x86_64-unknown-linux-gnu` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` |
+| macOS x64 | `x86_64-apple-darwin` |
+| macOS arm64 | `aarch64-apple-darwin` |
+| Android arm64 | `aarch64-linux-android` (needs NDK + cargo-ndk) |
+| Android x86_64 | `x86_64-linux-android` |
 
-### Android example (cargo-ndk)
+### Android (cargo-ndk)
 
 ```bash
-# Install NDK via Android Studio or sdkmanager
 export ANDROID_NDK_HOME=/path/to/ndk
-cargo ndk -t arm64-v8a -t x86_64 -o ./android/jniLibs build --release --features jni --manifest-path native/Cargo.toml
+cargo ndk -t arm64-v8a -t x86_64 -o ./android/app/src/main/jniLibs \
+  build --release --features jni \
+  --manifest-path native/Cargo.toml
 ```
 
 ## Tests
@@ -107,6 +112,35 @@ cargo test --target x86_64-pc-windows-msvc
 
 ## Benchmarks
 
+The project uses [`iai-callgrind`](https://github.com/iai-callgrind/iai-callgrind) for instruction-count benchmarks — **Linux only** (requires Valgrind/Callgrind).
+
+```bash
+# Linux only
+cargo bench -p wacore-binary
+cargo bench -p wacore-libsignal
+```
+
+On Windows, run the Bun/Mitata benchmarks instead:
+
 ```powershell
 npm run bench
 ```
+
+To run `iai-callgrind` on Windows, install WSL and Valgrind inside it:
+
+```powershell
+wsl --install
+# then inside WSL:
+sudo apt install valgrind
+cargo install iai-callgrind-runner
+cargo bench -p wacore-binary
+```
+
+## Common gotchas
+
+- `wacore-libsignal/Cargo.toml` — `serde`, `sha1`, `sha2`, `waproto` must be in `[dependencies]`, not under `[target.'cfg(wasm32)'.dependencies]`. The native build needs them too.
+- `wacore-noise/Cargo.toml` — `wacore-binary`, `wacore-libsignal`, `waproto` are under `[target.'cfg(target_arch = "wasm32")'.dependencies]`. Native `cargo test` will fail — this is expected.
+- `waproto/build.rs` — field attribute paths use `.proto.` prefix (not `.whatsapp.`), matching `package proto;`.
+- The C and JNI builds write to the same `target/` directory. `build-all.ps1` copies the JNI lib to `dist-native/jni/` to keep them separate.
+- `cargo test` (no target) → tries to run WASM binary natively → OS error 193 on Windows. Always specify `--target x86_64-pc-windows-msvc` for native tests.
+- `wasm-pack build` requires `link.exe` in PATH. If it fails with a linker error, ensure VS Build Tools are installed and `link.exe` is not shadowed by the Git-for-Windows version at `C:\Program Files\Git\usr\bin\link.exe`.

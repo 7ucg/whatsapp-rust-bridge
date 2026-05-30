@@ -26,10 +26,11 @@ High-performance WhatsApp utilities powered by Rust — available as **WebAssemb
 | HMAC-SHA256 / SHA-256 / MD5 / HKDF | ✅ |
 | LibSignal (session, pre-keys, group cipher) | ✅ |
 | App State Sync (LTHash, patch/snapshot MAC) | ✅ |
-| Noise handshake (XX pattern) | ✅ |
-| Audio (waveform, duration) | ✅ |
-| Image (thumbnails, conversion) | ✅ |
-| Sticker metadata (WebP EXIF) | ✅ |
+| Noise handshake (XX + IK + XXfallback) | ✅ |
+| JID parse / encode / inspect / construct | ✅ |
+| Audio (waveform, duration) | ✅ (optional feature) |
+| Image (thumbnails, conversion) | ✅ (optional feature) |
+| Sticker metadata (WebP EXIF) | ✅ (optional feature) |
 
 ## Bridges
 
@@ -85,27 +86,38 @@ byte[] kp = Curve.generateKeyPair();
 
 ```
 whatsapp-rust-bridge/
-├── src/              Rust source — WASM build
-│   ├── crypto.rs     AES, HMAC, HKDF, SHA, MD5
-│   ├── curve.rs      Curve25519
-│   ├── binary.rs     WhatsApp binary protocol
-│   ├── noise_session.rs  Noise XX handshake
-│   ├── session_builder.rs / session_cipher.rs
-│   ├── key_helper.rs
-│   ├── appstate.rs
-│   └── ...
-├── native/           Native C + JNI build
-│   ├── src/ffi/      C-ABI exports (wa_* functions)
-│   ├── src/jni_bridge/  JNI exports
-│   ├── java/         Java wrapper classes
-│   └── include/      whatsapp_bridge.h
-├── ts/               TypeScript entry point
-├── dist/             TypeScript build output
-├── pkg/              wasm-pack output
-├── test/             Bun tests
-├── benches/          Mitata benchmarks
-├── build-all.ps1     Master build script
-└── docs/             Extended documentation
+├── src/                  Rust source — WASM build (wasm-bindgen)
+│   ├── crypto.rs         AES, HMAC, HKDF, SHA-256, MD5
+│   ├── curve.rs          Curve25519 keygen, DH, sign, verify
+│   ├── binary.rs         WhatsApp binary protocol (encode/decode)
+│   ├── jid.rs            JID parse/encode/construct/inspect
+│   ├── noise_session.rs  Noise XX, IK, XXfallback handshake + framing
+│   ├── session_builder.rs / session_cipher.rs   Signal 1-to-1
+│   ├── group_cipher.rs   Signal group messaging
+│   ├── key_helper.rs     Pre-key / signed-pre-key / registration ID
+│   ├── appstate.rs       App-state sync, LTHash, MACs
+│   ├── storage_adapter.rs  JS ↔ Signal storage bridge
+│   ├── audio.rs          Waveform + duration (feature = audio)
+│   ├── image_utils.rs    Thumbnails (feature = image)
+│   └── sticker_metadata.rs  WebP EXIF (feature = sticker)
+├── internal/             Self-contained protocol crates
+│   ├── wacore/appstate   Key expansion, LTHash, patch encode/decode
+│   ├── wacore/binary     Binary protocol, JID types, token maps
+│   ├── wacore/libsignal  Signal protocol (sessions, group, ratchet)
+│   ├── wacore/noise      Noise XX/IK/XXfallback, frame codec
+│   ├── wacore/derive     Proc-macro helpers
+│   └── waproto           Protobuf definitions (WA 2.3000.x)
+├── native/               Native C + JNI build
+│   ├── src/ffi/          C-ABI exports (wa_* functions)
+│   ├── src/jni_bridge/   JNI exports (Java_* symbols)
+│   ├── java/             Java wrapper classes + NativeLoader
+│   └── include/          whatsapp_bridge.h
+├── ts/                   TypeScript entry point + macro
+├── dist/                 TypeScript compiled output
+├── pkg/                  wasm-pack output (WASM + JS glue + .d.ts)
+├── test/                 Bun tests
+├── build-all.ps1         Master build script (WASM + C + JNI)
+└── docs/                 Extended documentation
 ```
 
 

@@ -1,5 +1,5 @@
 use js_sys::{TypeError, Uint8Array};
-use rand::{TryRngCore as _, rngs::OsRng};
+use rand::Rng;
 use serde::Serialize;
 use tsify_next::Tsify;
 use wacore_libsignal::core::curve::{KeyPair as CoreKeyPair, PrivateKey as CorePrivateKey};
@@ -32,8 +32,8 @@ fn map_err(err: impl std::fmt::Display) -> JsValue {
     TypeError::new(&err.to_string()).into()
 }
 
-fn rng() -> impl rand::CryptoRng + rand::TryRngCore {
-    OsRng.unwrap_err()
+fn rng() -> impl rand::CryptoRng + rand::Rng {
+    rand::rng()
 }
 
 fn core_key_pair_to_key_pair(pair: CoreKeyPair) -> KeyPair {
@@ -51,7 +51,7 @@ pub fn generate_identity_key_pair() -> KeyPair {
 #[wasm_bindgen(js_name = generateRegistrationId)]
 pub fn generate_registration_id() -> u32 {
     let mut bytes = [0u8; 2];
-    rng().try_fill_bytes(&mut bytes).unwrap();
+    rand::rng().fill_bytes(&mut bytes);
     (u16::from_le_bytes(bytes) & 0x3FFF) as u32
 }
 

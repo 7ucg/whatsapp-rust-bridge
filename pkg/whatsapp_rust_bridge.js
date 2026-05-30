@@ -371,10 +371,132 @@ export class LTHashState {
 if (Symbol.dispose) LTHashState.prototype[Symbol.dispose] = LTHashState.prototype.free;
 
 /**
+ * Noise_IK_25519_AESGCM_SHA256 handshake — faster reconnect using a cached
+ * server static key. Falls back to XX automatically if the server rejects.
+ *
+ * Usage:
+ *   const ik = new NoiseIkSession(staticPub32, staticPriv32, serverStaticPub32, payload, prologue);
+ *   const clientHello = ik.buildClientHello();
+ *   // send clientHello framed over the wire, then:
+ *   const result = ik.readServerHello(serverHelloBytes);
+ *   if (result.fallback) {
+ *     // use result.fallback (NoiseSession) to continue as XX fallback
+ *   } else {
+ *     // IK succeeded — use result.writeCipher / readCipher
+ *   }
+ */
+export class NoiseIkSession {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        NoiseIkSessionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_noiseiksession_free(ptr, 0);
+    }
+    /**
+     * Build the IK ClientHello bytes (framed, ready to send).
+     * @returns {Uint8Array}
+     */
+    buildClientHello() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.noiseiksession_buildClientHello(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Create a new IK session.
+     * @param staticPub      Client's static public key (33 bytes, 0x05 prefix)
+     * @param staticPriv     Client's static private key (32 bytes)
+     * @param serverStaticPub Server's static public key (32 bytes, no prefix)
+     * @param clientPayload  The payload to send 0-RTT (e.g. client hello proto)
+     * @param prologue       Noise prologue bytes (WA header)
+     * @param {Uint8Array} static_pub
+     * @param {Uint8Array} static_priv
+     * @param {Uint8Array} server_static_pub
+     * @param {Uint8Array} client_payload
+     * @param {Uint8Array} prologue
+     */
+    constructor(static_pub, static_priv, server_static_pub, client_payload, prologue) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(static_pub, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passArray8ToWasm0(static_priv, wasm.__wbindgen_export);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passArray8ToWasm0(server_static_pub, wasm.__wbindgen_export);
+            const len2 = WASM_VECTOR_LEN;
+            const ptr3 = passArray8ToWasm0(client_payload, wasm.__wbindgen_export);
+            const len3 = WASM_VECTOR_LEN;
+            const ptr4 = passArray8ToWasm0(prologue, wasm.__wbindgen_export);
+            const len4 = WASM_VECTOR_LEN;
+            wasm.noiseiksession_new(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            this.__wbg_ptr = r0 >>> 0;
+            NoiseIkSessionFinalization.register(this, this.__wbg_ptr, this);
+            return this;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Process the server's response.
+     * Returns a JS object: `{ success: true, writeCipher, readCipher }` on IK success,
+     * or `{ success: false, fallbackSession: NoiseSession }` when the server requests XX fallback.
+     * @param {Uint8Array} response_bytes
+     * @param {Uint8Array | null} [routing_info]
+     * @returns {any}
+     */
+    readServerHello(response_bytes, routing_info) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(response_bytes, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            var ptr1 = isLikeNone(routing_info) ? 0 : passArray8ToWasm0(routing_info, wasm.__wbindgen_export);
+            var len1 = WASM_VECTOR_LEN;
+            wasm.noiseiksession_readServerHello(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+}
+if (Symbol.dispose) NoiseIkSession.prototype[Symbol.dispose] = NoiseIkSession.prototype.free;
+
+/**
  * NoiseSession implements the Noise_XX_25519_AESGCM_SHA256 protocol pattern
  * with combined binary encoding/decoding operations for reduced WASM boundary crossings.
  */
 export class NoiseSession {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(NoiseSession.prototype);
+        obj.__wbg_ptr = ptr;
+        NoiseSessionFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
@@ -639,6 +761,69 @@ export class NoiseSession {
     }
 }
 if (Symbol.dispose) NoiseSession.prototype[Symbol.dispose] = NoiseSession.prototype.free;
+
+/**
+ * Noise XXfallback session — used when an IK attempt is rejected by the server.
+ * Reuses the ephemeral already on the wire to avoid an extra round-trip.
+ */
+export class NoiseXxFallbackSession {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(NoiseXxFallbackSession.prototype);
+        obj.__wbg_ptr = ptr;
+        NoiseXxFallbackSessionFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        NoiseXxFallbackSessionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_noisexxfallbacksession_free(ptr, 0);
+    }
+    /**
+     * Build the client finish message (send this over the wire).
+     * @returns {Uint8Array}
+     */
+    buildClientFinish() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.noisexxfallbacksession_buildClientFinish(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Finalize the handshake — returns a ready `NoiseSession`.
+     * @returns {NoiseSession}
+     */
+    finish() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.noisexxfallbacksession_finish(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return NoiseSession.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+}
+if (Symbol.dispose) NoiseXxFallbackSession.prototype[Symbol.dispose] = NoiseXxFallbackSession.prototype.free;
 
 export class ProtocolAddress {
     static __wrap(ptr) {
@@ -1320,6 +1505,21 @@ export function aesEncryptGCM(plaintext, key, iv, additional_data) {
 }
 
 /**
+ * Returns true if both JIDs refer to the same user (ignoring device).
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+export function areSameUser(a, b) {
+    const ptr0 = passStringToWasm0(a, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(b, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.areSameUser(ptr0, len0, ptr1, len1);
+    return ret !== 0;
+}
+
+/**
  * @param {Uint8Array} public_key_bytes
  * @param {Uint8Array} private_key_bytes
  * @returns {Uint8Array}
@@ -1370,6 +1570,72 @@ export function calculateSignature(private_key_bytes, message) {
 }
 
 /**
+ * Extract all unique key IDs from a list of patches (and optionally a snapshot).
+ *
+ * @param snapshotBytes  Optional protobuf-encoded `SyncdSnapshot` bytes (pass empty Uint8Array to skip)
+ * @param patchesBytes   Array of protobuf-encoded `SyncdPatch` bytes
+ * @returns              Array of key-ID byte arrays that need to be fetched
+ * @param {Uint8Array} snapshot_bytes
+ * @param {Uint8Array[]} patches_bytes
+ * @returns {Array<any>}
+ */
+export function collectAppStateKeyIds(snapshot_bytes, patches_bytes) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(snapshot_bytes, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArrayJsValueToWasm0(patches_bytes, wasm.__wbindgen_export);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.collectAppStateKeyIds(retptr, ptr0, len0, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Decrypt and decode a single app-state record.
+ *
+ * @param recordBytes   Protobuf-encoded `SyncdRecord` bytes
+ * @param keys          Expanded app-state keys (from `expandAppStateKeys`)
+ * @param keyId         The key ID bytes (used for MAC validation)
+ * @param operation     0 = SET, 1 = REMOVE
+ * @param validateMacs  Whether to verify MACs (set false to skip for speed)
+ * @param {Uint8Array} record_bytes
+ * @param {ExpandedAppStateKeys} keys
+ * @param {Uint8Array} key_id
+ * @param {number} operation
+ * @param {boolean} validate_macs
+ * @returns {DecodedMutation}
+ */
+export function decodeAppStateRecord(record_bytes, keys, key_id, operation, validate_macs) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(record_bytes, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        _assertClass(keys, ExpandedAppStateKeys);
+        const ptr1 = passArray8ToWasm0(key_id, wasm.__wbindgen_export);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.decodeAppStateRecord(retptr, ptr0, len0, keys.__wbg_ptr, ptr1, len1, operation, validate_macs);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * @param {Uint8Array} data
  * @returns {InternalBinaryNode}
  */
@@ -1388,6 +1654,70 @@ export function decodeNode(data) {
         return InternalBinaryNode.__wrap(r0);
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Encode and encrypt a mutation into a `SyncdMutation` (ready to include in a patch).
+ *
+ * @param operation     0 = SET, 1 = REMOVE
+ * @param indexBytes    The index as JSON bytes, e.g. `["contact","123@s.whatsapp.net"]`
+ * @param actionBytes   Protobuf-encoded `SyncActionValue` bytes
+ * @param keys          Expanded app-state keys (from `expandAppStateKeys`)
+ * @param keyId         The key ID bytes
+ * @param iv            16-byte IV for AES-CBC encryption (use random bytes)
+ * @param {number} operation
+ * @param {Uint8Array} index_bytes
+ * @param {Uint8Array} action_bytes
+ * @param {ExpandedAppStateKeys} keys
+ * @param {Uint8Array} key_id
+ * @param {Uint8Array} iv
+ * @returns {EncodedMutation}
+ */
+export function encodeAppStateMutation(operation, index_bytes, action_bytes, keys, key_id, iv) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(index_bytes, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(action_bytes, wasm.__wbindgen_export);
+        const len1 = WASM_VECTOR_LEN;
+        _assertClass(keys, ExpandedAppStateKeys);
+        const ptr2 = passArray8ToWasm0(key_id, wasm.__wbindgen_export);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passArray8ToWasm0(iv, wasm.__wbindgen_export);
+        const len3 = WASM_VECTOR_LEN;
+        wasm.encodeAppStateMutation(retptr, operation, ptr0, len0, ptr1, len1, keys.__wbg_ptr, ptr2, len2, ptr3, len3);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Encode a JidInfo back to its canonical string.
+ * @param {JidInfo} info
+ * @returns {string}
+ */
+export function encodeJid(info) {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.encodeJid(retptr, addHeapObject(info));
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
     }
 }
 
@@ -1704,6 +2034,563 @@ export function hmacSign(buffer, key) {
 }
 
 /**
+ * Returns true if the JID belongs to a multi-device (AD) session (device > 0).
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isADJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isADJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is a WhatsApp bot.
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isBotJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isBotJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is a broadcast list (not status).
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isBroadcastListJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isBroadcastListJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is a group (g.us).
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isGroupJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isGroupJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is a hosted/Cloud API device.
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isHostedJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isHostedJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is a LID-based user (lid server).
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isLidJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isLidJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is a Meta Messenger bridged contact.
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isMessengerJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isMessengerJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is a newsletter (channel).
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isNewsletterJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isNewsletterJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is the status broadcast ("status@broadcast").
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isStatusBroadcastJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isStatusBroadcastJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Returns true if the JID is a regular user (s.whatsapp.net).
+ * @param {string} jid_str
+ * @returns {boolean}
+ */
+export function isUserJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.isUserJid(ptr0, len0);
+    return ret !== 0;
+}
+
+/**
+ * Extract the device ID from a JID string (0 = primary device).
+ * @param {string} jid_str
+ * @returns {number | undefined}
+ */
+export function jidGetDevice(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.jidGetDevice(ptr0, len0);
+    return ret === 0xFFFFFF ? undefined : ret;
+}
+
+/**
+ * Extract the server domain from a JID string.
+ * @param {string} jid_str
+ * @returns {string | undefined}
+ */
+export function jidGetServer(jid_str) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidGetServer(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        let v2;
+        if (r0 !== 0) {
+            v2 = getStringFromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+        }
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Extract the user part (phone / group-id) from a JID string.
+ * @param {string} jid_str
+ * @returns {string | undefined}
+ */
+export function jidGetUser(jid_str) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidGetUser(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        let v2;
+        if (r0 !== 0) {
+            v2 = getStringFromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+        }
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Create a group JID: "groupId@g.us"
+ * @param {string} group_id
+ * @returns {string}
+ */
+export function jidGroup(group_id) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(group_id, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidGroup(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred2_0 = r0;
+        deferred2_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Create a LID JID: "lid@lid"
+ * @param {string} lid
+ * @returns {string}
+ */
+export function jidLid(lid) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(lid, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidLid(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred2_0 = r0;
+        deferred2_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Create a newsletter (channel) JID: "id@newsletter"
+ * @param {string} id
+ * @returns {string}
+ */
+export function jidNewsletter(id) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(id, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidNewsletter(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred2_0 = r0;
+        deferred2_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Normalize a JID to its primary user form (device = 0, agent = 0).
+ * "123@s.whatsapp.net:5" → "123@s.whatsapp.net"
+ * @param {string} jid_str
+ * @returns {string | undefined}
+ */
+export function jidNormalizedUser(jid_str) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidNormalizedUser(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        let v2;
+        if (r0 !== 0) {
+            v2 = getStringFromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+        }
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * @returns {string}
+ */
+export function jidServerBot() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidServerBot(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * @returns {string}
+ */
+export function jidServerBroadcast() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidServerBroadcast(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * @returns {string}
+ */
+export function jidServerGroup() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidServerGroup(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * @returns {string}
+ */
+export function jidServerHosted() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidServerHosted(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * @returns {string}
+ */
+export function jidServerLid() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidServerLid(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * @returns {string}
+ */
+export function jidServerMessenger() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidServerMessenger(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * @returns {string}
+ */
+export function jidServerNewsletter() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidServerNewsletter(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * @returns {string}
+ */
+export function jidServerUser() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidServerUser(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * Returns the status broadcast JID: "status@broadcast"
+ * @returns {string}
+ */
+export function jidStatusBroadcast() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.jidStatusBroadcast(retptr);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred1_0 = r0;
+        deferred1_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
+ * Create a user JID: "phone@s.whatsapp.net"
+ * @param {string} phone
+ * @returns {string}
+ */
+export function jidUser(phone) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(phone, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidUser(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred2_0 = r0;
+        deferred2_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Returns the base user part stripping any ":device" suffix.
+ * "123:4@s.whatsapp.net" → "123"
+ * @param {string} jid_str
+ * @returns {string | undefined}
+ */
+export function jidUserBase(jid_str) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidUserBase(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        let v2;
+        if (r0 !== 0) {
+            v2 = getStringFromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+        }
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Create a user JID with a specific device ID.
+ * @param {string} phone
+ * @param {number} device
+ * @returns {string}
+ */
+export function jidUserDevice(phone, device) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(phone, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidUserDevice(retptr, ptr0, len0, device);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        deferred2_0 = r0;
+        deferred2_1 = r1;
+        return getStringFromWasm0(r0, r1);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Change the device ID on an existing JID string.
+ * @param {string} jid_str
+ * @param {number} device
+ * @returns {string | undefined}
+ */
+export function jidWithDevice(jid_str, device) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jidWithDevice(retptr, ptr0, len0, device);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        let v2;
+        if (r0 !== 0) {
+            v2 = getStringFromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+        }
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * @param {string} level
  * @param {string} message
  */
@@ -1723,6 +2610,19 @@ export function md5(buffer) {
     const ptr0 = passArray8ToWasm0(buffer, wasm.__wbindgen_export);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.md5(ptr0, len0);
+    return takeObject(ret);
+}
+
+/**
+ * Parse a JID string into its components.
+ * Accepts: "user@server", "user@server:device", "user.agent:device@server"
+ * @param {string} jid_str
+ * @returns {JidInfo | undefined}
+ */
+export function parseJid(jid_str) {
+    const ptr0 = passStringToWasm0(jid_str, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.parseJid(ptr0, len0);
     return takeObject(ret);
 }
 
@@ -1878,7 +2778,7 @@ function __wbg_get_imports() {
         __wbg__wbg_cb_unref_d9b87ff7982e3b21: function(arg0) {
             getObject(arg0)._wbg_cb_unref();
         },
-        __wbg_attrs_6d084be3233ef0c9: function(arg0) {
+        __wbg_attrs_7e03bce687b13600: function(arg0) {
             const ret = getObject(arg0).attrs;
             return addHeapObject(ret);
         },
@@ -1890,11 +2790,11 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).call(getObject(arg1), getObject(arg2));
             return addHeapObject(ret);
         }, arguments); },
-        __wbg_content_0e33d41cbbdb1e90: function(arg0) {
+        __wbg_content_5adfc5ce260fc60f: function(arg0) {
             const ret = getObject(arg0).content;
             return addHeapObject(ret);
         },
-        __wbg_debug_baa4d3249d84a4e5: function(arg0, arg1, arg2, arg3) {
+        __wbg_debug_d9ceba20b3b4bc31: function(arg0, arg1, arg2, arg3) {
             getObject(arg0).debug(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbg_done_57b39ecd9addfe81: function(arg0) {
@@ -1905,22 +2805,25 @@ function __wbg_get_imports() {
             const ret = Object.entries(getObject(arg0));
             return addHeapObject(ret);
         },
-        __wbg_error_d838eee49c986064: function(arg0, arg1, arg2, arg3) {
+        __wbg_error_38f2d2b44d5fbcdd: function(arg0, arg1, arg2, arg3) {
             getObject(arg0).error(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbg_from_bddd64e7d5ff6941: function(arg0) {
             const ret = Array.from(getObject(arg0));
             return addHeapObject(ret);
         },
-        __wbg_getOurIdentity_83295d63237c06fb: function() { return handleError(function (arg0) {
+        __wbg_getOurIdentity_ff06142cf4d771fd: function() { return handleError(function (arg0) {
             const ret = getObject(arg0).getOurIdentity();
             return addHeapObject(ret);
         }, arguments); },
-        __wbg_getOurRegistrationId_77d5d5854702846c: function() { return handleError(function (arg0) {
+        __wbg_getOurRegistrationId_9476cabd6615435c: function() { return handleError(function (arg0) {
             const ret = getObject(arg0).getOurRegistrationId();
             return addHeapObject(ret);
         }, arguments); },
         __wbg_getRandomValues_1c61fac11405ffdc: function() { return handleError(function (arg0, arg1) {
+            globalThis.crypto.getRandomValues(getArrayU8FromWasm0(arg0, arg1));
+        }, arguments); },
+        __wbg_getRandomValues_2a91986308c74a93: function() { return handleError(function (arg0, arg1) {
             globalThis.crypto.getRandomValues(getArrayU8FromWasm0(arg0, arg1));
         }, arguments); },
         __wbg_get_9b94d73e6221f75c: function(arg0, arg1) {
@@ -1939,7 +2842,7 @@ function __wbg_get_imports() {
             const ret = Reflect.has(getObject(arg0), getObject(arg1));
             return ret;
         }, arguments); },
-        __wbg_info_24c14d6aba85c9d7: function(arg0, arg1, arg2, arg3) {
+        __wbg_info_32d02c37919ba287: function(arg0, arg1, arg2, arg3) {
             getObject(arg0).info(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbg_instanceof_ArrayBuffer_c367199e2fa2aa04: function(arg0) {
@@ -2004,7 +2907,7 @@ function __wbg_get_imports() {
             const ret = Number.isSafeInteger(getObject(arg0));
             return ret;
         },
-        __wbg_isTrustedIdentity_6c80f1e6ee3541f4: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
+        __wbg_isTrustedIdentity_9227fe7bc856b2cd: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
             const ret = getObject(arg0).isTrustedIdentity(getStringFromWasm0(arg1, arg2), getObject(arg3), arg4 >>> 0);
             return addHeapObject(ret);
         }, arguments); },
@@ -2024,26 +2927,26 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).length;
             return ret;
         },
-        __wbg_level_1d9d278088887d9f: function(arg0, arg1) {
+        __wbg_level_d79ea42b38dc874b: function(arg0, arg1) {
             const ret = getObject(arg1).level;
             const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
         },
-        __wbg_loadPreKey_382dd082b5836adb: function() { return handleError(function (arg0, arg1) {
+        __wbg_loadPreKey_a2b93ab92b5a1c6c: function() { return handleError(function (arg0, arg1) {
             const ret = getObject(arg0).loadPreKey(arg1 >>> 0);
             return addHeapObject(ret);
         }, arguments); },
-        __wbg_loadSenderKey_a71dc0738208c87a: function() { return handleError(function (arg0, arg1, arg2) {
+        __wbg_loadSenderKey_0ff2e83503d12b46: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = getObject(arg0).loadSenderKey(getStringFromWasm0(arg1, arg2));
             return addHeapObject(ret);
         }, arguments); },
-        __wbg_loadSession_92206a915736df32: function() { return handleError(function (arg0, arg1, arg2) {
+        __wbg_loadSession_72cdb264c350dddb: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = getObject(arg0).loadSession(getStringFromWasm0(arg1, arg2));
             return addHeapObject(ret);
         }, arguments); },
-        __wbg_loadSignedPreKey_59ba3c82603ec105: function() { return handleError(function (arg0, arg1) {
+        __wbg_loadSignedPreKey_01cbb620428303f5: function() { return handleError(function (arg0, arg1) {
             const ret = getObject(arg0).loadSignedPreKey(arg1 >>> 0);
             return addHeapObject(ret);
         }, arguments); },
@@ -2066,7 +2969,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_1258(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_1679(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -2105,6 +3008,14 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).next;
             return addHeapObject(ret);
         },
+        __wbg_noisesession_new: function(arg0) {
+            const ret = NoiseSession.__wrap(arg0);
+            return addHeapObject(ret);
+        },
+        __wbg_noisexxfallbacksession_new: function(arg0) {
+            const ret = NoiseXxFallbackSession.__wrap(arg0);
+            return addHeapObject(ret);
+        },
         __wbg_parse_708461a1feddfb38: function() { return handleError(function (arg0, arg1) {
             const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
             return addHeapObject(ret);
@@ -2123,7 +3034,7 @@ function __wbg_get_imports() {
         __wbg_queueMicrotask_5bb536982f78a56f: function(arg0) {
             queueMicrotask(getObject(arg0));
         },
-        __wbg_removePreKey_910ca3319ea79e54: function() { return handleError(function (arg0, arg1) {
+        __wbg_removePreKey_98811fdd48c073fb: function() { return handleError(function (arg0, arg1) {
             const ret = getObject(arg0).removePreKey(arg1 >>> 0);
             return addHeapObject(ret);
         }, arguments); },
@@ -2168,19 +3079,19 @@ function __wbg_get_imports() {
             const ret = typeof window === 'undefined' ? null : window;
             return isLikeNone(ret) ? 0 : addHeapObject(ret);
         },
-        __wbg_storeSenderKey_5e54ff546352ef75: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+        __wbg_storeSenderKey_f75b687ecb81167b: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = getObject(arg0).storeSenderKey(getStringFromWasm0(arg1, arg2), getObject(arg3));
             return addHeapObject(ret);
         }, arguments); },
-        __wbg_storeSessionRaw_5e331f8465ce7724: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+        __wbg_storeSessionRaw_62bcfde67041fd72: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = getObject(arg0).storeSessionRaw(getStringFromWasm0(arg1, arg2), getObject(arg3));
             return addHeapObject(ret);
         }, arguments); },
-        __wbg_storeSession_8617b15d9a7e4da8: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+        __wbg_storeSession_85743e89b8885477: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = getObject(arg0).storeSession(getStringFromWasm0(arg1, arg2), takeObject(arg3));
             return addHeapObject(ret);
         }, arguments); },
-        __wbg_tag_273de63708794f52: function(arg0, arg1) {
+        __wbg_tag_f94df748099af08d: function(arg0, arg1) {
             const ret = getObject(arg1).tag;
             const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len1 = WASM_VECTOR_LEN;
@@ -2195,19 +3106,19 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).then(getObject(arg1));
             return addHeapObject(ret);
         },
-        __wbg_trace_ef85209ca59c1742: function(arg0, arg1, arg2, arg3) {
+        __wbg_trace_b203136e640da099: function(arg0, arg1, arg2, arg3) {
             getObject(arg0).trace(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbg_value_0546255b415e96c1: function(arg0) {
             const ret = getObject(arg0).value;
             return addHeapObject(ret);
         },
-        __wbg_warn_e97e9dc989f348ae: function(arg0, arg1, arg2, arg3) {
+        __wbg_warn_24e97d9de99c2b0e: function(arg0, arg1, arg2, arg3) {
             getObject(arg0).warn(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 154, function: Function { arguments: [Externref], shim_idx: 155, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_705, __wasm_bindgen_func_elem_707);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 198, function: Function { arguments: [Externref], shim_idx: 199, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_892, __wasm_bindgen_func_elem_894);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -2249,12 +3160,12 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_707(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_707(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_894(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_894(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_1258(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_1258(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_1679(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_1679(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const ExpandedAppStateKeysFinalization = (typeof FinalizationRegistry === 'undefined')
@@ -2275,9 +3186,15 @@ const LTHashAntiTamperingFinalization = (typeof FinalizationRegistry === 'undefi
 const LTHashStateFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_lthashstate_free(ptr >>> 0, 1));
+const NoiseIkSessionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_noiseiksession_free(ptr >>> 0, 1));
 const NoiseSessionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_noisesession_free(ptr >>> 0, 1));
+const NoiseXxFallbackSessionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_noisexxfallbacksession_free(ptr >>> 0, 1));
 const ProtocolAddressFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_protocoladdress_free(ptr >>> 0, 1));

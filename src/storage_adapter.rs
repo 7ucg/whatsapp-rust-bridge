@@ -119,6 +119,7 @@ pub struct JsStorageAdapter {
     has_store_session_raw: Rc<RefCell<Option<bool>>>,
     last_address_cache: Rc<RefCell<Option<(String, String)>>>,
     last_sender_key_cache: Rc<RefCell<Option<(String, String, String)>>>,
+    sender_key_locks: Rc<RefCell<HashMap<String, std::sync::Arc<async_lock::Mutex<()>>>>>,
 }
 
 impl JsStorageAdapter {
@@ -133,6 +134,7 @@ impl JsStorageAdapter {
             has_store_session_raw: Rc::new(RefCell::new(None)),
             last_address_cache: Rc::new(RefCell::new(None)),
             last_sender_key_cache: Rc::new(RefCell::new(None)),
+            sender_key_locks: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -786,10 +788,18 @@ impl SessionStore for JsStorageAdapter {
         }
     }
 
+    async fn has_session(
+        &self,
+        address: &libsignal::ProtocolAddress,
+    ) -> SignalResult<bool> {
+        let address_str = self.get_address_string(address);
+        Ok(self.cached_sessions.borrow().contains_key(&address_str))
+    }
+
     async fn store_session(
         &mut self,
         address: &libsignal::ProtocolAddress,
-        record: &CoreSessionRecord,
+        record: CoreSessionRecord,
     ) -> SignalResult<()> {
         let address_str = self.get_address_string(address);
 
@@ -1008,7 +1018,7 @@ impl SignedPreKeyStore for JsStorageAdapter {
 #[async_trait(?Send)]
 impl SenderKeyStore for JsStorageAdapter {
     async fn load_sender_key(
-        &mut self,
+        &self,
         sender_key_name: &CoreSenderKeyName,
     ) -> SignalResult<Option<CoreSenderKeyRecord>> {
         let key_id = self.get_sender_key_id(sender_key_name);
@@ -1059,7 +1069,7 @@ impl SenderKeyStore for JsStorageAdapter {
     async fn store_sender_key(
         &mut self,
         sender_key_name: &CoreSenderKeyName,
-        record: &CoreSenderKeyRecord,
+        record: CoreSenderKeyRecord,
     ) -> SignalResult<()> {
         let key_id = self.get_sender_key_id(sender_key_name);
 
@@ -1079,5 +1089,17 @@ impl SenderKeyStore for JsStorageAdapter {
             .map_err(js_to_signal_error)?;
 
         Ok(())
+    }
+
+    async fn sender_key_lock(
+        &self,
+        sender_key_name: &CoreSenderKeyName,
+    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+        let key = self.get_sender_key_id(sender_key_name);
+        let mut locks = self.sender_key_locks.borrow_mut();
+        locks
+            .entry(key)
+            .or_insert_with(|| std::sync::Arc::new(async_lock::Mutex::new(())))
+            .clone()
     }
 }
