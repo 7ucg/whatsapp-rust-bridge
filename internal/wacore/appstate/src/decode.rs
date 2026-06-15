@@ -10,14 +10,19 @@ use waproto::whatsapp as wa;
 pub struct Mutation {
     /// The decoded action value.
     pub action_value: Option<wa::SyncActionValue>,
-    /// The MAC of the index.
-    pub index_mac: Vec<u8>,
-    /// The MAC of the value.
-    pub value_mac: Vec<u8>,
     /// The parsed index components (JSON array of strings).
     pub index: Vec<String>,
     /// The operation type (Set or Remove).
     pub operation: wa::syncd_mutation::SyncdOperation,
+}
+
+/// Index/value MACs extracted from a record, returned alongside the decoded
+/// [`Mutation`]. Kept out of `Mutation` so the MACs live only in the persisted
+/// MAC list rather than being duplicated on every returned mutation.
+#[derive(Debug, Clone)]
+pub struct RecordMacs {
+    pub index_mac: Vec<u8>,
+    pub value_mac: Vec<u8>,
 }
 
 /// Decode a single encrypted record into a mutation.
@@ -33,14 +38,15 @@ pub struct Mutation {
 /// * `validate_macs` - Whether to validate MACs during decoding
 ///
 /// # Returns
-/// A decoded `Mutation` or an error if decoding/validation fails.
+/// The decoded `Mutation` together with its index/value MACs, or an error if
+/// decoding/validation fails.
 pub fn decode_record(
     operation: wa::syncd_mutation::SyncdOperation,
     record: &wa::SyncdRecord,
     keys: &ExpandedAppStateKeys,
     key_id: &[u8],
     validate_macs: bool,
-) -> Result<Mutation, AppStateError> {
+) -> Result<(Mutation, RecordMacs), AppStateError> {
     let value_blob = record
         .value
         .as_ref()
@@ -73,32 +79,43 @@ pub fn decode_record(
     let action = wa::SyncActionData::decode(plaintext.as_slice())
         .map_err(|_| AppStateError::DecodeFailed)?;
 
-    let mut index_list: Vec<String> = Vec::new();
-    if let Some(idx_bytes) = action.index.as_ref() {
-        if validate_macs {
-            let stored = record
-                .index
-                .as_ref()
-                .and_then(|i| i.blob.as_ref())
-                .ok_or(AppStateError::MissingIndexMAC)?;
-            validate_index_mac(idx_bytes, stored, &keys.index)?;
-        }
-        if let Ok(parsed) = serde_json::from_slice::<Vec<String>>(idx_bytes) {
-            index_list = parsed;
-        }
-    }
-
-    Ok(Mutation {
-        action_value: action.value,
-        index_mac: record
+    // WA Web (syncdDecryptMutation) computes the index MAC unconditionally over the
+    // decoded index (empty buffer when the field is absent) and rejects on mismatch,
+    // so an absent index must still match the stored MAC rather than bypass the check.
+    if validate_macs {
+        let stored = record
             .index
             .as_ref()
-            .and_then(|i| i.blob.clone())
-            .unwrap_or_default(),
-        value_mac: value_mac.to_vec(),
-        index: index_list,
-        operation,
-    })
+            .and_then(|i| i.blob.as_ref())
+            .ok_or(AppStateError::MissingIndexMAC)?;
+        validate_index_mac(action.index.as_deref().unwrap_or(&[]), stored, &keys.index)?;
+    }
+
+    let mut index_list: Vec<String> = Vec::new();
+    if let Some(idx_bytes) = action.index.as_ref()
+        && let Ok(parsed) = serde_json::from_slice::<Vec<String>>(idx_bytes)
+    {
+        index_list = parsed;
+    }
+
+    // A record without an index MAC is malformed; never persist an empty MAC
+    // (previously unwrap_or_default() let this through when validate_macs=false).
+    let index_mac = record
+        .index
+        .as_ref()
+        .and_then(|i| i.blob.clone())
+        .ok_or(AppStateError::MissingIndexMAC)?;
+    Ok((
+        Mutation {
+            action_value: action.value,
+            index: index_list,
+            operation,
+        },
+        RecordMacs {
+            index_mac,
+            value_mac: value_mac.to_vec(),
+        },
+    ))
 }
 
 /// Extract all unique key IDs from a patch list that need to be fetched.
@@ -150,7 +167,7 @@ pub fn collect_key_ids_from_patch_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::generate_content_mac;
+    use crate::hash::{generate_content_mac, generate_index_mac};
     use crate::keys::expand_app_state_keys;
     use prost::Message;
     use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
@@ -173,9 +190,10 @@ mod tests {
         let mut value_blob = value_with_iv;
         value_blob.extend_from_slice(&value_mac);
 
+        let index_bytes = action_data.index.as_deref().unwrap_or(&[]);
         wa::SyncdRecord {
             index: Some(wa::SyncdIndex {
-                blob: Some(vec![1; 32]),
+                blob: Some(generate_index_mac(index_bytes, &keys.index)),
             }),
             value: Some(wa::SyncdValue {
                 blob: Some(value_blob),
@@ -207,7 +225,7 @@ mod tests {
             &action_data,
         );
 
-        let mutation = decode_record(
+        let (mutation, macs) = decode_record(
             wa::syncd_mutation::SyncdOperation::Set,
             &record,
             &keys,
@@ -221,6 +239,11 @@ mod tests {
             Some(1234567890)
         );
         assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::Set);
+        // MACs are returned separately and must carry the real bytes, not empty
+        // or swapped values: index_mac is the HMAC of the (absent here) index.
+        assert_eq!(macs.index_mac, generate_index_mac(&[], &keys.index));
+        assert!(!macs.value_mac.is_empty());
+        assert_ne!(macs.index_mac, macs.value_mac);
     }
 
     #[test]
@@ -244,7 +267,7 @@ mod tests {
             &action_data,
         );
 
-        // With MAC validation enabled but no index in action_data, should succeed
+        // No index field, but the stored index MAC matches the empty-index HMAC: passes.
         let result = decode_record(
             wa::syncd_mutation::SyncdOperation::Set,
             &record,
@@ -253,6 +276,42 @@ mod tests {
             true,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn index_mac_is_validated_even_when_index_field_absent() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+
+        let action_data = wa::SyncActionData {
+            value: Some(wa::SyncActionValue {
+                timestamp: Some(1234567890),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &keys,
+            &key_id,
+            &action_data,
+        );
+        // Tamper the stored index MAC: with no index field the old code skipped the
+        // check entirely and accepted this; WA Web (and now we) reject it.
+        record.index = Some(wa::SyncdIndex {
+            blob: Some(vec![0xFF; 32]),
+        });
+
+        let err = decode_record(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &record,
+            &keys,
+            &key_id,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppStateError::MismatchingIndexMAC));
     }
 
     #[test]

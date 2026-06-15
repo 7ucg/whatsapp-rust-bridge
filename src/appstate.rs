@@ -346,7 +346,7 @@ pub fn decode_app_state_record(
     let op = wa::syncd_mutation::SyncdOperation::try_from(operation)
         .map_err(|_| JsValue::from_str(&format!("Invalid operation: {}", operation)))?;
 
-    let mutation = decode_record(op, &record, &keys.inner, key_id, validate_macs)
+    let (mutation, macs) = decode_record(op, &record, &keys.inner, key_id, validate_macs)
         .map_err(|e| JsValue::from_str(&format!("decode_record failed: {}", e)))?;
 
     let action_bytes = mutation
@@ -361,8 +361,8 @@ pub fn decode_app_state_record(
     Ok(DecodedMutation {
         operation: op as i32,
         index: mutation.index,
-        index_mac: mutation.index_mac,
-        value_mac: mutation.value_mac,
+        index_mac: macs.index_mac,
+        value_mac: macs.value_mac,
         action_bytes,
     })
 }
@@ -398,6 +398,8 @@ pub struct EncodedMutation {
 /// @param keys          Expanded app-state keys (from `expandAppStateKeys`)
 /// @param keyId         The key ID bytes
 /// @param iv            16-byte IV for AES-CBC encryption (use random bytes)
+/// @param version       Per-action schema version stamped into the mutation
+///                      (mirrors WA Web; e.g. label_edit/label_jid = 3, 0 otherwise)
 #[wasm_bindgen(js_name = encodeAppStateMutation)]
 pub fn encode_app_state_mutation(
     operation: i32,
@@ -406,6 +408,7 @@ pub fn encode_app_state_mutation(
     keys: &ExpandedAppStateKeys,
     key_id: &[u8],
     iv: &[u8],
+    version: i32,
 ) -> Result<EncodedMutation, JsValue> {
     let op = wa::syncd_mutation::SyncdOperation::try_from(operation)
         .map_err(|_| JsValue::from_str(&format!("Invalid operation: {}", operation)))?;
@@ -418,7 +421,7 @@ pub fn encode_app_state_mutation(
         .map_err(|e| JsValue::from_str(&format!("Failed to decode SyncActionValue: {}", e)))?;
 
     let (mutation, value_mac) =
-        encode_record(op, index_bytes, &action, &keys.inner, key_id, &iv_arr);
+        encode_record(op, index_bytes, &action, &keys.inner, key_id, &iv_arr, version);
 
     // Extract index_mac from the encoded record
     let index_mac = mutation

@@ -19,6 +19,7 @@
     },
     "scripts": {
 
+        "build:proto": "cargo build -p waproto --features generate",
         "build:wasm": "wasm-pack build --target web --out-dir pkg --no-pack",
         "build:ts": "tsc ts/index.ts --outDir dist --module es2022 --target es2022 --moduleResolution node --esModuleInterop --skipLibCheck",
         "postbuild": "tsc -p tsconfig.json --outDir dist && node -e \"try{require('fs').unlinkSync('dist/macro.d.ts')}catch(e){}\"",

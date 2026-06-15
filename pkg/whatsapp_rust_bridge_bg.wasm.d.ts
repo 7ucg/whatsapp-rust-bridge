@@ -30,7 +30,7 @@ export const calculateSignature: (a: number, b: number, c: number, d: number, e:
 export const collectAppStateKeyIds: (a: number, b: number, c: number, d: number, e: number) => void;
 export const decodeAppStateRecord: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const decodeNode: (a: number, b: number, c: number) => void;
-export const encodeAppStateMutation: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
+export const encodeAppStateMutation: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => void;
 export const encodeJid: (a: number, b: number) => void;
 export const encodeNode: (a: number, b: number) => void;
 export const expandAppStateKeys: (a: number, b: number) => number;
@@ -163,9 +163,9 @@ export const aesEncryptCTR: (a: number, b: number, c: number, d: number, e: numb
 export const generateKeyPair: () => number;
 export const updateLogger: (a: number) => void;
 export const __wbg_sessioncipher_free: (a: number, b: number) => void;
-export const __wasm_bindgen_func_elem_892: (a: number, b: number) => void;
-export const __wasm_bindgen_func_elem_1679: (a: number, b: number, c: number, d: number) => void;
-export const __wasm_bindgen_func_elem_894: (a: number, b: number, c: number) => void;
+export const __wasm_bindgen_func_elem_895: (a: number, b: number) => void;
+export const __wasm_bindgen_func_elem_1710: (a: number, b: number, c: number, d: number) => void;
+export const __wasm_bindgen_func_elem_897: (a: number, b: number, c: number) => void;
 export const __wbindgen_export: (a: number, b: number) => number;
 export const __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
 export const __wbindgen_export3: (a: number) => void;

@@ -430,8 +430,10 @@ export function decodeNode(data: Uint8Array): InternalBinaryNode;
  * @param keys          Expanded app-state keys (from `expandAppStateKeys`)
  * @param keyId         The key ID bytes
  * @param iv            16-byte IV for AES-CBC encryption (use random bytes)
+ * @param version       Per-action schema version stamped into the mutation
+ *                      (mirrors WA Web; e.g. label_edit/label_jid = 3, 0 otherwise)
  */
-export function encodeAppStateMutation(operation: number, index_bytes: Uint8Array, action_bytes: Uint8Array, keys: ExpandedAppStateKeys, key_id: Uint8Array, iv: Uint8Array): EncodedMutation;
+export function encodeAppStateMutation(operation: number, index_bytes: Uint8Array, action_bytes: Uint8Array, keys: ExpandedAppStateKeys, key_id: Uint8Array, iv: Uint8Array, version: number): EncodedMutation;
 
 /**
  * Encode a JidInfo back to its canonical string.
@@ -665,7 +667,7 @@ export interface InitOutput {
     readonly collectAppStateKeyIds: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly decodeAppStateRecord: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly decodeNode: (a: number, b: number, c: number) => void;
-    readonly encodeAppStateMutation: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
+    readonly encodeAppStateMutation: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => void;
     readonly encodeJid: (a: number, b: number) => void;
     readonly encodeNode: (a: number, b: number) => void;
     readonly expandAppStateKeys: (a: number, b: number) => number;
@@ -798,9 +800,9 @@ export interface InitOutput {
     readonly generateKeyPair: () => number;
     readonly updateLogger: (a: number) => void;
     readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_892: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1679: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_894: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_895: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_1710: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_897: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

@@ -1666,15 +1666,18 @@ export function decodeNode(data) {
  * @param keys          Expanded app-state keys (from `expandAppStateKeys`)
  * @param keyId         The key ID bytes
  * @param iv            16-byte IV for AES-CBC encryption (use random bytes)
+ * @param version       Per-action schema version stamped into the mutation
+ *                      (mirrors WA Web; e.g. label_edit/label_jid = 3, 0 otherwise)
  * @param {number} operation
  * @param {Uint8Array} index_bytes
  * @param {Uint8Array} action_bytes
  * @param {ExpandedAppStateKeys} keys
  * @param {Uint8Array} key_id
  * @param {Uint8Array} iv
+ * @param {number} version
  * @returns {EncodedMutation}
  */
-export function encodeAppStateMutation(operation, index_bytes, action_bytes, keys, key_id, iv) {
+export function encodeAppStateMutation(operation, index_bytes, action_bytes, keys, key_id, iv, version) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
         const ptr0 = passArray8ToWasm0(index_bytes, wasm.__wbindgen_export);
@@ -1686,7 +1689,7 @@ export function encodeAppStateMutation(operation, index_bytes, action_bytes, key
         const len2 = WASM_VECTOR_LEN;
         const ptr3 = passArray8ToWasm0(iv, wasm.__wbindgen_export);
         const len3 = WASM_VECTOR_LEN;
-        wasm.encodeAppStateMutation(retptr, operation, ptr0, len0, ptr1, len1, keys.__wbg_ptr, ptr2, len2, ptr3, len3);
+        wasm.encodeAppStateMutation(retptr, operation, ptr0, len0, ptr1, len1, keys.__wbg_ptr, ptr2, len2, ptr3, len3, version);
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -2969,7 +2972,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_1679(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_1710(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3117,8 +3120,8 @@ function __wbg_get_imports() {
             getObject(arg0).warn(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 198, function: Function { arguments: [Externref], shim_idx: 199, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_892, __wasm_bindgen_func_elem_894);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 193, function: Function { arguments: [Externref], shim_idx: 194, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_895, __wasm_bindgen_func_elem_897);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -3160,12 +3163,12 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_894(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_894(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_897(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_897(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_1679(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_1679(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_1710(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_1710(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const ExpandedAppStateKeysFinalization = (typeof FinalizationRegistry === 'undefined')

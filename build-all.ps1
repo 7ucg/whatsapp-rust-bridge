@@ -56,7 +56,18 @@ function Invoke-Cmd([string]$cmd, [string]$workDir = $PSScriptRoot) {
     Write-Info $cmd
     Push-Location $workDir
     try {
-        Invoke-Expression $cmd
+        # Native tools (cargo, wasm-pack) write progress/warnings to stderr. Under
+        # $ErrorActionPreference="Stop" that first stderr line is promoted to a
+        # terminating error before we ever see the exit code, so the build aborts
+        # on a harmless warning. Drop to Continue for the call and judge success
+        # by $LASTEXITCODE only.
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            Invoke-Expression $cmd
+        } finally {
+            $ErrorActionPreference = $prev
+        }
         if ($LASTEXITCODE -ne 0) { throw "Command failed (exit $LASTEXITCODE): $cmd" }
     } finally {
         Pop-Location

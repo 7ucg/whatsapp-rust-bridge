@@ -166,9 +166,38 @@ impl SenderChainKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SenderKeyState {
     state: SenderKeyStateStructure,
+    /// Parsed signing key with its XEdDSA cache pre-derived, memoized so the
+    /// per-send signature skips a basepoint multiplication (~18% of a warm
+    /// group send when re-derived from bytes every message). Clones carry the
+    /// warm value, and the record cache stores this object back after every
+    /// send, so the memo persists for the cache lifetime. Never persisted;
+    /// rebuilt lazily after a cold load. If a signing-key setter is ever
+    /// added, it must reset this memo.
+    signing_key_memo: std::sync::OnceLock<PrivateKey>,
+    /// Receive-side mirror of `signing_key_memo`: cached verifier whose
+    /// Edwards derivations are reused across every incoming message under
+    /// this sender key. Same lifecycle rules as above.
+    verifying_key_memo: std::sync::OnceLock<crate::core::curve::PreparedVerifyingKey>,
+}
+
+// Manual impl with the signing key REDACTED: the protobuf state embeds the
+// serialized private signing key, and the previous derive printed it raw
+// into any `{:?}` log or panic message.
+impl std::fmt::Debug for SenderKeyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenderKeyState")
+            .field("chain_id", &self.chain_id())
+            .field(
+                "chain_iteration",
+                &self.sender_chain_key().map(|c| c.iteration()),
+            )
+            .field("message_keys", &self.state.sender_message_keys.len())
+            .field("signing_key", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SenderKeyState {
@@ -188,16 +217,42 @@ impl SenderKeyState {
             sender_signing_key: Some(sender_key_state_structure::SenderSigningKey {
                 public: Some(Bytes::copy_from_slice(&signature_key.serialize())),
                 private: signature_private_key
+                    .as_ref()
                     .map(|k| Bytes::copy_from_slice(k.serialize().as_ref())),
             }),
             sender_message_keys: vec![],
         };
 
-        Self { state }
+        let signing_key_memo = std::sync::OnceLock::new();
+        if let Some(key) = signature_private_key {
+            key.precompute_signing_cache();
+            let _ = signing_key_memo.set(key);
+        }
+        let verifying_key_memo = std::sync::OnceLock::new();
+        if signing_key_memo.get().is_none() {
+            // Receive-side state (no private key): this key will verify every
+            // incoming message, so build the verifier and derive its Edwards
+            // entries here, at SKDM processing, once per sender rotation.
+            // Send-side states never verify their own messages, so they skip
+            // even the verifier allocation; the memo builds lazily if ever
+            // asked.
+            let verifier = crate::core::curve::PreparedVerifyingKey::new(&signature_key);
+            verifier.precompute();
+            let _ = verifying_key_memo.set(verifier);
+        }
+        Self {
+            state,
+            signing_key_memo,
+            verifying_key_memo,
+        }
     }
 
     pub(crate) fn from_protobuf(state: SenderKeyStateStructure) -> Self {
-        Self { state }
+        Self {
+            state,
+            signing_key_memo: std::sync::OnceLock::new(),
+            verifying_key_memo: std::sync::OnceLock::new(),
+        }
     }
 
     pub fn message_version(&self) -> u32 {
@@ -239,17 +294,49 @@ impl SenderKeyState {
         }
     }
 
+    /// Cached verifier for this sender's signing key; the Edwards
+    /// derivations warm on first use and persist with the in-memory state.
+    pub fn signing_key_verifier(
+        &self,
+    ) -> Result<&crate::core::curve::PreparedVerifyingKey, InvalidSenderKeySessionError> {
+        if let Some(verifier) = self.verifying_key_memo.get() {
+            return Ok(verifier);
+        }
+        let verifier = crate::core::curve::PreparedVerifyingKey::new(&self.signing_key_public()?);
+        // Benign race: concurrent firsts compute the same value.
+        let _ = self.verifying_key_memo.set(verifier);
+        Ok(self
+            .verifying_key_memo
+            .get()
+            .expect("set on the line above"))
+    }
+
     pub fn signing_key_private(&self) -> Result<PrivateKey, InvalidSenderKeySessionError> {
+        if let Some(key) = self.signing_key_memo.get() {
+            return Ok(key.clone());
+        }
         if let Some(ref signing_key) = self.state.sender_signing_key {
             let private = signing_key
                 .private
                 .as_ref()
                 .ok_or(InvalidSenderKeySessionError("missing private key bytes"))?;
-            PrivateKey::deserialize(private)
-                .map_err(|_| InvalidSenderKeySessionError("invalid private signing key"))
+            let key = PrivateKey::deserialize(private)
+                .map_err(|_| InvalidSenderKeySessionError("invalid private signing key"))?;
+            // Warm BEFORE memoizing: the caller gets a clone, and clones of a
+            // cold key would each re-derive the cache; clones of a warm one
+            // carry it. Benign race: concurrent firsts compute equal values.
+            key.precompute_signing_cache();
+            let _ = self.signing_key_memo.set(key.clone());
+            Ok(key)
         } else {
             Err(InvalidSenderKeySessionError("missing signing key"))
         }
+    }
+
+    /// Test-only: whether the signing-key memo is populated.
+    #[cfg(test)]
+    pub(crate) fn signing_key_memo_initialized(&self) -> bool {
+        self.signing_key_memo.get().is_some()
     }
 
     pub(crate) fn as_protobuf(&self) -> SenderKeyStateStructure {
@@ -543,6 +630,68 @@ mod tests {
 
         assert!(state.signing_key_public().is_ok());
         assert!(state.signing_key_private().is_ok());
+    }
+
+    #[test]
+    fn signing_key_memo_warms_on_first_use_and_survives_clone() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = crate::core::curve::KeyPair::generate(&mut rng);
+        let chain_key = [7u8; 32];
+        let state = SenderKeyState::new(
+            3,
+            1,
+            0,
+            &chain_key,
+            signing.public_key,
+            Some(signing.private_key),
+        );
+
+        // new() received the parsed key: memo pre-populated and pre-warmed.
+        assert!(state.signing_key_memo_initialized());
+        assert!(
+            state
+                .signing_key_private()
+                .expect("memo key")
+                .has_warm_signing_cache()
+        );
+
+        // A cold load (protobuf roundtrip) drops the memo; the first
+        // signing_key_private() call rebuilds AND warms it, and the clone
+        // handed back carries the warm cache.
+        let reloaded = SenderKeyState::from_protobuf(state.as_protobuf());
+        assert!(!reloaded.signing_key_memo_initialized());
+        let key = reloaded.signing_key_private().expect("reloaded key");
+        assert!(key.has_warm_signing_cache());
+        assert!(reloaded.signing_key_memo_initialized());
+
+        // Clones of the state (the per-send record clone) carry the memo.
+        let cloned = reloaded.clone();
+        assert!(cloned.signing_key_memo_initialized());
+        assert!(
+            cloned
+                .signing_key_private()
+                .expect("cloned key")
+                .has_warm_signing_cache()
+        );
+
+        // Verifier memo: send-side states (private key present) skip even
+        // the allocation; it builds lazily if asked, is seeded eagerly only
+        // on receive-side creation, rebuilds after a cold load, and clones
+        // carry it.
+        assert!(state.verifying_key_memo.get().is_none());
+        let _ = state.signing_key_verifier().expect("lazy build works");
+        assert!(state.verifying_key_memo.get().is_some());
+        let cold = SenderKeyState::from_protobuf(state.as_protobuf());
+        assert!(cold.verifying_key_memo.get().is_none());
+        let _ = cold.signing_key_verifier().expect("verifier");
+        assert!(cold.verifying_key_memo.get().is_some());
+        assert!(cold.clone().verifying_key_memo.get().is_some());
+
+        // The memoized key still signs correctly.
+        let msg = b"skmsg";
+        let sig = key.calculate_signature(msg, &mut rng).expect("sign");
+        let public = reloaded.signing_key_public().expect("public key");
+        assert!(public.verify_signature(msg, &sig));
     }
 
     /// Test SenderKeyState chain key operations

@@ -6,7 +6,9 @@ use crate::{
     protocol_address::ProtocolAddress,
     storage_adapter::{JsStorageAdapter, SignalStorage},
 };
-use wacore_libsignal::protocol::{self as libsignal, PreKeySignalMessage, SessionStore, UsePQRatchet};
+use wacore_libsignal::protocol::{
+    self as libsignal, PreKeySignalMessage, PreKeyStore, SessionStore, UsePQRatchet,
+};
 
 /// Extracts the sender's identity key from a PreKeySignalMessage for identity-change detection.
 /// Returns `undefined` if parsing fails or the message is not a valid PreKeyMessage.
@@ -103,7 +105,7 @@ impl SessionCipher {
         let mut prekey_store = session_store.clone();
         let signed_prekey_store = session_store.clone();
 
-        let plaintext = libsignal::message_decrypt_prekey(
+        let result = libsignal::message_decrypt_prekey(
             &prekey_message,
             &self.remote_address.0,
             &mut session_store,
@@ -119,7 +121,18 @@ impl SessionCipher {
             JsValue::from_str(&msg)
         })?;
 
-        Ok(bytes_to_uint8array(&plaintext))
+        // The decrypt no longer deletes the consumed one-time prekey itself; the
+        // caller must remove it now that the promoted session is stored.
+        if let Some(prekey_id) = result.consumed_prekey_id {
+            prekey_store.remove_pre_key(prekey_id).await.map_err(|e| {
+                JsValue::from_str(&format!(
+                    "SessionCipher.decryptPreKeyWhisperMessage: remove_pre_key failed: {:?}",
+                    e
+                ))
+            })?;
+        }
+
+        Ok(bytes_to_uint8array(&result.plaintext))
     }
 
     #[wasm_bindgen(js_name = decryptWhisperMessage)]
@@ -138,7 +151,7 @@ impl SessionCipher {
         let mut session_store = self.storage_adapter.clone();
         let mut identity_store = session_store.clone();
 
-        let plaintext = libsignal::message_decrypt_signal(
+        let result = libsignal::message_decrypt_signal(
             &signal_message,
             &self.remote_address.0,
             &mut session_store,
@@ -151,7 +164,7 @@ impl SessionCipher {
             JsValue::from_str(&msg)
         })?;
 
-        Ok(bytes_to_uint8array(&plaintext))
+        Ok(bytes_to_uint8array(&result.plaintext))
     }
 
     #[wasm_bindgen(js_name = hasOpenSession)]

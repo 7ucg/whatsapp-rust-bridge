@@ -1,7 +1,7 @@
-﻿syntax = "proto2";
+syntax = "proto2";
 package proto;
 
-/// WhatsApp Version: 2.3000.1040457520
+/// WhatsApp Version: 2.3000.1041467552
 
 message ADVDeviceIdentity {
     optional uint32 rawId = 1;
@@ -288,6 +288,13 @@ message Account {
     optional string username = 2;
     optional string countryCode = 3;
     optional bool isUsernameDeleted = 4;
+}
+
+message AccountLinkingOpaqueData {
+    optional string accesstoken = 1;
+    optional string fbid = 2;
+    optional string nonce = 3;
+    optional string encryptedPassword = 4;
 }
 
 message ActionLink {
@@ -957,6 +964,7 @@ message BotSignatureVerificationUseCaseProof {
         UNSPECIFIED = 0;
         WA_BOT_MSG = 1;
         WA_TEE_BOT_MSG = 2;
+        P2P_PILLS = 3;
     }
 }
 
@@ -1004,6 +1012,29 @@ message BotUnifiedResponseMutation {
     
 }
 
+enum COMMAND_COMMAND_TYPE {
+    EVERYONE = 1;
+    SILENT = 2;
+    AI = 3;
+    AI_IMAGINE = 4;
+}
+enum CONSUMER_APPLICATION_EXTENDED_TEXT_MESSAGE_PREVIEW_TYPE {
+    PREVIEW_TYPE_NONE = 0;
+    PREVIEW_TYPE_VIDEO = 1;
+}
+enum CONSUMER_APPLICATION_METADATA_SPECIAL_TEXT_SIZE {
+    SMALL = 1;
+    MEDIUM = 2;
+    LARGE = 3;
+}
+enum CONSUMER_APPLICATION_STATUS_TEXT_MESAGE_FONT_TYPE {
+    SANS_SERIF = 0;
+    SERIF = 1;
+    NORICAN_REGULAR = 2;
+    BRYNDAN_WRITE = 3;
+    BEBASNEUE_REGULAR = 4;
+    OSWALD_HEAVY = 5;
+}
 message CallLogRecord {
     optional CallResult callResult = 1;
     optional bool isDndMode = 2;
@@ -1371,6 +1402,19 @@ enum CollectionName {
     CRITICAL_BLOCK = 4;
     CRITICAL_UNBLOCK_LOW = 5;
 }
+message CombinedFingerprint {
+    optional uint32 version = 1;
+    optional FingerprintData localFingerprint = 2;
+    optional FingerprintData remoteFingerprint = 3;
+}
+
+message Command {
+    optional COMMAND_COMMAND_TYPE commandType = 1;
+    optional uint32 offset = 2;
+    optional uint32 length = 3;
+    optional string validationToken = 4;
+}
+
 message CommentMetadata {
     optional MessageKey commentParentKey = 1;
     optional uint32 replyCount = 2;
@@ -1389,6 +1433,213 @@ message CompanionEphemeralIdentity {
 message Config {
     map<uint32, Field> field = 1;
     optional uint32 version = 2;
+}
+
+message ConsumerApplication {
+    optional Payload payload = 1;
+    optional Metadata metadata = 2;
+    message ApplicationData {
+        oneof applicationContent {
+            ConsumerApplication.RevokeMessage revoke = 1;
+        }
+    }
+    
+    message AudioMessage {
+        optional SubProtocol audio = 1;
+        optional bool ptt = 2;
+    }
+    
+    message ContactMessage {
+        optional SubProtocol contact = 1;
+    }
+    
+    message ContactsArrayMessage {
+        optional string displayName = 1;
+        repeated ConsumerApplication.ContactMessage contacts = 2;
+    }
+    
+    message Content {
+        oneof content {
+            MessageText messageText = 1;
+            ConsumerApplication.ImageMessage imageMessage = 2;
+            ConsumerApplication.ContactMessage contactMessage = 3;
+            ConsumerApplication.LocationMessage locationMessage = 4;
+            ConsumerApplication.ExtendedTextMessage extendedTextMessage = 5;
+            ConsumerApplication.StatusTextMesage statusTextMessage = 6;
+            ConsumerApplication.DocumentMessage documentMessage = 7;
+            ConsumerApplication.AudioMessage audioMessage = 8;
+            ConsumerApplication.VideoMessage videoMessage = 9;
+            ConsumerApplication.ContactsArrayMessage contactsArrayMessage = 10;
+            ConsumerApplication.LiveLocationMessage liveLocationMessage = 11;
+            ConsumerApplication.StickerMessage stickerMessage = 12;
+            ConsumerApplication.GroupInviteMessage groupInviteMessage = 13;
+            ConsumerApplication.ViewOnceMessage viewOnceMessage = 14;
+            ConsumerApplication.ReactionMessage reactionMessage = 16;
+            ConsumerApplication.PollCreationMessage pollCreationMessage = 17;
+            ConsumerApplication.PollUpdateMessage pollUpdateMessage = 18;
+            ConsumerApplication.EditMessage editMessage = 19;
+        }
+    }
+    
+    message DocumentMessage {
+        optional SubProtocol document = 1;
+        optional string fileName = 2;
+    }
+    
+    message EditMessage {
+        optional MessageKey key = 1;
+        optional MessageText message = 2;
+        optional int64 timestampMs = 3;
+    }
+    
+    message ExtendedTextMessage {
+        optional MessageText text = 1;
+        optional string matchedText = 2;
+        optional string canonicalUrl = 3;
+        optional string description = 4;
+        optional string title = 5;
+        optional SubProtocol thumbnail = 6;
+        optional CONSUMER_APPLICATION_EXTENDED_TEXT_MESSAGE_PREVIEW_TYPE previewType = 7;
+    }
+    
+    message GroupInviteMessage {
+        optional string groupJid = 1;
+        optional string inviteCode = 2;
+        optional int64 inviteExpiration = 3;
+        optional string groupName = 4;
+        optional bytes jpegThumbnail = 5;
+        optional MessageText caption = 6;
+    }
+    
+    message ImageMessage {
+        optional SubProtocol image = 1;
+        optional MessageText caption = 2;
+    }
+    
+    message InteractiveAnnotation {
+        repeated ConsumerApplication.Point polygonVertices = 1;
+        oneof action {
+            ConsumerApplication.Location location = 2;
+        }
+    }
+    
+    message LiveLocationMessage {
+        optional ConsumerApplication.Location location = 1;
+        optional uint32 accuracyInMeters = 2;
+        optional float speedInMps = 3;
+        optional uint32 degreesClockwiseFromMagneticNorth = 4;
+        optional MessageText caption = 5;
+        optional int64 sequenceNumber = 6;
+        optional uint32 timeOffset = 7;
+    }
+    
+    message Location {
+        optional double degreesLatitude = 1;
+        optional double degreesLongitude = 2;
+        optional string name = 3;
+    }
+    
+    message LocationMessage {
+        optional ConsumerApplication.Location location = 1;
+        optional string address = 2;
+    }
+    
+    message MediaPayload {
+        optional SubProtocol protocol = 1;
+    }
+    
+    message Metadata {
+        optional CONSUMER_APPLICATION_METADATA_SPECIAL_TEXT_SIZE specialTextSize = 1;
+    }
+    
+    message Option {
+        optional string optionName = 1;
+    }
+    
+    message Payload {
+        oneof payload {
+            ConsumerApplication.Content content = 1;
+            ConsumerApplication.ApplicationData applicationData = 2;
+            ConsumerApplication.Signal signal = 3;
+            ConsumerApplication.SubProtocolPayload subProtocol = 4;
+        }
+    }
+    
+    message Point {
+        optional double x = 1;
+        optional double y = 2;
+    }
+    
+    message PollAddOptionMessage {
+        repeated ConsumerApplication.Option pollOption = 1;
+    }
+    
+    message PollCreationMessage {
+        optional bytes encKey = 1;
+        optional string name = 2;
+        repeated ConsumerApplication.Option options = 3;
+        optional uint32 selectableOptionsCount = 4;
+    }
+    
+    message PollEncValue {
+        optional bytes encPayload = 1;
+        optional bytes encIv = 2;
+    }
+    
+    message PollUpdateMessage {
+        optional MessageKey pollCreationMessageKey = 1;
+        optional ConsumerApplication.PollEncValue vote = 2;
+        optional ConsumerApplication.PollEncValue addOption = 3;
+    }
+    
+    message PollVoteMessage {
+        repeated bytes selectedOptions = 1;
+        optional int64 senderTimestampMs = 2;
+    }
+    
+    message ReactionMessage {
+        optional MessageKey key = 1;
+        optional string text = 2;
+        optional string groupingKey = 3;
+        optional int64 senderTimestampMs = 4;
+        optional string reactionMetadataDataclassData = 5;
+        optional int32 style = 6;
+    }
+    
+    message RevokeMessage {
+        optional MessageKey key = 1;
+    }
+    
+    message Signal {
+    }
+    
+    message StatusTextMesage {
+        optional ConsumerApplication.ExtendedTextMessage text = 1;
+        optional fixed32 textArgb = 6;
+        optional fixed32 backgroundArgb = 7;
+        optional CONSUMER_APPLICATION_STATUS_TEXT_MESAGE_FONT_TYPE font = 8;
+    }
+    
+    message StickerMessage {
+        optional SubProtocol sticker = 1;
+    }
+    
+    message SubProtocolPayload {
+        optional FUTURE_PROOF_BEHAVIOR futureProof = 1;
+    }
+    
+    message VideoMessage {
+        optional SubProtocol video = 1;
+        optional MessageText caption = 2;
+    }
+    
+    message ViewOnceMessage {
+        oneof viewOnceContent {
+            ConsumerApplication.ImageMessage imageMessage = 1;
+            ConsumerApplication.VideoMessage videoMessage = 2;
+        }
+    }
+    
 }
 
 message ContextInfo {
@@ -1470,6 +1721,8 @@ message ContextInfo {
         optional string businessJid = 1;
         repeated Pill pills = 2;
         optional EntryPoint entryPoint = 3;
+        optional bytes signedPayload = 4;
+        optional BotSignatureVerificationMetadata signatureEnvelope = 5;
         enum EntryPoint {
             ENTRY_POINT_UNKNOWN = 0;
             P2P_LINK_SHARE = 1;
@@ -1498,6 +1751,11 @@ message ContextInfo {
             SHOP = 11;
             ORDER = 12;
         }
+        message SignedPayload {
+            optional string verifiedName = 1;
+            repeated ContextInfo.BusinessInteractionPills.Pill pills = 2;
+        }
+        
     }
     
     message BusinessMessageForwardInfo {
@@ -1951,12 +2209,26 @@ message ExternalBlobReference {
     optional bytes fileEncSha256 = 6;
 }
 
+enum FUTURE_PROOF_BEHAVIOR {
+    PLACEHOLDER = 0;
+    NO_PLACEHOLDER = 1;
+    IGNORE = 2;
+}
 message Field {
     optional uint32 minVersion = 1;
     optional uint32 maxVersion = 2;
     optional uint32 notReportableMinVersion = 3;
     optional bool isMessage = 4;
     map<uint32, Field> subfield = 5;
+}
+
+message FingerprintData {
+    optional bytes publicKey = 1;
+    optional bytes pnIdentifier = 2;
+    optional bytes lidIdentifier = 3;
+    optional bytes usernameIdentifier = 4;
+    optional HostedState hostedState = 5;
+    optional bytes hashedPublicKey = 6;
 }
 
 message ForwardedAIBotMessageInfo {
@@ -1988,6 +2260,13 @@ message GlobalSettings {
     optional int64 chatDbLidMigrationTimestamp = 20;
 }
 
+message GroupHistory {
+    repeated WebMessageInfo messages = 1;
+    repeated UnCountedAssociatedMessageList uncountedAssociatedMessageLists = 2;
+    repeated WebMessageInfo commentMessages = 3;
+    repeated WebMessageInfo outOfWindowPinnedMessages = 4;
+}
+
 message GroupHistoryBundleInfo {
     optional Message.MessageHistoryBundle deprecatedMessageHistoryBundle = 1;
     optional ProcessState processState = 2;
@@ -2004,6 +2283,13 @@ message GroupHistoryBundleInfo {
 message GroupHistoryIndividualMessageInfo {
     optional MessageKey bundleMessageKey = 1;
     optional bool editedAfterReceivedAsHistory = 2;
+}
+
+message GroupHistoryWithMessageBytes {
+    repeated WebMessageInfoWithMessageBytes messages = 1;
+    repeated UnCountedAssociatedMessageListWithMessageBytes uncountedAssociatedMessageLists = 2;
+    repeated WebMessageInfoWithMessageBytes commentMessages = 3;
+    repeated WebMessageInfoWithMessageBytes outOfWindowPinnedMessages = 4;
 }
 
 message GroupMention {
@@ -2127,6 +2413,10 @@ message HistorySyncMsg {
     optional uint64 msgOrderId = 2;
 }
 
+enum HostedState {
+    HOSTED_STATE_E2EE = 0;
+    HOSTED_STATE_HOSTED = 1;
+}
 message HydratedTemplateButton {
     optional uint32 index = 4;
     oneof hydratedButton {
@@ -2302,6 +2592,9 @@ message Location {
     optional string name = 3;
 }
 
+enum MENTION_MENTION_TYPE {
+    PROFILE = 0;
+}
 message MediaData {
     optional string localPath = 1;
 }
@@ -2309,6 +2602,40 @@ message MediaData {
 message MediaDomainInfo {
     optional MediaKeyDomain mediaKeyDomain = 1;
     optional bytes e2EeMediaKey = 2;
+}
+
+message MediaEntry {
+    optional bytes fileSha256 = 1;
+    optional bytes mediaKey = 2;
+    optional bytes fileEncSha256 = 3;
+    optional string directPath = 4;
+    optional int64 mediaKeyTimestamp = 5;
+    optional string serverMediaType = 6;
+    optional bytes uploadToken = 7;
+    optional bytes validatedTimestamp = 8;
+    optional bytes sidecar = 9;
+    optional string objectId = 10;
+    optional string fbid = 11;
+    optional DownloadableThumbnail downloadableThumbnail = 12;
+    optional string handle = 13;
+    optional string filename = 14;
+    optional ProgressiveJpegDetails progressiveJpegDetails = 15;
+    optional int64 size = 16;
+    optional int64 lastDownloadAttemptTimestamp = 17;
+    message DownloadableThumbnail {
+        optional bytes fileSha256 = 1;
+        optional bytes fileEncSha256 = 2;
+        optional string directPath = 3;
+        optional bytes mediaKey = 4;
+        optional int64 mediaKeyTimestamp = 5;
+        optional string objectId = 6;
+    }
+    
+    message ProgressiveJpegDetails {
+        repeated uint32 scanLengths = 1;
+        optional bytes sidecar = 2;
+    }
+    
 }
 
 enum MediaKeyDomain {
@@ -2343,6 +2670,13 @@ enum MediaVisibility {
 message MemberLabel {
     optional string label = 1;
     optional int64 labelTimestamp = 2;
+}
+
+message Mention {
+    optional MENTION_MENTION_TYPE mentionType = 1;
+    optional string mentionedJid = 2;
+    optional uint32 offset = 3;
+    optional uint32 length = 4;
 }
 
 message Message {
@@ -2452,6 +2786,7 @@ message Message {
     optional PaymentReminderMessage paymentReminderMessage = 124;
     optional SplitPaymentMessage splitPaymentMessage = 125;
     optional FutureProofMessage newsletterAdminProfileStatusMessage = 126;
+    optional RootSecretDistributeMessage rootSecretDistributeMessage = 127;
     message AlbumMessage {
         optional uint32 expectedImageCount = 2;
         optional uint32 expectedVideoCount = 3;
@@ -3679,6 +4014,7 @@ message Message {
     message PollAddOptionMessage {
         optional MessageKey pollCreationMessageKey = 1;
         optional Message.PollCreationMessage.Option addOption = 2;
+        optional Message.PollUpdateMessageMetadata metadata = 3;
     }
     
     enum PollContentType {
@@ -3734,6 +4070,8 @@ message Message {
     }
     
     message PollUpdateMessageMetadata {
+        optional bytes pollNameHash = 1;
+        optional string lastEditStanzaId = 2;
     }
     
     message PollVoteMessage {
@@ -3871,6 +4209,10 @@ message Message {
             CHAT_OPEN = 0;
             COMPANION_PAIRING = 1;
         }
+    }
+    
+    message RootSecretDistributeMessage {
+        optional string chatJid = 1;
     }
     
     message ScheduledCallCreationMessage {
@@ -4241,6 +4583,13 @@ message MessageSecretMessage {
     optional bytes encPayload = 3;
 }
 
+message MessageText {
+    optional string text = 1;
+    repeated string mentionedJid = 2;
+    repeated Command commands = 3;
+    repeated Mention mentions = 4;
+}
+
 message Money {
     optional int64 value = 1;
     optional uint32 offset = 2;
@@ -4295,6 +4644,14 @@ message MsgOpaqueData {
     optional int64 pollEndTime = 49;
     optional bool pollHideVoterNames = 50;
     optional bool pollAllowAddOption = 52;
+    optional string sharableEventInviteId = 53;
+    optional string sharableEventInviteTitle = 54;
+    optional int64 sharableEventInviteStartTime = 55;
+    optional int64 sharableEventInviteEndTime = 56;
+    optional string sharableEventInviteCaption = 57;
+    optional bool sharableEventInviteIsCanceled = 58;
+    optional bytes sharableEventInviteJpegThumbnail = 59;
+    optional string sharableEventInviteCallLink = 60;
     message EventLocation {
         optional double degreesLatitude = 1;
         optional double degreesLongitude = 2;
@@ -4624,6 +4981,12 @@ message Point {
 
 message PollAdditionalMetadata {
     optional bool pollInvalidated = 1;
+    repeated PollNameHashHistoryEntry pollNameHashHistory = 2;
+    message PollNameHashHistoryEntry {
+        optional string editStanzaId = 1;
+        optional bytes pollNameHash = 2;
+    }
+    
 }
 
 message PollEncValue {
@@ -4637,6 +5000,7 @@ message PollUpdate {
     optional int64 senderTimestampMs = 3;
     optional int64 serverTimestampMs = 4;
     optional bool unread = 5;
+    optional Message.PollUpdateMessageMetadata metadata = 6;
 }
 
 message PreKeyRecordStructure {
@@ -4695,6 +5059,41 @@ message Pushname {
     optional string pushname = 2;
 }
 
+message QP {
+    enum ClauseType {
+        AND = 1;
+        OR = 2;
+        NOR = 3;
+    }
+    message Filter {
+        optional string filterName = 1;
+        repeated QP.FilterParameters parameters = 2;
+        optional QP.FilterResult filterResult = 3;
+        optional QP.FilterClientNotSupportedConfig clientNotSupportedConfig = 4;
+    }
+    
+    message FilterClause {
+        optional QP.ClauseType clauseType = 1;
+        repeated QP.FilterClause clauses = 2;
+        repeated QP.Filter filters = 3;
+    }
+    
+    enum FilterClientNotSupportedConfig {
+        PASS_BY_DEFAULT = 1;
+        FAIL_BY_DEFAULT = 2;
+    }
+    message FilterParameters {
+        optional string key = 1;
+        optional string value = 2;
+    }
+    
+    enum FilterResult {
+        TRUE = 1;
+        FALSE = 2;
+        UNKNOWN = 3;
+    }
+}
+
 message QuarantinedMessage {
     optional bytes originalData = 1;
     optional string extractedText = 2;
@@ -4727,6 +5126,15 @@ message Reportable {
 
 message ReportingTokenInfo {
     optional bytes reportingTag = 1;
+}
+
+message RoutingInfo {
+    repeated int32 regionId = 1;
+    repeated int32 clusterId = 2;
+    optional int32 taskId = 3;
+    optional bool debug = 4;
+    optional bool tcpBbr = 5;
+    optional bool tcpKeepalive = 6;
 }
 
 message ScheduledMessageMetadata {
@@ -4977,6 +5385,11 @@ message StickerMetadata {
     optional bool isLottie = 12;
     optional string imageHash = 13;
     optional bool isAvatarSticker = 14;
+}
+
+message SubProtocol {
+    optional bytes payload = 1;
+    optional int32 version = 2;
 }
 
 message SyncActionData {
@@ -5263,7 +5676,7 @@ message SyncActionValue {
     
     message LabelAssociationAction {
         optional bool labeled = 1;
-        repeated SyncActionValue.ModelMetadata modelMetaData = 2;
+        optional string modelMetaData = 2;
     }
     
     message LabelEditAction {
@@ -5316,10 +5729,16 @@ message SyncActionValue {
     
     message MaibaAIFeaturesControlAction {
         optional MaibaAIFeatureStatus aiFeatureStatus = 1;
+        optional MaibaAIReplyMode aiReplyMode = 2;
         enum MaibaAIFeatureStatus {
             ENABLED = 0;
             ENABLED_HAS_LEARNING = 1;
             DISABLED = 2;
+        }
+        enum MaibaAIReplyMode {
+            MUTED = 0;
+            AI_AGENT = 1;
+            SUGGESTIONS = 2;
         }
     }
     
@@ -5354,12 +5773,6 @@ message SyncActionValue {
             ACTIVE = 0;
             INACTIVE = 1;
         }
-    }
-    
-    message ModelMetadata {
-        optional string modelName = 1;
-        optional bool isLatestModel = 2;
-        optional bool isDetected = 3;
     }
     
     message MusicUserIdAction {
@@ -5733,6 +6146,12 @@ message SyncdPatch {
     optional bytes clientDebugData = 9;
 }
 
+message SyncdPlainTextRecord {
+    optional SyncActionData value = 1;
+    optional bytes keyId = 2;
+    optional bytes mac = 3;
+}
+
 message SyncdRecord {
     optional SyncdIndex index = 1;
     optional SyncdValue value = 2;
@@ -5744,6 +6163,13 @@ message SyncdSnapshot {
     repeated SyncdRecord records = 2;
     optional bytes mac = 3;
     optional KeyId keyId = 4;
+}
+
+message SyncdSnapshotRecovery {
+    optional SyncdVersion version = 1;
+    optional string collectionName = 2;
+    repeated SyncdPlainTextRecord mutationRecords = 3;
+    optional bytes collectionLthash = 4;
 }
 
 message SyncdValue {
@@ -5791,6 +6217,17 @@ message ThreadID {
         VIEW_REPLIES = 1;
         AI_THREAD = 2;
     }
+}
+
+message UnCountedAssociatedMessageList {
+    repeated WebMessageInfo messages = 1;
+    optional MessageKey parentMessage = 2;
+    optional MessageAssociation.AssociationType associationType = 3;
+}
+
+message UnCountedAssociatedMessageListWithMessageBytes {
+    repeated WebMessageInfoWithMessageBytes messages = 1;
+    optional MessageKey parentMessage = 2;
 }
 
 message UrlTrackingMap {
@@ -6236,9 +6673,230 @@ message WebMessageInfo {
     }
 }
 
+message WebMessageInfoWithMessageBytes {
+    optional MessageKey key = 1;
+    optional bytes messageBytes = 2;
+}
+
 message WebNotificationsInfo {
     optional uint64 timestamp = 2;
     optional uint32 unreadChats = 3;
     optional uint32 notifyMessageCount = 4;
     repeated WebMessageInfo notifyMessages = 5;
 }
+
+// >>> wa.voip (VoIP engine, generated by decode-voip-wasm.js) >>>
+enum RekeyKeyType {
+    REKEY_KEY_AUDIO = 0;
+    REKEY_KEY_VIDEO = 1;
+    REKEY_KEY_APPDATA = 2;
+}
+
+enum RxVidSubscriptionInfo_VideoQuality {
+    VIDEO_QUALITY_DEFAULT = 0;
+    VIDEO_QUALITY_LOW = 1;
+    VIDEO_QUALITY_MEDIUM = 2;
+    VIDEO_QUALITY_HIGH = 3;
+    VIDEO_QUALITY_HD = 4;
+}
+
+enum SenderSubscriptionExt_TemporalLayer {
+    BASE = 0;
+    ENHANCEMENT = 1;
+}
+
+enum StreamDescriptor_PayloadType {
+    Media = 0;
+    Fec = 1;
+    Nack = 2;
+    HbhFec = 3;
+    AppData = 4;
+}
+
+enum StreamDescriptor_StreamLayer {
+    Audio = 0;
+    VideoStream0 = 1;
+    VideoStream1 = 2;
+    HbhFecClientToServer = 3;
+    HbhFecServerToClient = 4;
+    AppDataStream0 = 5;
+    LiveTranscriptionStream0 = 6;
+    IMUDataStream0 = 7;
+    ScreenShareVideoStream0 = 8;
+    ScreenShareVideoStream1 = 9;
+}
+
+// original: wa.voip.appDataMessage
+message appDataMessage {
+    optional reactionInfo reaction_info = 1;
+    optional liveTranscriptionInfo transcription_info = 2;
+}
+
+// original: wa.voip.appDataPayloads
+message appDataPayloads {
+    repeated appDataMessage messages = 1;
+}
+
+// original: wa.voip.AQSStats
+message AQSStats {
+    optional int32 aqs = 1;
+}
+
+// original: wa.voip.BackupRelayLatency
+message BackupRelayLatency {
+    optional uint32 ipv4 = 1;
+    optional bytes ipv6 = 2;
+    optional uint32 port = 3;
+    optional sint32 latency_ms = 4;
+    optional uint32 tx_bitrate = 5;
+    optional uint32 rx_bitrate = 6;
+    optional uint64 conn_id = 7;
+    optional bool is_xpop_relay = 8;
+    optional bool is_favored = 9;
+    optional string relay_name = 10;
+}
+
+// original: wa.voip.BackupRelayLatencyReport
+message BackupRelayLatencyReport {
+    optional int32 relay_transaction_id = 1;
+    repeated BackupRelayLatency relays = 2;
+}
+
+// original: wa.voip.BackupSignalEnvelope
+message BackupSignalEnvelope {
+    optional BackupRelayLatencyReport relay_latency = 1;
+}
+
+// original: wa.voip.BwaInfo
+message BwaInfo {
+    optional uint32 id = 1;
+    optional uint32 num_participants = 2;
+}
+
+// original: wa.voip.BwaStream
+message BwaStream {
+    optional uint32 bitrate = 1;
+    optional uint64 subscribed_pids_bitmap_0_63 = 2;
+    optional uint64 subscribed_pids_bitmap_64_127 = 3;
+}
+
+// original: wa.voip.E2eRekeyPayload
+message E2eRekeyPayload {
+    repeated RekeyKeyEntry keys = 1;
+}
+
+// original: wa.voip.liveTranscriptionInfo
+message liveTranscriptionInfo {
+    optional uint64 transcript_id = 1;
+    optional string caption = 2;
+    optional string language = 3;
+}
+
+// original: wa.voip.PeerFeedback
+message PeerFeedback {
+    optional VideoSenderStats video_sender_stats = 1;
+    optional VideoFeedbackMessage video_fb_msg = 2;
+    optional AQSStats aqs_stats = 3;
+    optional bool noise_suppression_ui_status = 4;
+}
+
+// original: wa.voip.reactionInfo
+message reactionInfo {
+    optional uint64 transaction_id = 1;
+    optional string reaction = 2;
+}
+
+// original: wa.voip.RekeyKeyEntry
+message RekeyKeyEntry {
+    optional RekeyKeyType type = 1;
+    optional bytes key = 2;
+}
+
+// original: wa.voip.RtcpRxSubscriptions
+message RtcpRxSubscriptions {
+    repeated RtcpRxSubscriptionsPerParticipant rx_subscriptions = 1;
+}
+
+// original: wa.voip.RtcpRxSubscriptionsPerParticipant
+message RtcpRxSubscriptionsPerParticipant {
+    optional uint32 tx_pid = 1;
+    optional RxSubscriptions rx_subscriptions = 2;
+}
+
+// original: wa.voip.RxSubscriptions
+message RxSubscriptions {
+    repeated uint32 vid_rx_pids = 1;
+    repeated RxVidSubscriptionInfo vid_subscriptions = 2;
+}
+
+// original: wa.voip.RxVidSubscriptionInfo
+message RxVidSubscriptionInfo {
+    optional uint32 pid = 1;
+    optional RxVidSubscriptionInfo_VideoQuality vid_quality = 2;
+}
+
+// original: wa.voip.SenderSubscriptionExt
+message SenderSubscriptionExt {
+    optional SenderSubscriptionExt_SSrcsToPidAssignments ssrcLayers = 1;
+}
+
+// original: wa.voip.SenderSubscriptionExt.PidTemporalLayer
+message SenderSubscriptionExt_PidTemporalLayer {
+    optional uint32 pid = 1;
+    optional SenderSubscriptionExt_TemporalLayer layerId = 2;
+}
+
+// original: wa.voip.SenderSubscriptionExt.SSrcsToPidAssignments
+message SenderSubscriptionExt_SSrcsToPidAssignments {
+    repeated uint32 ssrcs = 1;
+    repeated SenderSubscriptionExt_PidTemporalLayer pids = 2;
+}
+
+// original: wa.voip.SenderSubscriptions
+message SenderSubscriptions {
+    repeated SenderSubscriptionExt subscriptions = 1;
+}
+
+// original: wa.voip.SimulcastBwaResults
+message SimulcastBwaResults {
+    optional BwaInfo info = 1;
+    optional BwaStream stream1 = 2;
+    optional BwaStream stream2 = 3;
+}
+
+// original: wa.voip.SrtpAfbStreamInfo
+message SrtpAfbStreamInfo {
+    optional bool is_valid = 1;
+    optional uint32 ssrc = 2;
+    optional uint32 rtcp_index = 3;
+    optional uint64 rtp_index = 4;
+}
+
+// original: wa.voip.SrtpAfbStreams
+message SrtpAfbStreams {
+    repeated SrtpAfbStreamInfo srtp_afb = 1;
+}
+
+// original: wa.voip.StreamDescriptor
+message StreamDescriptor {
+    optional StreamDescriptor_StreamLayer stream_layer = 1;
+    optional StreamDescriptor_PayloadType payload_type = 2;
+    optional uint32 ssrc = 3;
+    optional bool is_uplink_prefetch_enabled = 4;
+}
+
+// original: wa.voip.StreamDescriptors
+message StreamDescriptors {
+    repeated StreamDescriptor stream_descriptors = 1;
+}
+
+// original: wa.voip.VideoFeedbackMessage
+message VideoFeedbackMessage {
+    optional int32 freeze_state = 1;
+}
+
+// original: wa.voip.VideoSenderStats
+message VideoSenderStats {
+    optional int32 sender_bwe = 1;
+}
+// <<< wa.voip <<<
