@@ -1,6 +1,6 @@
 {
     "name": "whatsapp-rust-bridge-baron",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "A high-performance utilities for WhatsApp, powered by Rust and WebAssembly.",
     "author": "Baron",
     "license": "MIT",
