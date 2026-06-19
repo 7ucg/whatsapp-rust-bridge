@@ -6994,8 +6994,8 @@ pub mod history_sync {
 #[cfg_attr(feature = "serde-deserialize", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HistorySyncMsg {
-    #[prost(message, optional, tag = "1")]
-    pub message: ::core::option::Option<WebMessageInfo>,
+    #[prost(message, optional, boxed, tag = "1")]
+    pub message: ::core::option::Option<::prost::alloc::boxed::Box<WebMessageInfo>>,
     #[prost(uint64, optional, tag = "2")]
     pub msg_order_id: ::core::option::Option<u64>,
 }
@@ -7663,8 +7663,8 @@ pub struct Message {
     pub video_message: ::core::option::Option<::prost::alloc::boxed::Box<message::VideoMessage>>,
     #[prost(message, optional, boxed, tag = "10")]
     pub call: ::core::option::Option<::prost::alloc::boxed::Box<message::Call>>,
-    #[prost(message, optional, tag = "11")]
-    pub chat: ::core::option::Option<message::Chat>,
+    #[prost(message, optional, boxed, tag = "11")]
+    pub chat: ::core::option::Option<::prost::alloc::boxed::Box<message::Chat>>,
     #[prost(message, optional, boxed, tag = "12")]
     pub protocol_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ProtocolMessage>>,
     #[prost(message, optional, boxed, tag = "13")]
@@ -7679,10 +7679,10 @@ pub struct Message {
     pub live_location_message: ::core::option::Option<::prost::alloc::boxed::Box<message::LiveLocationMessage>>,
     #[prost(message, optional, boxed, tag = "22")]
     pub request_payment_message: ::core::option::Option<::prost::alloc::boxed::Box<message::RequestPaymentMessage>>,
-    #[prost(message, optional, tag = "23")]
-    pub decline_payment_request_message: ::core::option::Option<message::DeclinePaymentRequestMessage>,
-    #[prost(message, optional, tag = "24")]
-    pub cancel_payment_request_message: ::core::option::Option<message::CancelPaymentRequestMessage>,
+    #[prost(message, optional, boxed, tag = "23")]
+    pub decline_payment_request_message: ::core::option::Option<::prost::alloc::boxed::Box<message::DeclinePaymentRequestMessage>>,
+    #[prost(message, optional, boxed, tag = "24")]
+    pub cancel_payment_request_message: ::core::option::Option<::prost::alloc::boxed::Box<message::CancelPaymentRequestMessage>>,
     #[prost(message, optional, boxed, tag = "25")]
     pub template_message: ::core::option::Option<::prost::alloc::boxed::Box<message::TemplateMessage>>,
     #[prost(message, optional, boxed, tag = "26")]
@@ -7695,8 +7695,8 @@ pub struct Message {
     pub product_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ProductMessage>>,
     #[prost(message, optional, boxed, tag = "31")]
     pub device_sent_message: ::core::option::Option<::prost::alloc::boxed::Box<message::DeviceSentMessage>>,
-    #[prost(message, optional, tag = "35")]
-    pub message_context_info: ::core::option::Option<MessageContextInfo>,
+    #[prost(message, optional, boxed, tag = "35")]
+    pub message_context_info: ::core::option::Option<::prost::alloc::boxed::Box<MessageContextInfo>>,
     #[prost(message, optional, boxed, tag = "36")]
     pub list_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ListMessage>>,
     #[prost(message, optional, boxed, tag = "37")]
@@ -7707,78 +7707,78 @@ pub struct Message {
     pub list_response_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ListResponseMessage>>,
     #[prost(message, optional, boxed, tag = "40")]
     pub ephemeral_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
-    #[prost(message, optional, tag = "41")]
-    pub invoice_message: ::core::option::Option<message::InvoiceMessage>,
+    #[prost(message, optional, boxed, tag = "41")]
+    pub invoice_message: ::core::option::Option<::prost::alloc::boxed::Box<message::InvoiceMessage>>,
     #[prost(message, optional, boxed, tag = "42")]
     pub buttons_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ButtonsMessage>>,
     #[prost(message, optional, boxed, tag = "43")]
     pub buttons_response_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ButtonsResponseMessage>>,
-    #[prost(message, optional, tag = "44")]
-    pub payment_invite_message: ::core::option::Option<message::PaymentInviteMessage>,
+    #[prost(message, optional, boxed, tag = "44")]
+    pub payment_invite_message: ::core::option::Option<::prost::alloc::boxed::Box<message::PaymentInviteMessage>>,
     #[prost(message, optional, boxed, tag = "45")]
     pub interactive_message: ::core::option::Option<::prost::alloc::boxed::Box<message::InteractiveMessage>>,
-    #[prost(message, optional, tag = "46")]
-    pub reaction_message: ::core::option::Option<message::ReactionMessage>,
-    #[prost(message, optional, tag = "47")]
-    pub sticker_sync_rmr_message: ::core::option::Option<message::StickerSyncRmrMessage>,
+    #[prost(message, optional, boxed, tag = "46")]
+    pub reaction_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ReactionMessage>>,
+    #[prost(message, optional, boxed, tag = "47")]
+    pub sticker_sync_rmr_message: ::core::option::Option<::prost::alloc::boxed::Box<message::StickerSyncRmrMessage>>,
     #[prost(message, optional, boxed, tag = "48")]
     pub interactive_response_message: ::core::option::Option<::prost::alloc::boxed::Box<message::InteractiveResponseMessage>>,
     #[prost(message, optional, boxed, tag = "49")]
     pub poll_creation_message: ::core::option::Option<::prost::alloc::boxed::Box<message::PollCreationMessage>>,
-    #[prost(message, optional, tag = "50")]
-    pub poll_update_message: ::core::option::Option<message::PollUpdateMessage>,
-    #[prost(message, optional, tag = "51")]
-    pub keep_in_chat_message: ::core::option::Option<message::KeepInChatMessage>,
+    #[prost(message, optional, boxed, tag = "50")]
+    pub poll_update_message: ::core::option::Option<::prost::alloc::boxed::Box<message::PollUpdateMessage>>,
+    #[prost(message, optional, boxed, tag = "51")]
+    pub keep_in_chat_message: ::core::option::Option<::prost::alloc::boxed::Box<message::KeepInChatMessage>>,
     #[prost(message, optional, boxed, tag = "53")]
     pub document_with_caption_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
     #[prost(message, optional, boxed, tag = "54")]
     pub request_phone_number_message: ::core::option::Option<::prost::alloc::boxed::Box<message::RequestPhoneNumberMessage>>,
     #[prost(message, optional, boxed, tag = "55")]
     pub view_once_message_v2: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
-    #[prost(message, optional, tag = "56")]
-    pub enc_reaction_message: ::core::option::Option<message::EncReactionMessage>,
+    #[prost(message, optional, boxed, tag = "56")]
+    pub enc_reaction_message: ::core::option::Option<::prost::alloc::boxed::Box<message::EncReactionMessage>>,
     #[prost(message, optional, boxed, tag = "58")]
     pub edited_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
     #[prost(message, optional, boxed, tag = "59")]
     pub view_once_message_v2_extension: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
     #[prost(message, optional, boxed, tag = "60")]
     pub poll_creation_message_v2: ::core::option::Option<::prost::alloc::boxed::Box<message::PollCreationMessage>>,
-    #[prost(message, optional, tag = "61")]
-    pub scheduled_call_creation_message: ::core::option::Option<message::ScheduledCallCreationMessage>,
+    #[prost(message, optional, boxed, tag = "61")]
+    pub scheduled_call_creation_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ScheduledCallCreationMessage>>,
     #[prost(message, optional, boxed, tag = "62")]
     pub group_mentioned_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
-    #[prost(message, optional, tag = "63")]
-    pub pin_in_chat_message: ::core::option::Option<message::PinInChatMessage>,
+    #[prost(message, optional, boxed, tag = "63")]
+    pub pin_in_chat_message: ::core::option::Option<::prost::alloc::boxed::Box<message::PinInChatMessage>>,
     #[prost(message, optional, boxed, tag = "64")]
     pub poll_creation_message_v3: ::core::option::Option<::prost::alloc::boxed::Box<message::PollCreationMessage>>,
-    #[prost(message, optional, tag = "65")]
-    pub scheduled_call_edit_message: ::core::option::Option<message::ScheduledCallEditMessage>,
+    #[prost(message, optional, boxed, tag = "65")]
+    pub scheduled_call_edit_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ScheduledCallEditMessage>>,
     #[prost(message, optional, boxed, tag = "66")]
     pub ptv_message: ::core::option::Option<::prost::alloc::boxed::Box<message::VideoMessage>>,
     #[prost(message, optional, boxed, tag = "67")]
     pub bot_invoke_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
-    #[prost(message, optional, tag = "69")]
-    pub call_log_messsage: ::core::option::Option<message::CallLogMessage>,
+    #[prost(message, optional, boxed, tag = "69")]
+    pub call_log_messsage: ::core::option::Option<::prost::alloc::boxed::Box<message::CallLogMessage>>,
     #[prost(message, optional, boxed, tag = "70")]
     pub message_history_bundle: ::core::option::Option<::prost::alloc::boxed::Box<message::MessageHistoryBundle>>,
-    #[prost(message, optional, tag = "71")]
-    pub enc_comment_message: ::core::option::Option<message::EncCommentMessage>,
-    #[prost(message, optional, tag = "72")]
-    pub bcall_message: ::core::option::Option<message::BCallMessage>,
+    #[prost(message, optional, boxed, tag = "71")]
+    pub enc_comment_message: ::core::option::Option<::prost::alloc::boxed::Box<message::EncCommentMessage>>,
+    #[prost(message, optional, boxed, tag = "72")]
+    pub bcall_message: ::core::option::Option<::prost::alloc::boxed::Box<message::BCallMessage>>,
     #[prost(message, optional, boxed, tag = "74")]
     pub lottie_sticker_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
     #[prost(message, optional, boxed, tag = "75")]
     pub event_message: ::core::option::Option<::prost::alloc::boxed::Box<message::EventMessage>>,
-    #[prost(message, optional, tag = "76")]
-    pub enc_event_response_message: ::core::option::Option<message::EncEventResponseMessage>,
+    #[prost(message, optional, boxed, tag = "76")]
+    pub enc_event_response_message: ::core::option::Option<::prost::alloc::boxed::Box<message::EncEventResponseMessage>>,
     #[prost(message, optional, boxed, tag = "77")]
     pub comment_message: ::core::option::Option<::prost::alloc::boxed::Box<message::CommentMessage>>,
     #[prost(message, optional, boxed, tag = "78")]
     pub newsletter_admin_invite_message: ::core::option::Option<::prost::alloc::boxed::Box<message::NewsletterAdminInviteMessage>>,
-    #[prost(message, optional, tag = "80")]
-    pub placeholder_message: ::core::option::Option<message::PlaceholderMessage>,
-    #[prost(message, optional, tag = "82")]
-    pub secret_encrypted_message: ::core::option::Option<message::SecretEncryptedMessage>,
+    #[prost(message, optional, boxed, tag = "80")]
+    pub placeholder_message: ::core::option::Option<::prost::alloc::boxed::Box<message::PlaceholderMessage>>,
+    #[prost(message, optional, boxed, tag = "82")]
+    pub secret_encrypted_message: ::core::option::Option<::prost::alloc::boxed::Box<message::SecretEncryptedMessage>>,
     #[prost(message, optional, boxed, tag = "83")]
     pub album_message: ::core::option::Option<::prost::alloc::boxed::Box<message::AlbumMessage>>,
     #[prost(message, optional, boxed, tag = "85")]
@@ -7803,8 +7803,8 @@ pub struct Message {
     pub group_status_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
     #[prost(message, optional, boxed, tag = "97")]
     pub rich_response_message: ::core::option::Option<::prost::alloc::boxed::Box<AiRichResponseMessage>>,
-    #[prost(message, optional, tag = "98")]
-    pub status_notification_message: ::core::option::Option<message::StatusNotificationMessage>,
+    #[prost(message, optional, boxed, tag = "98")]
+    pub status_notification_message: ::core::option::Option<::prost::alloc::boxed::Box<message::StatusNotificationMessage>>,
     #[prost(message, optional, boxed, tag = "99")]
     pub limit_sharing_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
     #[prost(message, optional, boxed, tag = "100")]
@@ -7817,16 +7817,16 @@ pub struct Message {
     pub group_status_message_v2: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
     #[prost(message, optional, boxed, tag = "104")]
     pub bot_forwarded_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
-    #[prost(message, optional, tag = "105")]
-    pub status_question_answer_message: ::core::option::Option<message::StatusQuestionAnswerMessage>,
+    #[prost(message, optional, boxed, tag = "105")]
+    pub status_question_answer_message: ::core::option::Option<::prost::alloc::boxed::Box<message::StatusQuestionAnswerMessage>>,
     #[prost(message, optional, boxed, tag = "106")]
     pub question_reply_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
-    #[prost(message, optional, tag = "107")]
-    pub question_response_message: ::core::option::Option<message::QuestionResponseMessage>,
-    #[prost(message, optional, tag = "109")]
-    pub status_quoted_message: ::core::option::Option<message::StatusQuotedMessage>,
-    #[prost(message, optional, tag = "110")]
-    pub status_sticker_interaction_message: ::core::option::Option<message::StatusStickerInteractionMessage>,
+    #[prost(message, optional, boxed, tag = "107")]
+    pub question_response_message: ::core::option::Option<::prost::alloc::boxed::Box<message::QuestionResponseMessage>>,
+    #[prost(message, optional, boxed, tag = "109")]
+    pub status_quoted_message: ::core::option::Option<::prost::alloc::boxed::Box<message::StatusQuotedMessage>>,
+    #[prost(message, optional, boxed, tag = "110")]
+    pub status_sticker_interaction_message: ::core::option::Option<::prost::alloc::boxed::Box<message::StatusStickerInteractionMessage>>,
     #[prost(message, optional, boxed, tag = "111")]
     pub poll_creation_message_v5: ::core::option::Option<::prost::alloc::boxed::Box<message::PollCreationMessage>>,
     #[prost(message, optional, boxed, tag = "113")]
@@ -7841,22 +7841,22 @@ pub struct Message {
     pub spoiler_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
     #[prost(message, optional, boxed, tag = "119")]
     pub poll_creation_message_v6: ::core::option::Option<::prost::alloc::boxed::Box<message::PollCreationMessage>>,
-    #[prost(message, optional, tag = "120")]
-    pub conditional_reveal_message: ::core::option::Option<message::ConditionalRevealMessage>,
-    #[prost(message, optional, tag = "121")]
-    pub poll_add_option_message: ::core::option::Option<message::PollAddOptionMessage>,
+    #[prost(message, optional, boxed, tag = "120")]
+    pub conditional_reveal_message: ::core::option::Option<::prost::alloc::boxed::Box<message::ConditionalRevealMessage>>,
+    #[prost(message, optional, boxed, tag = "121")]
+    pub poll_add_option_message: ::core::option::Option<::prost::alloc::boxed::Box<message::PollAddOptionMessage>>,
     #[prost(message, optional, boxed, tag = "122")]
     pub event_invite_message: ::core::option::Option<::prost::alloc::boxed::Box<message::EventInviteMessage>>,
-    #[prost(message, optional, tag = "123")]
-    pub group_root_key_share: ::core::option::Option<GroupRootKeyShare>,
-    #[prost(message, optional, tag = "124")]
-    pub payment_reminder_message: ::core::option::Option<message::PaymentReminderMessage>,
+    #[prost(message, optional, boxed, tag = "123")]
+    pub group_root_key_share: ::core::option::Option<::prost::alloc::boxed::Box<GroupRootKeyShare>>,
+    #[prost(message, optional, boxed, tag = "124")]
+    pub payment_reminder_message: ::core::option::Option<::prost::alloc::boxed::Box<message::PaymentReminderMessage>>,
     #[prost(message, optional, boxed, tag = "125")]
     pub split_payment_message: ::core::option::Option<::prost::alloc::boxed::Box<message::SplitPaymentMessage>>,
     #[prost(message, optional, boxed, tag = "126")]
     pub newsletter_admin_profile_status_message: ::core::option::Option<::prost::alloc::boxed::Box<message::FutureProofMessage>>,
-    #[prost(message, optional, tag = "127")]
-    pub root_secret_distribute_message: ::core::option::Option<message::RootSecretDistributeMessage>,
+    #[prost(message, optional, boxed, tag = "127")]
+    pub root_secret_distribute_message: ::core::option::Option<::prost::alloc::boxed::Box<message::RootSecretDistributeMessage>>,
 }
 /// Nested message and enum types in `Message`.
 pub mod message {
@@ -17927,8 +17927,8 @@ pub mod web_features {
 pub struct WebMessageInfo {
     #[prost(message, optional, tag = "1")]
     pub key: ::core::option::Option<MessageKey>,
-    #[prost(message, optional, tag = "2")]
-    pub message: ::core::option::Option<Message>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub message: ::core::option::Option<::prost::alloc::boxed::Box<Message>>,
     #[prost(uint64, optional, tag = "3")]
     pub message_timestamp: ::core::option::Option<u64>,
     #[prost(enumeration = "web_message_info::Status", optional, tag = "4")]
@@ -18039,8 +18039,8 @@ pub struct WebMessageInfo {
     pub target_message_id: ::core::option::Option<MessageKey>,
     #[prost(message, repeated, tag = "68")]
     pub message_add_ons: ::prost::alloc::vec::Vec<MessageAddOn>,
-    #[prost(message, optional, tag = "69")]
-    pub status_mention_message_info: ::core::option::Option<StatusMentionMessage>,
+    #[prost(message, optional, boxed, tag = "69")]
+    pub status_mention_message_info: ::core::option::Option<::prost::alloc::boxed::Box<StatusMentionMessage>>,
     #[prost(bool, optional, tag = "70")]
     pub is_support_ai_message: ::core::option::Option<bool>,
     #[prost(string, repeated, tag = "71")]

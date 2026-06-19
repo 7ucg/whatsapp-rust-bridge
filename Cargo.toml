@@ -2,6 +2,7 @@
 members = [
     ".",
     "native",
+    "internal/wacore",
     "internal/wacore/appstate",
     "internal/wacore/binary",
     "internal/wacore/derive",
@@ -15,8 +16,11 @@ resolver = "2"
 aes = "0.9.0"
 aes-gcm = { version = "0.11.0-rc.3", default-features = false, features = ["aes", "alloc", "bytes"] }
 anyhow = { version = "1.0", default-features = false }
+async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
+event-listener = { version = "5", default-features = false }
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 bytemuck = { version = "1.22", default-features = false }
 bytes = { version = "1.5", default-features = false }
@@ -45,6 +49,7 @@ thiserror = "2.0.17"
 uuid = { version = "1", default-features = false }
 yoke = { version = "0.8", features = ["derive"] }
 
+wacore           = { path = "internal/wacore",           default-features = false, version = "0.6.0" }
 wacore-appstate  = { path = "internal/wacore/appstate",  default-features = false, version = "0.6.0" }
 wacore-binary    = { path = "internal/wacore/binary",    default-features = false, version = "0.6.0" }
 wacore-derive    = { path = "internal/wacore/derive",    version = "0.6.0" }

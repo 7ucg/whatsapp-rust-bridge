@@ -1,0 +1,66 @@
+[package]
+name = "wacore"
+version = "0.6.0"
+edition = "2024"
+authors = ["Baron"]
+license = "MIT"
+repository = "https://github.com/7ucg/whatsapp-rust-bridge"
+description = "Core WhatsApp protocol implementation without runtime dependencies"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["simd"]
+simd = ["wacore-appstate/simd"]
+debug-diagnostics = []
+debug-snapshots = []
+# Render raw phone numbers in tracing fields instead of redacted tokens (debug only).
+tracing-pii = ["wacore-binary/tracing-pii"]
+# Disables XEdDSA verification of the server's Noise cert chain. Required
+# for the e2e mock server (self-signed certs). NEVER enable in prod.
+danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
+
+[dependencies]
+aes = { workspace = true }
+anyhow = { workspace = true }
+async-channel = { workspace = true }
+async-lock = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true, features = ["now", "serde"] }
+compact_str = { workspace = true }
+ctr = { workspace = true }
+event-listener = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true, features = ["std"] }
+hex = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+itoa = { workspace = true }
+log = { workspace = true }
+md5 = "0.8.0"
+portable-atomic = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde-big-array = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+typed-builder = "0.23"
+wacore-appstate = { workspace = true }
+wacore-binary = { workspace = true, features = ["serde"] }
+wacore-derive = { workspace = true }
+wacore-libsignal = { workspace = true }
+wacore-noise = { workspace = true }
+waproto = { workspace = true }
+
+# rand's getrandom backend needs the wasm_js feature on wasm32 (browser/Node).
+# On native targets getrandom uses the OS backend, so it is wasm-only here —
+# mirrors the other vendored subcrates.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", default-features = false, features = ["wasm_js"] }

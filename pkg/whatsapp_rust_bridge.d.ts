@@ -801,7 +801,7 @@ export interface InitOutput {
     readonly updateLogger: (a: number) => void;
     readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
     readonly __wasm_bindgen_func_elem_895: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1710: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1715: (a: number, b: number, c: number, d: number) => void;
     readonly __wasm_bindgen_func_elem_897: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
