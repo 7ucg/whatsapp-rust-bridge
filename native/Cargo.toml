@@ -39,6 +39,7 @@ getrandom = "0.3.4"
 wacore-libsignal = { path = "../internal/wacore/libsignal" }
 wacore-binary    = { path = "../internal/wacore/binary", features = ["serde"] }
 wacore-appstate  = { path = "../internal/wacore/appstate" }
+wacore           = { path = "../internal/wacore", features = ["voip"] }
 
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 compact_str = "0.9"

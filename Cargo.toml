@@ -130,6 +130,7 @@ symphonia = { version = "0.5.4", default-features = false, features = [
 tsify-next = { version = "0.5", default-features = false, features = ["js"] }
 uuid = { version = "1.18.1", default-features = false, features = ["v4", "js"] }
 
+wacore           = { path = "internal/wacore", features = ["voip"] }
 wacore-appstate  = { path = "internal/wacore/appstate" }
 wacore-binary    = { path = "internal/wacore/binary", features = ["serde"] }
 wacore-libsignal = { path = "internal/wacore/libsignal" }

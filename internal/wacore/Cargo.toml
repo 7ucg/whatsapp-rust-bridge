@@ -20,9 +20,13 @@ tracing-pii = ["wacore-binary/tracing-pii"]
 # Disables XEdDSA verification of the server's Noise cert chain. Required
 # for the e2e mock server (self-signed certs). NEVER enable in prod.
 danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
+# VoIP/calls media crypto + MLow codec (SRTP, SFrame, WAHKDF). Pure, no-Tokio.
+# Off by default: the media plane is opt-in and pulls aes-gcm into the build.
+voip = ["dep:aes-gcm"]
 
 [dependencies]
 aes = { workspace = true }
+aes-gcm = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
@@ -58,6 +62,11 @@ wacore-derive = { workspace = true }
 wacore-libsignal = { workspace = true }
 wacore-noise = { workspace = true }
 waproto = { workspace = true }
+
+# NOTE: the upstream wacore test suite + benches are intentionally NOT vendored
+# here — they target upstream's proto version and don't compile against this
+# bridge's newer proto. Run them in the source repo (whatsapp-rust-main), where
+# the proto matches; the voip/src here is byte-identical to that source.
 
 # rand's getrandom backend needs the wasm_js feature on wasm32 (browser/Node).
 # On native targets getrandom uses the OS backend, so it is wasm-only here —
