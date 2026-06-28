@@ -109,7 +109,9 @@ $profile    = if ($Debug) { "debug" } else { "release" }
 $cargoProf  = if ($Debug) { "" }     else { "--release" }
 
 $nativeDir   = Join-Path $PSScriptRoot "native"
-$outDir      = Join-Path $nativeDir "target\$rustTarget\$profile"
+# `native` is a workspace member, so cargo writes to the workspace-root target/,
+# NOT native/target/ (that holds only stale pre-workspace standalone builds).
+$outDir      = Join-Path $PSScriptRoot "target\$rustTarget\$profile"
 $distNative  = Join-Path $PSScriptRoot "dist-native"
 
 # Status values: "ok", "fail", "skip" — no special chars so comparisons work
