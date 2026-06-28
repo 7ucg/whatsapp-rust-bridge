@@ -61,12 +61,18 @@ Self-contained protocol implementations — no external git dependencies.
 
 | Crate | Responsibility |
 |---|---|
+| `wacore` | Full vendored WhatsApp core. The stateful client (`send`/`iq`/`store`) is present but unused; only its `voip` engine is exposed (via `src/voip.rs`). Built with `features = ["voip"]`. |
 | `wacore-binary` | WhatsApp binary protocol, JID types, constants, build-time token maps |
 | `wacore-libsignal` | Signal protocol: sessions, pre-keys, group cipher, ratchet, crypto primitives |
 | `wacore-noise` | Noise XX / IK / XXfallback handshake, frame encoder/decoder, edge routing |
 | `wacore-appstate` | App-state sync: key expansion, LTHash, patch/snapshot encode+decode+validate |
 | `wacore-derive` | Internal proc-macro helpers |
-| `waproto` | Protobuf definitions (WhatsApp Version 2.3000.1040457520) |
+| `waproto` | Protobuf definitions (WhatsApp 2.3000.x). `build.rs` boxes large `Message` fields and generates `tags.rs`; `lib.rs` exposes `whatsapp` + `tags` + `codec`. |
+
+The vendored `wacore` test suite + benches are **not** included here — they target
+upstream's proto version and don't build against this bridge's newer proto. Run
+them in the source repo (`whatsapp-rust-main`), where the proto matches; the
+`wacore/src` here (incl. the whole `voip`/MLow engine) is byte-identical to it.
 
 ### Native crate (`native/`)
 
@@ -96,13 +102,16 @@ Compiled to `cdylib` for the host platform or any cross-target.
 ## Proto regeneration
 
 ```powershell
-cargo build -p waproto --features generate
+npm run build:proto        # = cargo build -p waproto --features generate
 ```
 
 - Requires `protoc-bin-vendored` (bundled via Cargo)
 - Proto uses `syntax = "proto2"` — WhatsApp enums don't start at 0 (proto3 rejects this)
-- `build.rs` renames the generated `proto.rs` → `whatsapp.rs`
-- Field attribute paths use `.proto.` prefix (matches `package proto;` in the `.proto` file)
+- `build.rs` renames the generated `proto.rs` → `whatsapp.rs`, boxes large `Message`
+  fields, and generates `tags.rs` (wire-tag consts) from the descriptor
+- Field attribute / `bytes` / `boxed` paths use `.proto.` prefix (matches `package proto;`)
+- Both `whatsapp.rs` and `tags.rs` are committed; `lib.rs` also hand-exposes a `codec`
+  module of pinned non-generic encode/decode entry points
 
 ---
 

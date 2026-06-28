@@ -5,7 +5,7 @@ High-performance WhatsApp utilities powered by Rust — available as **WebAssemb
 ```
 ┌─────────────────────────────────────────────────────┐
 │                   Rust core (src/)                  │
-│  crypto · curve25519 · signal · binary · noise      │
+│  crypto · curve25519 · signal · binary · noise · voip│
 └──────────┬─────────────────┬───────────────┬────────┘
            │                 │               │
      wasm32 target      cdylib target   cdylib + jni
@@ -28,6 +28,9 @@ High-performance WhatsApp utilities powered by Rust — available as **WebAssemb
 | App State Sync (LTHash, patch/snapshot MAC) | ✅ |
 | Noise handshake (XX + IK + XXfallback) | ✅ |
 | JID parse / encode / inspect / construct | ✅ |
+| VoIP — MLow audio codec (encode / decode) | ✅ |
+| VoIP — E2E SRTP media pipeline (protect / unprotect) | ✅ |
+| VoIP — sans-io CallEngine (signaling + media driver) | ✅ |
 | Audio (waveform, duration) | ✅ (optional feature) |
 | Image (thumbnails, conversion) | ✅ (optional feature) |
 | Sticker metadata (WebP EXIF) | ✅ (optional feature) |
@@ -96,17 +99,20 @@ whatsapp-rust-bridge/
 │   ├── group_cipher.rs   Signal group messaging
 │   ├── key_helper.rs     Pre-key / signed-pre-key / registration ID
 │   ├── appstate.rs       App-state sync, LTHash, MACs
+│   ├── voip.rs           Calls: MLow codec, E2E SRTP, sans-io CallEngine
 │   ├── storage_adapter.rs  JS ↔ Signal storage bridge
 │   ├── audio.rs          Waveform + duration (feature = audio)
 │   ├── image_utils.rs    Thumbnails (feature = image)
 │   └── sticker_metadata.rs  WebP EXIF (feature = sticker)
 ├── internal/             Self-contained protocol crates
+│   ├── wacore            Full WhatsApp core + VoIP engine (vendored; client
+│   │                     parts unused, voip exposed via src/voip.rs)
 │   ├── wacore/appstate   Key expansion, LTHash, patch encode/decode
 │   ├── wacore/binary     Binary protocol, JID types, token maps
 │   ├── wacore/libsignal  Signal protocol (sessions, group, ratchet)
 │   ├── wacore/noise      Noise XX/IK/XXfallback, frame codec
 │   ├── wacore/derive     Proc-macro helpers
-│   └── waproto           Protobuf definitions (WA 2.3000.x)
+│   └── waproto           Protobuf definitions (WA 2.3000.x) + tags + codec
 ├── native/               Native C + JNI build
 │   ├── src/ffi/          C-ABI exports (wa_* functions)
 │   ├── src/jni_bridge/   JNI exports (Java_* symbols)

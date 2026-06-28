@@ -233,3 +233,29 @@ new GroupCipher(storage: SignalStorage, groupId: string, sender: ProtocolAddress
 | `WA_ERR_OUTPUT_SMALL` | -6 | Output buffer too small; `*out_len` set to required size |
 | `WA_ERR_HKDF_FAIL` | -7 | HKDF expansion failed |
 | `WA_ERR_RNG_FAIL` | -8 | OS random number generator failed |
+
+## VoIP / Calls (all targets)
+
+Pure media-plane primitives (`src/voip.rs`, `native/.../voip.rs`, `Voip.java`).
+Stateful — one instance per stream/call; release native handles (`*Free` / `*_free`).
+
+### MLow audio codec — `MlowEncoder` / `MlowDecoder`
+
+| Op | TS | C | Java |
+|---|---|---|---|
+| create | `new MlowEncoder()` | `wa_mlow_encoder_new` | `Voip.mlowEncoderNew` |
+| encode (f32 frame → bytes) | `enc.encode(Float32Array)` | `wa_mlow_encode` | `Voip.mlowEncode` |
+| decode (bytes → f32) | `dec.decode(Uint8Array)` | `wa_mlow_decode` | `Voip.mlowDecode` |
+| redundancy / reset / free | `dec.setRedundancy` · `reset()` | `wa_mlow_decoder_set_redundancy` · `*_reset` · `*_free` | `mlowDecoderSetRedundancy` · `*Reset` · `*Free` |
+
+Mic frames are 960 samples (60 ms @ 16 kHz mono). C decode `out_len` is in **float elements**.
+
+### E2E SRTP — `MediaPipeline`
+
+`create(callKey, selfLid, peerLid, ssrc, samplesPerPacket, warpMiTagLen)` → `protectAudio` (bytes→packet), `unprotectAudio` (packet→bytes | none), `rekeyRecv`, free. Create fails (throw / NULL / 0) if the callKey is too short to derive E2E keys.
+
+### CallEngine — sans-io signaling + media driver
+
+`create(configJson)` → `start(now)` → feed `handleRelayPacket` / `handleMicFrame` / `handleTimeout` → drain `pollOutput()` until it returns `0` (TIMEOUT), taking the payload per **output kind** (`1` Transmit, `2` Playout, `3` Event) via `takeTransmit` / `takePlayout` / `eventKind`+`takeForeignAudio`/`eventCode`. Arm timers from `pollTimeout()` (ms, `-1` = none). Plus `rekeyRecv`, `callId`, `direction` (0 out / 1 in), `isAllocated`, `isTerminated`. STUN transaction ids use an OS RNG.
+
+Config JSON (snake_case): `call_id`, `direction` (`"incoming"`/`"outgoing"`), `self_lid`, `peer_lid`, `call_key[]`, `ssrc`, `samples_per_packet`, `relay_token[]`, `relay_ip`, `relay_port`, `integrity_key[]`, `warp_mi_tag_len`, `enable_media`, `enable_sframe`.

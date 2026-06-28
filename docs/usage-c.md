@@ -306,3 +306,63 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> generate_key_pair() {
     return { pub, priv };
 }
 ```
+
+## VoIP / Calls
+
+Stateful handles: create with `*_new`, drive, release with `*_free`. Encode/decode
+use the `out_buf`/`out_len` convention — call with a NULL/too-small buffer to learn
+the required size in `*out_len`, then call again.
+
+### MLow audio codec
+
+```c
+MlowEncoder *enc = wa_mlow_encoder_new();
+MlowDecoder *dec = wa_mlow_decoder_new();
+
+// encode a 960-sample f32 frame (16 kHz mono)
+uint8_t pkt[512]; size_t pkt_len = sizeof(pkt);
+wa_mlow_encode(enc, mic_frame, 960, pkt, &pkt_len);   // WA_OK
+
+// decode -> PCM (out_len is in FLOAT ELEMENTS, not bytes)
+float pcm[1024]; size_t pcm_len = 1024;
+wa_mlow_decode(dec, pkt, pkt_len, pcm, &pcm_len);
+
+wa_mlow_encoder_free(enc);
+wa_mlow_decoder_free(dec);
+```
+
+### E2E SRTP media pipeline
+
+```c
+MediaPipeline *mp = wa_media_pipeline_new(
+    call_key, 32, self_lid, self_lid_len, peer_lid, peer_lid_len,
+    ssrc, /*samples*/ 960, /*warp_mi_tag_len*/ 4);   // NULL on bad input
+
+uint8_t out[2048]; size_t out_len = sizeof(out);
+wa_media_pipeline_protect(mp, payload, payload_len, out, &out_len);
+int rc = wa_media_pipeline_unprotect(mp, packet, packet_len, out, &out_len);
+// rc == WA_ERR_DECRYPT_FAIL (with *out_len = 0) if not decryptable audio
+wa_media_pipeline_free(mp);
+```
+
+### CallEngine (sans-io)
+
+Config is a UTF-8 JSON string (fields documented in the header). Drive: feed
+inputs, then drain `wa_call_engine_poll_output` until it returns 0 (TIMEOUT),
+fetching each payload via the matching call. Times are monotonic ms (`uint64_t`).
+
+```c
+WaCallEngine *eng = wa_call_engine_new(config_json, config_json_len);  // NULL on error
+wa_call_engine_start(eng, now);
+wa_call_engine_handle_relay_packet(eng, now, packet, packet_len);
+
+for (int32_t k = wa_call_engine_poll_output(eng); k != 0;
+             k = wa_call_engine_poll_output(eng)) {
+    if (k == 1) { /* TRANSMIT  */ wa_call_engine_take_transmit(eng, buf, &len); }
+    else if (k == 2) { /* PLAYOUT (int16, len in elements) */
+        wa_call_engine_take_playout(eng, pcm, &n); }
+    else if (k == 3) { /* EVENT */ int32_t ev = wa_call_engine_event_kind(eng); }
+}
+int64_t arm_at = wa_call_engine_poll_timeout(eng);   // ms, or -1
+wa_call_engine_free(eng);
+```

@@ -294,3 +294,72 @@ import type {
   PreKeyBundleInput,
 } from "whatsapp-rust-bridge-baron";
 ```
+
+---
+
+## VoIP / Calls
+
+Pure media-plane primitives for WhatsApp calls (no networking — you own the socket).
+All instances are stateful; create one per stream/call and reuse it.
+
+### MLow audio codec
+
+```ts
+import { MlowEncoder, MlowDecoder } from "whatsapp-rust-bridge-baron";
+
+const enc = new MlowEncoder();
+const dec = new MlowDecoder();
+
+// 60ms mic frame: exactly 960 f32 samples (16 kHz mono, range -1.0..=1.0)
+const payload = enc.encode(micFrame);     // Float32Array -> Uint8Array
+const pcm     = dec.decode(payload);      // Uint8Array -> Float32Array (PLC on loss)
+// dec.setRedundancy(n); enc.reset(); dec.reset();
+```
+
+### E2E SRTP media pipeline
+
+```ts
+import { MediaPipeline } from "whatsapp-rust-bridge-baron";
+
+// throws if callKey is too short to derive E2E keys
+const pipe = MediaPipeline.create(callKey, selfLid, peerLid, ssrc, 960, 4);
+
+const packet  = pipe.protectAudio(payload);      // codec bytes -> SRTP packet
+const decoded = pipe.unprotectAudio(packet);     // SRTP packet -> bytes | undefined
+pipe.rekeyRecv(callKey, answeringPeerLid);       // after the peer answers
+```
+
+### CallEngine (sans-io signaling + media driver)
+
+Feed inputs, then drain `pollOutput()` until it returns `0` (TIMEOUT = drained),
+taking each output's payload with the matching getter. Times are monotonic ms.
+
+```ts
+import { CallEngine } from "whatsapp-rust-bridge-baron";
+
+const eng = CallEngine.create(JSON.stringify({
+  call_id, direction: "incoming", self_lid, peer_lid,
+  call_key: [...callKey], ssrc, samples_per_packet: 960,
+  relay_token: [...relayToken], relay_ip, relay_port,
+  integrity_key: [...integrityKey], warp_mi_tag_len: 4,
+  enable_media: true, enable_sframe: true,
+}));
+
+eng.start(now);
+eng.handleRelayPacket(now, packet);   // or handleMicFrame(now, Int16Array) / handleTimeout(now)
+
+for (let kind = eng.pollOutput(); kind !== 0; kind = eng.pollOutput()) {
+  if (kind === 1) sendToRelay(eng.takeTransmit());        // TRANSMIT
+  else if (kind === 2) playout(eng.takePlayout());        // PLAYOUT (Int16Array)
+  else if (kind === 3) {                                   // EVENT
+    switch (eng.eventKind()) {
+      case 0: /* RelayAllocated */ break;
+      case 1: decodeForeign(eng.takeForeignAudio()); break;
+      case 2: /* RelayAllocateFailed */ console.warn(eng.eventCode()); break;
+      case 3: /* RelayAllocateTimedOut */ break;
+    }
+  }
+}
+const armAt = eng.pollTimeout();   // ms deadline, or -1 = no timer
+// eng.callId() / eng.direction() (0=out,1=in) / eng.isAllocated() / eng.isTerminated()
+```

@@ -246,3 +246,61 @@ If that fails, it falls back to extracting the library from the JAR resources at
 ```
 
 To bundle the library in a JAR, add it to `src/main/resources/native/<os>-<arch>/`.
+
+## VoIP / Calls
+
+`com.whatsapp.bridge.Voip` — pure media-plane primitives for calls. The codec,
+SRTP pipeline, and engine are stateful native objects referenced by an opaque
+`long` handle; always `*Free(handle)` when done and never reuse a freed handle.
+
+### MLow audio codec
+
+```java
+long enc = Voip.mlowEncoderNew();
+long dec = Voip.mlowDecoderNew();
+
+byte[]  pkt = Voip.mlowEncode(enc, micFrame);   // float[960] (16 kHz) -> bytes
+float[] pcm = Voip.mlowDecode(dec, pkt);        // bytes -> PCM (PLC on loss)
+
+Voip.mlowEncoderFree(enc);
+Voip.mlowDecoderFree(dec);
+```
+
+### E2E SRTP media pipeline
+
+```java
+long mp = Voip.mediaPipelineNew(callKey, selfLid, peerLid, ssrc, 960, 4); // 0 on error
+byte[] packet  = Voip.mediaPipelineProtect(mp, payload);
+byte[] decoded = Voip.mediaPipelineUnprotect(mp, packet);   // null if undecryptable
+Voip.mediaPipelineRekeyRecv(mp, callKey, answeringPeerLid);
+Voip.mediaPipelineFree(mp);
+```
+
+### CallEngine (sans-io)
+
+Config is a JSON string (see `Voip.java` / the C header for the fields). Feed
+inputs, then drain `callEnginePollOutput` until it returns 0 (TIMEOUT), taking
+each payload with the matching getter. Times are monotonic milliseconds.
+
+```java
+long eng = Voip.callEngineNew(configJson);      // 0 on error
+Voip.callEngineStart(eng, now);
+Voip.callEngineHandleRelayPacket(eng, now, packet);
+
+for (int k = Voip.callEnginePollOutput(eng); k != 0; k = Voip.callEnginePollOutput(eng)) {
+    switch (k) {
+        case 1 -> sendToRelay(Voip.callEngineTakeTransmit(eng));   // TRANSMIT
+        case 2 -> playout(Voip.callEngineTakePlayout(eng));        // PLAYOUT (short[])
+        case 3 -> {                                                 // EVENT
+            switch (Voip.callEngineEventKind(eng)) {
+                case 0 -> {}                                        // RelayAllocated
+                case 1 -> decodeForeign(Voip.callEngineTakeForeignAudio(eng));
+                case 2 -> log(Voip.callEngineEventCode(eng));       // RelayAllocateFailed
+                case 3 -> {}                                        // RelayAllocateTimedOut
+            }
+        }
+    }
+}
+long armAt = Voip.callEnginePollTimeout(eng);   // ms deadline, or -1
+Voip.callEngineFree(eng);
+```
