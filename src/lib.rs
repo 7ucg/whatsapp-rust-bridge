@@ -20,6 +20,7 @@ pub mod session_record;
 #[cfg(feature = "sticker")]
 pub mod sticker_metadata;
 pub mod storage_adapter;
+pub mod voip;
 
 // Re-export WhatsApp protocol constants for JS usage
 use js_sys::Uint8Array;

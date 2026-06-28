@@ -1,10 +1,13 @@
 use aes::Aes256;
-use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, KeyInit, Payload}};
-use cbc::{
-    Decryptor as CbcDecryptor, Encryptor as CbcEncryptor,
-    cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7},
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce,
 };
-use ctr::{Ctr128BE, cipher::StreamCipher};
+use cbc::{
+    cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit},
+    Decryptor as CbcDecryptor, Encryptor as CbcEncryptor,
+};
+use ctr::{cipher::StreamCipher, Ctr128BE};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use md5::Md5;
@@ -123,10 +126,9 @@ pub unsafe extern "C" fn wa_hmac_sha256(
     out_buf: *mut u8,
     out_len: *mut usize,
 ) -> i32 {
-    let (Some(d), Some(k)) = (
-        unsafe { in_slice(data, data_len) },
-        unsafe { in_slice(key, key_len) },
-    ) else {
+    let (Some(d), Some(k)) = (unsafe { in_slice(data, data_len) }, unsafe {
+        in_slice(key, key_len)
+    }) else {
         return BridgeError::NullPointer as i32;
     };
     let Ok(mut mac) = <HmacSha256 as Mac>::new_from_slice(k) else {
@@ -209,7 +211,10 @@ pub unsafe extern "C" fn wa_aes_encrypt_gcm(
         return BridgeError::BadKeyLength as i32;
     };
     let nonce = Nonce::from_slice(nonce_bytes);
-    let payload = Payload { msg: pt, aad: aad_slice };
+    let payload = Payload {
+        msg: pt,
+        aad: aad_slice,
+    };
     match cipher.encrypt(nonce, payload) {
         Ok(ct) => unsafe { write_out(&ct, out_buf, out_len) },
         Err(_) => BridgeError::EncryptionFailed as i32,
@@ -244,7 +249,10 @@ pub unsafe extern "C" fn wa_aes_decrypt_gcm(
         return BridgeError::BadKeyLength as i32;
     };
     let nonce = Nonce::from_slice(nonce_bytes);
-    let payload = Payload { msg: ct, aad: aad_slice };
+    let payload = Payload {
+        msg: ct,
+        aad: aad_slice,
+    };
     match cipher.decrypt(nonce, payload) {
         Ok(pt) => unsafe { write_out(&pt, out_buf, out_len) },
         Err(_) => BridgeError::DecryptionFailed as i32,
@@ -263,10 +271,9 @@ pub unsafe extern "C" fn wa_aes_encrypt_cbc(
     out_buf: *mut u8,
     out_len: *mut usize,
 ) -> i32 {
-    let (Some(pt), Some(k)) = (
-        unsafe { in_slice(plaintext, plaintext_len) },
-        unsafe { in_slice(key, 32) },
-    ) else {
+    let (Some(pt), Some(k)) = (unsafe { in_slice(plaintext, plaintext_len) }, unsafe {
+        in_slice(key, 32)
+    }) else {
         return BridgeError::NullPointer as i32;
     };
     let mut iv = [0u8; 16];
@@ -293,10 +300,9 @@ pub unsafe extern "C" fn wa_aes_decrypt_cbc(
     if ciphertext_len < 16 {
         return BridgeError::BadIvLength as i32;
     }
-    let (Some(ct_full), Some(k)) = (
-        unsafe { in_slice(ciphertext, ciphertext_len) },
-        unsafe { in_slice(key, 32) },
-    ) else {
+    let (Some(ct_full), Some(k)) = (unsafe { in_slice(ciphertext, ciphertext_len) }, unsafe {
+        in_slice(key, 32)
+    }) else {
         return BridgeError::NullPointer as i32;
     };
     let (iv, ct) = ct_full.split_at(16);

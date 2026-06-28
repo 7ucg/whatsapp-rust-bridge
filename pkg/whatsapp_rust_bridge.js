@@ -1,5 +1,247 @@
 /* @ts-self-types="./whatsapp_rust_bridge.d.ts" */
 
+/**
+ * Sans-io call engine: the signaling + media driver. Feed it inputs
+ * (`handle*`), then drain `pollOutput` until it returns `TIMEOUT` (0), taking
+ * each output's payload via the matching `take*`/`event*` getter. Drive timers
+ * off `pollTimeout()`. All times are monotonic milliseconds (JS `number`).
+ */
+export class CallEngine {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(CallEngine.prototype);
+        obj.__wbg_ptr = ptr;
+        CallEngineFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        CallEngineFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_callengine_free(ptr, 0);
+    }
+    /**
+     * @returns {string}
+     */
+    callId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.callengine_callId(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Create the engine from a JSON config string (see `EngineConfigJson`
+     * fields: callId, direction, selfLid, peerLid, callKey[], ssrc,
+     * samplesPerPacket, relayToken[], relayIp, relayPort, integrityKey[],
+     * warpMiTagLen, enableMedia, enableSframe — snake_case keys).
+     * @param {string} config_json
+     * @returns {CallEngine}
+     */
+    static create(config_json) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(config_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.callengine_create(retptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return CallEngine.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * 0 = outgoing, 1 = incoming.
+     * @returns {number}
+     */
+    direction() {
+        const ret = wasm.callengine_direction(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * STUN error code of a `RelayAllocateFailed` event, or -1.
+     * @returns {number}
+     */
+    eventCode() {
+        const ret = wasm.callengine_eventCode(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Kind of the last `EVENT` (0=RelayAllocated,1=ForeignAudio,
+     * 2=RelayAllocateFailed,3=RelayAllocateTimedOut), or -1.
+     * @returns {number}
+     */
+    eventKind() {
+        const ret = wasm.callengine_eventKind(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Feed a 60ms mic frame (exactly 960 i16 samples, 16kHz mono).
+     * @param {number} now
+     * @param {Int16Array} pcm
+     */
+    handleMicFrame(now, pcm) {
+        const ptr0 = passArray16ToWasm0(pcm, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.callengine_handleMicFrame(this.__wbg_ptr, now, ptr0, len0);
+    }
+    /**
+     * Feed an inbound relay-channel packet.
+     * @param {number} now
+     * @param {Uint8Array} packet
+     */
+    handleRelayPacket(now, packet) {
+        const ptr0 = passArray8ToWasm0(packet, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.callengine_handleRelayPacket(this.__wbg_ptr, now, ptr0, len0);
+    }
+    /**
+     * Signal that the armed timer fired.
+     * @param {number} now
+     */
+    handleTimeout(now) {
+        wasm.callengine_handleTimeout(this.__wbg_ptr, now);
+    }
+    /**
+     * @returns {boolean}
+     */
+    isAllocated() {
+        const ret = wasm.callengine_isAllocated(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @returns {boolean}
+     */
+    isTerminated() {
+        const ret = wasm.callengine_isTerminated(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Deadline (ms) of the last `TIMEOUT` output, or -1 if none/no-timer.
+     * @returns {number}
+     */
+    lastTimeout() {
+        const ret = wasm.callengine_lastTimeout(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Drain one output. Returns its kind (0=TIMEOUT,1=TRANSMIT,2=PLAYOUT,
+     * 3=EVENT); fetch the payload with the matching getter, then call again
+     * until it returns 0 (TIMEOUT = drained).
+     * @returns {number}
+     */
+    pollOutput() {
+        const ret = wasm.callengine_pollOutput(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Next timer deadline (ms), or -1 if no timer is armed.
+     * @returns {number}
+     */
+    pollTimeout() {
+        const ret = wasm.callengine_pollTimeout(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Re-derive recv keys once the answering device LID is known.
+     * @param {string} answering_peer_lid
+     * @returns {boolean}
+     */
+    rekeyRecv(answering_peer_lid) {
+        const ptr0 = passStringToWasm0(answering_peer_lid, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.callengine_rekeyRecv(this.__wbg_ptr, ptr0, len0);
+        return ret !== 0;
+    }
+    /**
+     * Start the call (kick off relay allocate). `now` = monotonic ms.
+     * @param {number} now
+     */
+    start(now) {
+        wasm.callengine_start(this.__wbg_ptr, now);
+    }
+    /**
+     * Payload of a `ForeignAudio` event (a non-MLow inbound frame to decode
+     * with a platform codec).
+     * @returns {Uint8Array | undefined}
+     */
+    takeForeignAudio() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.callengine_takeForeignAudio(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getArrayU8FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * PCM of the last `PLAYOUT` output (i16 samples for the speaker).
+     * @returns {Int16Array | undefined}
+     */
+    takePlayout() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.callengine_takePlayout(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getArrayI16FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 2, 2);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Payload of the last `TRANSMIT` output (bytes to send over the relay).
+     * @returns {Uint8Array | undefined}
+     */
+    takeTransmit() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.callengine_takeTransmit(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getArrayU8FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+}
+if (Symbol.dispose) CallEngine.prototype[Symbol.dispose] = CallEngine.prototype.free;
+
 export class ExpandedAppStateKeys {
     static __wrap(ptr) {
         ptr = ptr >>> 0;
@@ -369,6 +611,236 @@ export class LTHashState {
     }
 }
 if (Symbol.dispose) LTHashState.prototype[Symbol.dispose] = LTHashState.prototype.free;
+
+/**
+ * E2E SRTP media pipeline for a call: derives the per-call SRTP keys from the
+ * callKey and protects/unprotects audio packets. Stateful (the SRTP context
+ * advances per packet) — keep one per call.
+ */
+export class MediaPipeline {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(MediaPipeline.prototype);
+        obj.__wbg_ptr = ptr;
+        MediaPipelineFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        MediaPipelineFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_mediapipeline_free(ptr, 0);
+    }
+    /**
+     * Create the pipeline. `callKey` is the negotiated call key; `selfLid` /
+     * `peerLid` are the LID JIDs; `ssrc` the local stream SSRC. Returns an
+     * error if the callKey is too short to derive E2E keys.
+     * @param {Uint8Array} call_key
+     * @param {string} self_lid
+     * @param {string} peer_lid
+     * @param {number} ssrc
+     * @param {number} samples_per_packet
+     * @param {number} warp_mi_tag_len
+     * @returns {MediaPipeline}
+     */
+    static create(call_key, self_lid, peer_lid, ssrc, samples_per_packet, warp_mi_tag_len) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(call_key, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(self_lid, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(peer_lid, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.mediapipeline_create(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ssrc, samples_per_packet, warp_mi_tag_len);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return MediaPipeline.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Encrypt + frame an audio payload (MLow/Opus) into an SRTP packet.
+     * @param {Uint8Array} audio_payload
+     * @returns {Uint8Array}
+     */
+    protectAudio(audio_payload) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(audio_payload, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.mediapipeline_protectAudio(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var v2 = getArrayU8FromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            return v2;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Re-derive receive keys after the peer answers from a specific device.
+     * @param {Uint8Array} call_key
+     * @param {string} answering_peer_lid
+     * @returns {boolean}
+     */
+    rekeyRecv(call_key, answering_peer_lid) {
+        const ptr0 = passArray8ToWasm0(call_key, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(answering_peer_lid, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.mediapipeline_rekeyRecv(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret !== 0;
+    }
+    /**
+     * Decrypt an inbound SRTP packet into its audio payload, or `undefined` if
+     * the packet is not a decryptable audio packet.
+     * @param {Uint8Array} packet
+     * @returns {Uint8Array | undefined}
+     */
+    unprotectAudio(packet) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(packet, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.mediapipeline_unprotectAudio(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v2;
+            if (r0 !== 0) {
+                v2 = getArrayU8FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v2;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+}
+if (Symbol.dispose) MediaPipeline.prototype[Symbol.dispose] = MediaPipeline.prototype.free;
+
+/**
+ * MLow audio decoder. Decodes MLow wire payloads back to f32 PCM. Stateful —
+ * keep one instance per incoming stream.
+ */
+export class MlowDecoder {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        MlowDecoderFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_mlowdecoder_free(ptr, 0);
+    }
+    /**
+     * Decode one MLow payload into PCM (f32 samples). Empty input / loss
+     * concealment yields the decoder's PLC output.
+     * @param {Uint8Array} payload
+     * @returns {Float32Array}
+     */
+    decode(payload) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(payload, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.mlowdecoder_decode(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var v2 = getArrayF32FromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 4, 4);
+            return v2;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    constructor() {
+        const ret = wasm.mlowdecoder_new();
+        this.__wbg_ptr = ret >>> 0;
+        MlowDecoderFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Reset decoder state.
+     */
+    reset() {
+        wasm.mlowdecoder_reset(this.__wbg_ptr);
+    }
+    /**
+     * Set the number of redundant (RED) frames the decoder expects.
+     * @param {number} n
+     */
+    setRedundancy(n) {
+        wasm.mlowdecoder_setRedundancy(this.__wbg_ptr, n);
+    }
+}
+if (Symbol.dispose) MlowDecoder.prototype[Symbol.dispose] = MlowDecoder.prototype.free;
+
+/**
+ * MLow audio encoder (WhatsApp call codec). Encodes f32 PCM frames into MLow
+ * wire payloads. Stateful — keep one instance per outgoing stream.
+ */
+export class MlowEncoder {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        MlowEncoderFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_mlowencoder_free(ptr, 0);
+    }
+    /**
+     * Encode one PCM frame (f32 samples, -1.0..=1.0) into an MLow payload.
+     * @param {Float32Array} pcm
+     * @returns {Uint8Array}
+     */
+    encode(pcm) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArrayF32ToWasm0(pcm, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.mlowencoder_encode(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            if (r3) {
+                throw takeObject(r2);
+            }
+            var v2 = getArrayU8FromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            return v2;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    constructor() {
+        const ret = wasm.mlowencoder_new();
+        this.__wbg_ptr = ret >>> 0;
+        MlowEncoderFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Reset encoder state (e.g. on a new call leg).
+     */
+    reset() {
+        wasm.mlowencoder_reset(this.__wbg_ptr);
+    }
+}
+if (Symbol.dispose) MlowEncoder.prototype[Symbol.dispose] = MlowEncoder.prototype.free;
 
 /**
  * Noise_IK_25519_AESGCM_SHA256 handshake — faster reconnect using a cached
@@ -2972,7 +3444,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_1715(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_2050(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3120,8 +3592,8 @@ function __wbg_get_imports() {
             getObject(arg0).warn(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 193, function: Function { arguments: [Externref], shim_idx: 194, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_895, __wasm_bindgen_func_elem_897);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 224, function: Function { arguments: [Externref], shim_idx: 225, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1197, __wasm_bindgen_func_elem_1199);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -3163,14 +3635,17 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_897(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_897(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_1199(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_1199(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_1715(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_1715(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_2050(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_2050(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
+const CallEngineFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_callengine_free(ptr >>> 0, 1));
 const ExpandedAppStateKeysFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_expandedappstatekeys_free(ptr >>> 0, 1));
@@ -3189,6 +3664,15 @@ const LTHashAntiTamperingFinalization = (typeof FinalizationRegistry === 'undefi
 const LTHashStateFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_lthashstate_free(ptr >>> 0, 1));
+const MediaPipelineFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_mediapipeline_free(ptr >>> 0, 1));
+const MlowDecoderFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_mlowdecoder_free(ptr >>> 0, 1));
+const MlowEncoderFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_mlowencoder_free(ptr >>> 0, 1));
 const NoiseIkSessionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_noiseiksession_free(ptr >>> 0, 1));
@@ -3310,6 +3794,16 @@ function dropObject(idx) {
     heap_next = idx;
 }
 
+function getArrayF32FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getFloat32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
+}
+
+function getArrayI16FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getInt16ArrayMemory0().subarray(ptr / 2, ptr / 2 + len);
+}
+
 function getArrayU8FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
@@ -3323,9 +3817,33 @@ function getDataViewMemory0() {
     return cachedDataViewMemory0;
 }
 
+let cachedFloat32ArrayMemory0 = null;
+function getFloat32ArrayMemory0() {
+    if (cachedFloat32ArrayMemory0 === null || cachedFloat32ArrayMemory0.byteLength === 0) {
+        cachedFloat32ArrayMemory0 = new Float32Array(wasm.memory.buffer);
+    }
+    return cachedFloat32ArrayMemory0;
+}
+
+let cachedInt16ArrayMemory0 = null;
+function getInt16ArrayMemory0() {
+    if (cachedInt16ArrayMemory0 === null || cachedInt16ArrayMemory0.byteLength === 0) {
+        cachedInt16ArrayMemory0 = new Int16Array(wasm.memory.buffer);
+    }
+    return cachedInt16ArrayMemory0;
+}
+
 function getStringFromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return decodeText(ptr, len);
+}
+
+let cachedUint16ArrayMemory0 = null;
+function getUint16ArrayMemory0() {
+    if (cachedUint16ArrayMemory0 === null || cachedUint16ArrayMemory0.byteLength === 0) {
+        cachedUint16ArrayMemory0 = new Uint16Array(wasm.memory.buffer);
+    }
+    return cachedUint16ArrayMemory0;
 }
 
 let cachedUint8ArrayMemory0 = null;
@@ -3383,9 +3901,23 @@ function makeMutClosure(arg0, arg1, dtor, f) {
     return real;
 }
 
+function passArray16ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 2, 2) >>> 0;
+    getUint16ArrayMemory0().set(arg, ptr / 2);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
+
 function passArray8ToWasm0(arg, malloc) {
     const ptr = malloc(arg.length * 1, 1) >>> 0;
     getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
+
+function passArrayF32ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 4, 4) >>> 0;
+    getFloat32ArrayMemory0().set(arg, ptr / 4);
     WASM_VECTOR_LEN = arg.length;
     return ptr;
 }
@@ -3477,6 +4009,9 @@ function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
     cachedDataViewMemory0 = null;
+    cachedFloat32ArrayMemory0 = null;
+    cachedInt16ArrayMemory0 = null;
+    cachedUint16ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     return wasm;
 }

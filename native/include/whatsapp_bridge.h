@@ -251,6 +251,118 @@ int32_t wa_decode_node(
     const uint8_t *data, size_t data_len,
     uint8_t *out_buf, size_t *out_len);
 
+/* ── VoIP: MLow audio codec ──────────────────────────────────────────────────
+ *
+ * Stateful: create a handle with *_new, drive it, free with *_free. The
+ * encode/decode calls use the out_buf/out_len convention — pass a NULL or
+ * too-small buffer to query the required length, then call again.
+ */
+
+typedef struct MlowEncoder MlowEncoder;
+typedef struct MlowDecoder MlowDecoder;
+
+/* Allocate / free / reset an MLow encoder. */
+MlowEncoder *wa_mlow_encoder_new(void);
+void wa_mlow_encoder_free(MlowEncoder *enc);
+void wa_mlow_encoder_reset(MlowEncoder *enc);
+
+/* Encode PCM (pcm/pcm_len f32 samples) into out_buf (*out_len in BYTES). */
+int32_t wa_mlow_encode(
+    MlowEncoder *enc,
+    const float *pcm, size_t pcm_len,
+    uint8_t *out_buf, size_t *out_len);
+
+/* Allocate / free / reset an MLow decoder. */
+MlowDecoder *wa_mlow_decoder_new(void);
+void wa_mlow_decoder_free(MlowDecoder *dec);
+void wa_mlow_decoder_reset(MlowDecoder *dec);
+void wa_mlow_decoder_set_redundancy(MlowDecoder *dec, int32_t n);
+
+/* Decode an MLow payload into out_buf (*out_len in FLOAT ELEMENTS). */
+int32_t wa_mlow_decode(
+    MlowDecoder *dec,
+    const uint8_t *payload, size_t payload_len,
+    float *out_buf, size_t *out_len);
+
+/* ── VoIP: E2E SRTP media pipeline ────────────────────────────────────────────
+ *
+ * Stateful per call. lids are UTF-8 (ptr+len, not NUL-terminated). protect/
+ * unprotect use the out_buf/out_len (bytes) convention. unprotect returns
+ * WA_ERR_DECRYPT_FAIL with *out_len=0 when the packet is not decryptable audio.
+ */
+
+typedef struct MediaPipeline MediaPipeline;
+
+/* Create / free a pipeline. new() returns NULL on bad UTF-8 or short callKey. */
+MediaPipeline *wa_media_pipeline_new(
+    const uint8_t *call_key, size_t call_key_len,
+    const uint8_t *self_lid, size_t self_lid_len,
+    const uint8_t *peer_lid, size_t peer_lid_len,
+    uint32_t ssrc, uint32_t samples_per_packet, size_t warp_mi_tag_len);
+void wa_media_pipeline_free(MediaPipeline *mp);
+
+/* Encrypt audio payload into an SRTP packet. */
+int32_t wa_media_pipeline_protect(
+    MediaPipeline *mp,
+    const uint8_t *payload, size_t payload_len,
+    uint8_t *out_buf, size_t *out_len);
+
+/* Decrypt an SRTP packet into its audio payload. */
+int32_t wa_media_pipeline_unprotect(
+    MediaPipeline *mp,
+    const uint8_t *packet, size_t packet_len,
+    uint8_t *out_buf, size_t *out_len);
+
+/* Re-derive receive keys after the peer answers. 1=ok, 0=no-op, <0=error. */
+int32_t wa_media_pipeline_rekey_recv(
+    MediaPipeline *mp,
+    const uint8_t *call_key, size_t call_key_len,
+    const uint8_t *answering_peer_lid, size_t answering_peer_lid_len);
+
+/* ── VoIP: sans-io CallEngine (signaling + media driver) ──────────────────────
+ *
+ * Drive loop: feed inputs (wa_call_engine_handle_*), then drain
+ * wa_call_engine_poll_output until it returns 0 (TIMEOUT = drained), fetching
+ * each output's payload with the matching take/last/event call. Arm timers off
+ * wa_call_engine_poll_timeout. All times are monotonic milliseconds.
+ *
+ * Output kinds: 0=Timeout(drained) 1=Transmit 2=Playout 3=Event.
+ * Event kinds:  0=RelayAllocated 1=ForeignAudio 2=RelayAllocateFailed 3=RelayAllocateTimedOut.
+ */
+
+typedef struct WaCallEngine WaCallEngine;
+
+/* Create from a UTF-8 JSON config (callId, direction "incoming"|"outgoing",
+ * selfLid, peerLid, callKey[], ssrc, samplesPerPacket, relayToken[], relayIp,
+ * relayPort, integrityKey[], warpMiTagLen, enableMedia, enableSframe — snake_case).
+ * Returns NULL on parse error / short callKey / bad endpoint. */
+WaCallEngine *wa_call_engine_new(const uint8_t *config_json, size_t config_json_len);
+void wa_call_engine_free(WaCallEngine *eng);
+
+void wa_call_engine_start(WaCallEngine *eng, uint64_t now);
+void wa_call_engine_handle_relay_packet(
+    WaCallEngine *eng, uint64_t now, const uint8_t *packet, size_t packet_len);
+void wa_call_engine_handle_mic_frame(
+    WaCallEngine *eng, uint64_t now, const int16_t *pcm, size_t pcm_len);
+void wa_call_engine_handle_timeout(WaCallEngine *eng, uint64_t now);
+
+/* Drain one output; returns its kind. Fetch payload via the matching call. */
+int32_t wa_call_engine_poll_output(WaCallEngine *eng);
+int32_t wa_call_engine_take_transmit(WaCallEngine *eng, uint8_t *out_buf, size_t *out_len);
+int32_t wa_call_engine_take_playout(WaCallEngine *eng, int16_t *out_buf, size_t *out_len);
+int64_t wa_call_engine_last_timeout(WaCallEngine *eng);
+int32_t wa_call_engine_event_kind(WaCallEngine *eng);
+int32_t wa_call_engine_take_foreign_audio(WaCallEngine *eng, uint8_t *out_buf, size_t *out_len);
+int32_t wa_call_engine_event_code(WaCallEngine *eng);
+
+int64_t wa_call_engine_poll_timeout(WaCallEngine *eng);
+int32_t wa_call_engine_rekey_recv(
+    WaCallEngine *eng, const uint8_t *answering_peer_lid, size_t answering_peer_lid_len);
+int32_t wa_call_engine_call_id(WaCallEngine *eng, uint8_t *out_buf, size_t *out_len);
+int32_t wa_call_engine_direction(WaCallEngine *eng);     /* 0=out 1=in -1=unknown */
+int32_t wa_call_engine_is_allocated(WaCallEngine *eng);  /* 1/0 */
+int32_t wa_call_engine_is_terminated(WaCallEngine *eng); /* 1/0 */
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

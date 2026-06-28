@@ -150,6 +150,88 @@ export interface SignedPreKeyPublicKey {
 }
 
 
+/**
+ * Sans-io call engine: the signaling + media driver. Feed it inputs
+ * (`handle*`), then drain `pollOutput` until it returns `TIMEOUT` (0), taking
+ * each output's payload via the matching `take*`/`event*` getter. Drive timers
+ * off `pollTimeout()`. All times are monotonic milliseconds (JS `number`).
+ */
+export class CallEngine {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    callId(): string;
+    /**
+     * Create the engine from a JSON config string (see `EngineConfigJson`
+     * fields: callId, direction, selfLid, peerLid, callKey[], ssrc,
+     * samplesPerPacket, relayToken[], relayIp, relayPort, integrityKey[],
+     * warpMiTagLen, enableMedia, enableSframe — snake_case keys).
+     */
+    static create(config_json: string): CallEngine;
+    /**
+     * 0 = outgoing, 1 = incoming.
+     */
+    direction(): number;
+    /**
+     * STUN error code of a `RelayAllocateFailed` event, or -1.
+     */
+    eventCode(): number;
+    /**
+     * Kind of the last `EVENT` (0=RelayAllocated,1=ForeignAudio,
+     * 2=RelayAllocateFailed,3=RelayAllocateTimedOut), or -1.
+     */
+    eventKind(): number;
+    /**
+     * Feed a 60ms mic frame (exactly 960 i16 samples, 16kHz mono).
+     */
+    handleMicFrame(now: number, pcm: Int16Array): void;
+    /**
+     * Feed an inbound relay-channel packet.
+     */
+    handleRelayPacket(now: number, packet: Uint8Array): void;
+    /**
+     * Signal that the armed timer fired.
+     */
+    handleTimeout(now: number): void;
+    isAllocated(): boolean;
+    isTerminated(): boolean;
+    /**
+     * Deadline (ms) of the last `TIMEOUT` output, or -1 if none/no-timer.
+     */
+    lastTimeout(): number;
+    /**
+     * Drain one output. Returns its kind (0=TIMEOUT,1=TRANSMIT,2=PLAYOUT,
+     * 3=EVENT); fetch the payload with the matching getter, then call again
+     * until it returns 0 (TIMEOUT = drained).
+     */
+    pollOutput(): number;
+    /**
+     * Next timer deadline (ms), or -1 if no timer is armed.
+     */
+    pollTimeout(): number;
+    /**
+     * Re-derive recv keys once the answering device LID is known.
+     */
+    rekeyRecv(answering_peer_lid: string): boolean;
+    /**
+     * Start the call (kick off relay allocate). `now` = monotonic ms.
+     */
+    start(now: number): void;
+    /**
+     * Payload of a `ForeignAudio` event (a non-MLow inbound frame to decode
+     * with a platform codec).
+     */
+    takeForeignAudio(): Uint8Array | undefined;
+    /**
+     * PCM of the last `PLAYOUT` output (i16 samples for the speaker).
+     */
+    takePlayout(): Int16Array | undefined;
+    /**
+     * Payload of the last `TRANSMIT` output (bytes to send over the relay).
+     */
+    takeTransmit(): Uint8Array | undefined;
+}
+
 export class ExpandedAppStateKeys {
     private constructor();
     free(): void;
@@ -206,6 +288,77 @@ export class LTHashState {
     setValueMac(index_mac_base64: string, value_mac: Uint8Array): void;
     hash: Uint8Array;
     version: bigint;
+}
+
+/**
+ * E2E SRTP media pipeline for a call: derives the per-call SRTP keys from the
+ * callKey and protects/unprotects audio packets. Stateful (the SRTP context
+ * advances per packet) — keep one per call.
+ */
+export class MediaPipeline {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Create the pipeline. `callKey` is the negotiated call key; `selfLid` /
+     * `peerLid` are the LID JIDs; `ssrc` the local stream SSRC. Returns an
+     * error if the callKey is too short to derive E2E keys.
+     */
+    static create(call_key: Uint8Array, self_lid: string, peer_lid: string, ssrc: number, samples_per_packet: number, warp_mi_tag_len: number): MediaPipeline;
+    /**
+     * Encrypt + frame an audio payload (MLow/Opus) into an SRTP packet.
+     */
+    protectAudio(audio_payload: Uint8Array): Uint8Array;
+    /**
+     * Re-derive receive keys after the peer answers from a specific device.
+     */
+    rekeyRecv(call_key: Uint8Array, answering_peer_lid: string): boolean;
+    /**
+     * Decrypt an inbound SRTP packet into its audio payload, or `undefined` if
+     * the packet is not a decryptable audio packet.
+     */
+    unprotectAudio(packet: Uint8Array): Uint8Array | undefined;
+}
+
+/**
+ * MLow audio decoder. Decodes MLow wire payloads back to f32 PCM. Stateful —
+ * keep one instance per incoming stream.
+ */
+export class MlowDecoder {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Decode one MLow payload into PCM (f32 samples). Empty input / loss
+     * concealment yields the decoder's PLC output.
+     */
+    decode(payload: Uint8Array): Float32Array;
+    constructor();
+    /**
+     * Reset decoder state.
+     */
+    reset(): void;
+    /**
+     * Set the number of redundant (RED) frames the decoder expects.
+     */
+    setRedundancy(n: number): void;
+}
+
+/**
+ * MLow audio encoder (WhatsApp call codec). Encodes f32 PCM frames into MLow
+ * wire payloads. Stateful — keep one instance per outgoing stream.
+ */
+export class MlowEncoder {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Encode one PCM frame (f32 samples, -1.0..=1.0) into an MLow payload.
+     */
+    encode(pcm: Float32Array): Uint8Array;
+    constructor();
+    /**
+     * Reset encoder state (e.g. on a new call leg).
+     */
+    reset(): void;
 }
 
 /**
@@ -638,12 +791,16 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_callengine_free: (a: number, b: number) => void;
     readonly __wbg_expandedappstatekeys_free: (a: number, b: number) => void;
     readonly __wbg_groupcipher_free: (a: number, b: number) => void;
     readonly __wbg_groupsessionbuilder_free: (a: number, b: number) => void;
     readonly __wbg_internalbinarynode_free: (a: number, b: number) => void;
     readonly __wbg_lthashantitampering_free: (a: number, b: number) => void;
     readonly __wbg_lthashstate_free: (a: number, b: number) => void;
+    readonly __wbg_mediapipeline_free: (a: number, b: number) => void;
+    readonly __wbg_mlowdecoder_free: (a: number, b: number) => void;
+    readonly __wbg_mlowencoder_free: (a: number, b: number) => void;
     readonly __wbg_noiseiksession_free: (a: number, b: number) => void;
     readonly __wbg_noisesession_free: (a: number, b: number) => void;
     readonly __wbg_noisexxfallbacksession_free: (a: number, b: number) => void;
@@ -664,6 +821,24 @@ export interface InitOutput {
     readonly areSameUser: (a: number, b: number, c: number, d: number) => number;
     readonly calculateAgreement: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly calculateSignature: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly callengine_callId: (a: number, b: number) => void;
+    readonly callengine_create: (a: number, b: number, c: number) => void;
+    readonly callengine_direction: (a: number) => number;
+    readonly callengine_eventCode: (a: number) => number;
+    readonly callengine_eventKind: (a: number) => number;
+    readonly callengine_handleMicFrame: (a: number, b: number, c: number, d: number) => void;
+    readonly callengine_handleRelayPacket: (a: number, b: number, c: number, d: number) => void;
+    readonly callengine_handleTimeout: (a: number, b: number) => void;
+    readonly callengine_isAllocated: (a: number) => number;
+    readonly callengine_isTerminated: (a: number) => number;
+    readonly callengine_lastTimeout: (a: number) => number;
+    readonly callengine_pollOutput: (a: number) => number;
+    readonly callengine_pollTimeout: (a: number) => number;
+    readonly callengine_rekeyRecv: (a: number, b: number, c: number) => number;
+    readonly callengine_start: (a: number, b: number) => void;
+    readonly callengine_takeForeignAudio: (a: number, b: number) => void;
+    readonly callengine_takePlayout: (a: number, b: number) => void;
+    readonly callengine_takeTransmit: (a: number, b: number) => void;
     readonly collectAppStateKeyIds: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly decodeAppStateRecord: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly decodeNode: (a: number, b: number, c: number) => void;
@@ -747,6 +922,17 @@ export interface InitOutput {
     readonly lthashstate_set_version: (a: number, b: bigint) => void;
     readonly lthashstate_version: (a: number) => bigint;
     readonly md5: (a: number, b: number) => number;
+    readonly mediapipeline_create: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
+    readonly mediapipeline_protectAudio: (a: number, b: number, c: number, d: number) => void;
+    readonly mediapipeline_rekeyRecv: (a: number, b: number, c: number, d: number, e: number) => number;
+    readonly mediapipeline_unprotectAudio: (a: number, b: number, c: number, d: number) => void;
+    readonly mlowdecoder_decode: (a: number, b: number, c: number, d: number) => void;
+    readonly mlowdecoder_new: () => number;
+    readonly mlowdecoder_reset: (a: number) => void;
+    readonly mlowdecoder_setRedundancy: (a: number, b: number) => void;
+    readonly mlowencoder_encode: (a: number, b: number, c: number, d: number) => void;
+    readonly mlowencoder_new: () => number;
+    readonly mlowencoder_reset: (a: number) => void;
     readonly noiseiksession_buildClientHello: (a: number, b: number) => void;
     readonly noiseiksession_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
     readonly noiseiksession_readServerHello: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
@@ -800,9 +986,9 @@ export interface InitOutput {
     readonly generateKeyPair: () => number;
     readonly updateLogger: (a: number) => void;
     readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_895: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1715: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_897: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1197: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2050: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1199: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

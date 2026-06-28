@@ -1,4 +1,4 @@
-use curve25519_dalek::{Scalar, constants::ED25519_BASEPOINT_TABLE};
+use curve25519_dalek::{constants::ED25519_BASEPOINT_TABLE, Scalar};
 use std::slice;
 use wacore_libsignal::core::curve::{
     KeyPair as CoreKeyPair, PrivateKey as CorePrivateKey, PublicKey as CorePublicKey,
@@ -12,10 +12,7 @@ use super::crypto::BridgeError;
 /// pub_key_out must be 33 bytes (0x05 prefix + 32 bytes).
 /// priv_key_out must be 32 bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wa_generate_key_pair(
-    pub_key_out: *mut u8,
-    priv_key_out: *mut u8,
-) -> i32 {
+pub unsafe extern "C" fn wa_generate_key_pair(pub_key_out: *mut u8, priv_key_out: *mut u8) -> i32 {
     if pub_key_out.is_null() || priv_key_out.is_null() {
         return BridgeError::NullPointer as i32;
     }
@@ -138,10 +135,7 @@ pub unsafe extern "C" fn wa_verify_signature(
 /// Derive public key from private key.
 /// priv_key: 32 bytes. out must be 33 bytes (0x05 prefix included).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wa_get_public_from_private(
-    priv_key: *const u8,
-    out: *mut u8,
-) -> i32 {
+pub unsafe extern "C" fn wa_get_public_from_private(priv_key: *const u8, out: *mut u8) -> i32 {
     if priv_key.is_null() || out.is_null() {
         return BridgeError::NullPointer as i32;
     }
@@ -177,4 +171,3 @@ fn parse_pub_key(bytes: &[u8]) -> Option<CorePublicKey> {
         _ => None,
     }
 }
-
