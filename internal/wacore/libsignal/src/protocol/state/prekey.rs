@@ -8,7 +8,7 @@ use std::fmt;
 use prost::Message;
 
 use crate::protocol::{
-    KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, stores::PreKeyRecordStructure,
+    stores::PreKeyRecordStructure, KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError,
 };
 
 /// A unique identifier selecting among this client's known pre-keys.

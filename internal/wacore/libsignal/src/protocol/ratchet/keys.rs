@@ -11,7 +11,7 @@ use arrayref::array_ref;
 use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
-use crate::protocol::{PrivateKey, PublicKey, Result, crypto, stores::session_structure};
+use crate::protocol::{crypto, stores::session_structure, PrivateKey, PublicKey, Result};
 
 /// Lazy message key generator that defers key derivation and avoids re-serialization.
 ///

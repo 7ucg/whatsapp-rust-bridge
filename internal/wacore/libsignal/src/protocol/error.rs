@@ -7,8 +7,8 @@ use std::panic::UnwindSafe;
 
 use crate::{
     core::{
-        ProtocolAddress,
         curve::{CurveError, KeyType},
+        ProtocolAddress,
     },
     protocol::CiphertextMessageType,
 };
@@ -64,6 +64,8 @@ pub enum SignalProtocolError {
     InvalidPreKeyId,
     /// invalid signed prekey identifier
     InvalidSignedPreKeyId,
+    /// invalid kyber prekey identifier
+    InvalidKyberPreKeyId,
 
     /// invalid MAC key length <{0}>
     InvalidMacKeyLength(usize),

@@ -5,7 +5,8 @@
 
 use std::clone::Clone;
 
-use crate::protocol::state::{PreKeyId, SignedPreKeyId};
+use crate::kem;
+use crate::protocol::state::{KyberPreKeyId, PreKeyId, SignedPreKeyId};
 use crate::protocol::{DeviceId, IdentityKey, PublicKey, Result, SignalProtocolError};
 
 #[derive(Clone)]
@@ -38,6 +39,7 @@ pub struct PreKeyBundleContent {
     pub ec_pre_key_public: Option<PublicKey>,
     pub ec_pre_key_signature: Option<Vec<u8>>,
     pub identity_key: Option<IdentityKey>,
+    pub kyber_pre_key: Option<(KyberPreKeyId, kem::PublicKey, Vec<u8>)>,
 }
 
 impl From<PreKeyBundle> for PreKeyBundleContent {
@@ -51,6 +53,7 @@ impl From<PreKeyBundle> for PreKeyBundleContent {
             ec_pre_key_public: Some(bundle.ec_signed_pre_key.public_key),
             ec_pre_key_signature: Some(bundle.ec_signed_pre_key.signature),
             identity_key: Some(bundle.identity_key),
+            kyber_pre_key: bundle.kyber_pre_key,
         }
     }
 }
@@ -83,6 +86,7 @@ impl TryFrom<PreKeyBundleContent> for PreKeyBundle {
             content.identity_key.ok_or_else(|| {
                 SignalProtocolError::InvalidArgument("identity_key is required".to_string())
             })?,
+            content.kyber_pre_key,
         )?;
 
         Ok(bundle)
@@ -97,6 +101,7 @@ pub struct PreKeyBundle {
     pre_key_public: Option<PublicKey>,
     ec_signed_pre_key: SignedPreKey,
     identity_key: IdentityKey,
+    kyber_pre_key: Option<(KyberPreKeyId, kem::PublicKey, Vec<u8>)>,
 }
 
 impl PreKeyBundle {
@@ -108,6 +113,7 @@ impl PreKeyBundle {
         signed_pre_key_public: PublicKey,
         signed_pre_key_signature: Vec<u8>,
         identity_key: IdentityKey,
+        kyber_pre_key: Option<(KyberPreKeyId, kem::PublicKey, Vec<u8>)>,
     ) -> Result<Self> {
         let (pre_key_id, pre_key_public) = match pre_key {
             None => (None, None),
@@ -127,6 +133,7 @@ impl PreKeyBundle {
             pre_key_public,
             ec_signed_pre_key,
             identity_key,
+            kyber_pre_key,
         })
     }
 
@@ -160,6 +167,20 @@ impl PreKeyBundle {
 
     pub fn identity_key(&self) -> Result<&IdentityKey> {
         Ok(&self.identity_key)
+    }
+
+    pub fn kyber_pre_key_id(&self) -> Option<KyberPreKeyId> {
+        self.kyber_pre_key.as_ref().map(|(id, _, _)| *id)
+    }
+
+    pub fn kyber_pre_key_public(&self) -> Option<&kem::PublicKey> {
+        self.kyber_pre_key.as_ref().map(|(_, pk, _)| pk)
+    }
+
+    pub fn kyber_pre_key_signature(&self) -> Option<&[u8]> {
+        self.kyber_pre_key
+            .as_ref()
+            .map(|(_, _, sig)| sig.as_slice())
     }
 
     pub fn modify<F>(self, modify: F) -> Result<Self>

@@ -22,6 +22,7 @@ mod crypto;
 pub mod error;
 mod group_cipher;
 mod identity_key;
+pub mod pqxdh;
 #[allow(clippy::module_inception)]
 mod protocol;
 mod ratchet;
@@ -51,22 +52,22 @@ pub use protocol::{
     PreKeySignalMessage, SenderKeyDistributionMessage, SenderKeyMessage, SignalMessage,
 };
 pub use ratchet::{
-    AliceSignalProtocolParameters, BobSignalProtocolParameters, ChainKey, MessageKeyGenerator,
-    RootKey, UsePQRatchet, derive_keys, initialize_alice_session_record, initialize_bob_session,
-    initialize_bob_session_record,
+    derive_keys, initialize_alice_session_record, initialize_bob_session,
+    initialize_bob_session_record, AliceSignalProtocolParameters, BobSignalProtocolParameters,
+    ChainKey, MessageKeyGenerator, RootKey, UsePQRatchet,
 };
 pub use sender_keys::{SenderKeyRecord, SenderKeyState};
 pub use session::{process_prekey, process_prekey_bundle};
 pub use session_cipher::{
-    DecryptionResult, message_decrypt, message_decrypt_prekey, message_decrypt_signal,
-    message_encrypt,
+    message_decrypt, message_decrypt_prekey, message_decrypt_signal, message_encrypt,
+    DecryptionResult,
 };
 pub use state::{
-    GenericSignedPreKey, PreKeyBundle, PreKeyBundleContent, PreKeyId, PreKeyRecord, SessionRecord,
-    SessionState, SignedPreKeyId, SignedPreKeyRecord,
+    GenericSignedPreKey, KyberPreKeyId, KyberPreKeyRecord, PreKeyBundle, PreKeyBundleContent,
+    PreKeyId, PreKeyRecord, SessionRecord, SessionState, SignedPreKeyId, SignedPreKeyRecord,
 };
 pub use storage::{
-    Direction, IdentityChange, IdentityKeyStore, PreKeyStore, ProtocolStore, SenderKeyStore,
-    SessionStore, SignedPreKeyStore,
+    Direction, IdentityChange, IdentityKeyStore, KyberPreKeyStore, PreKeyStore, ProtocolStore,
+    SenderKeyStore, SessionStore, SignedPreKeyStore,
 };
 pub use timestamp::Timestamp;

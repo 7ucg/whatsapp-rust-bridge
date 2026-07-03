@@ -8,7 +8,8 @@
 use crate::protocol::error::Result;
 use crate::protocol::sender_keys::SenderKeyRecord;
 use crate::protocol::state::{
-    PreKeyId, PreKeyRecord, SessionRecord, SignedPreKeyId, SignedPreKeyRecord,
+    KyberPreKeyId, KyberPreKeyRecord, PreKeyId, PreKeyRecord, SessionRecord, SignedPreKeyId,
+    SignedPreKeyRecord,
 };
 use crate::protocol::{IdentityKey, IdentityKeyPair, ProtocolAddress};
 use crate::store::sender_key_name::SenderKeyName;
@@ -185,6 +186,24 @@ pub trait SenderKeyStore: ThreadSafe {
     ) -> std::sync::Arc<async_lock::Mutex<()>> {
         std::sync::Arc::new(async_lock::Mutex::new(()))
     }
+}
+
+/// Interface for storing Kyber pre-keys.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait KyberPreKeyStore: ThreadSafe {
+    /// Look up the Kyber pre-key corresponding to `id`.
+    async fn get_kyber_pre_key(&self, id: KyberPreKeyId) -> Result<KyberPreKeyRecord>;
+
+    /// Set the entry for `id` to the value of `record`.
+    async fn save_kyber_pre_key(
+        &mut self,
+        id: KyberPreKeyId,
+        record: &KyberPreKeyRecord,
+    ) -> Result<()>;
+
+    /// Mark a one-time Kyber pre-key as consumed (delete it).
+    async fn mark_kyber_pre_key_used(&mut self, id: KyberPreKeyId) -> Result<()>;
 }
 
 /// Mixes in all the store interfaces defined in this module.

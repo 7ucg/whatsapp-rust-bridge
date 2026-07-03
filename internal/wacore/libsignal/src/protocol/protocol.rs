@@ -10,7 +10,7 @@ use sha2::Sha256;
 use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 
-use crate::protocol::state::{PreKeyId, SignedPreKeyId};
+use crate::protocol::state::{KyberPreKeyId, PreKeyId, SignedPreKeyId};
 use crate::protocol::{IdentityKey, PrivateKey, PublicKey, Result, SignalProtocolError, Timestamp};
 
 /// Get-or-init for `OnceLock<Box<[u8]>>` with a fallible initializer.
@@ -289,6 +289,8 @@ pub struct PreKeySignalMessage {
     base_key: PublicKey,
     identity_key: IdentityKey,
     message: SignalMessage,
+    kyber_pre_key_id: Option<KyberPreKeyId>,
+    kyber_ciphertext: Option<Vec<u8>>,
     serialized: Box<[u8]>,
 }
 
@@ -301,6 +303,8 @@ impl PreKeySignalMessage {
         base_key: PublicKey,
         identity_key: IdentityKey,
         message: SignalMessage,
+        kyber_pre_key_id: Option<KyberPreKeyId>,
+        kyber_ciphertext: Option<Vec<u8>>,
     ) -> Result<Self> {
         let proto_message = waproto::whatsapp::PreKeySignalMessage {
             registration_id: Some(registration_id),
@@ -309,6 +313,8 @@ impl PreKeySignalMessage {
             base_key: Some(base_key.serialize().to_vec()),
             identity_key: Some(identity_key.serialize().to_vec()),
             message: Some(Vec::from(message.as_ref())),
+            kyber_pre_key_id: kyber_pre_key_id.map(|id| id.value()),
+            kyber_ciphertext: kyber_ciphertext.clone(),
         };
         let mut serialized = Vec::with_capacity(1 + proto_message.encoded_len());
         serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
@@ -323,6 +329,8 @@ impl PreKeySignalMessage {
             base_key,
             identity_key,
             message,
+            kyber_pre_key_id,
+            kyber_ciphertext,
             serialized: serialized.into_boxed_slice(),
         })
     }
@@ -360,6 +368,16 @@ impl PreKeySignalMessage {
     #[inline]
     pub fn message(&self) -> &SignalMessage {
         &self.message
+    }
+
+    #[inline]
+    pub fn kyber_pre_key_id(&self) -> Option<KyberPreKeyId> {
+        self.kyber_pre_key_id
+    }
+
+    #[inline]
+    pub fn kyber_ciphertext(&self) -> Option<&[u8]> {
+        self.kyber_ciphertext.as_deref()
     }
 
     #[inline]
@@ -421,6 +439,8 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
             base_key,
             identity_key: IdentityKey::try_from(identity_key.as_ref())?,
             message: SignalMessage::try_from(message.as_ref())?,
+            kyber_pre_key_id: proto_structure.kyber_pre_key_id.map(KyberPreKeyId::new),
+            kyber_ciphertext: proto_structure.kyber_ciphertext,
             serialized: Box::from(value),
         })
     }

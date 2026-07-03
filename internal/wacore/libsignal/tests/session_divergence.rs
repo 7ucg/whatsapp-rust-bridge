@@ -8,11 +8,11 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use wacore_libsignal::protocol::{
-    CiphertextMessage, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
-    IdentityKeyPair, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore,
-    ProtocolAddress, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId,
-    SignedPreKeyRecord, SignedPreKeyStore, Timestamp, UsePQRatchet, message_decrypt,
-    message_encrypt, process_prekey_bundle,
+    message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage, Direction,
+    GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair,
+    PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, SessionRecord,
+    SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    Timestamp, UsePQRatchet,
 };
 
 // ---- in-memory store impls (clones of the bench fixtures, kept local
@@ -799,6 +799,8 @@ fn pkmsg_decrypt_failure_does_not_persist_promoted_session() {
         *pkmsg.base_key(),
         *pkmsg.identity_key(),
         tampered_inner,
+        None,
+        None,
     )
     .expect("reconstructed pkmsg with tampered inner");
     let tampered = CiphertextMessage::PreKeySignalMessage(tampered_pkmsg);

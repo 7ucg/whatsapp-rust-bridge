@@ -11,7 +11,7 @@ use prost::Message;
 use rand::{CryptoRng, Rng};
 
 use crate::protocol::{
-    KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, stores::IdentityKeyPairStructure,
+    stores::IdentityKeyPairStructure, KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError,
 };
 
 // Used for domain separation between alternate-identity signatures and other key-to-key signatures.

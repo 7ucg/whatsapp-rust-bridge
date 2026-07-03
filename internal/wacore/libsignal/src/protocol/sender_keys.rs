@@ -12,9 +12,9 @@ use sha2::Sha256;
 
 use crate::protocol::crypto::hmac_sha256;
 use crate::protocol::stores::{
-    SenderKeyRecordStructure, SenderKeyStateStructure, sender_key_state_structure,
+    sender_key_state_structure, SenderKeyRecordStructure, SenderKeyStateStructure,
 };
-use crate::protocol::{PrivateKey, PublicKey, SignalProtocolError, consts};
+use crate::protocol::{consts, PrivateKey, PublicKey, SignalProtocolError};
 
 /// A distinct error type to keep from accidentally propagating deserialization errors.
 #[derive(Debug)]
@@ -665,12 +665,10 @@ mod tests {
 
         // new() received the parsed key: memo pre-populated and pre-warmed.
         assert!(state.signing_key_memo_initialized());
-        assert!(
-            state
-                .signing_key_private()
-                .expect("memo key")
-                .has_warm_signing_cache()
-        );
+        assert!(state
+            .signing_key_private()
+            .expect("memo key")
+            .has_warm_signing_cache());
 
         // A cold load (protobuf roundtrip) drops the memo; the first
         // signing_key_private() call rebuilds AND warms it, and the clone
@@ -684,12 +682,10 @@ mod tests {
         // Clones of the state (the per-send record clone) carry the memo.
         let cloned = reloaded.clone();
         assert!(cloned.signing_key_memo_initialized());
-        assert!(
-            cloned
-                .signing_key_private()
-                .expect("cloned key")
-                .has_warm_signing_cache()
-        );
+        assert!(cloned
+            .signing_key_private()
+            .expect("cloned key")
+            .has_warm_signing_cache());
 
         // Verifier memo: send-side states (private key present) skip even
         // the allocation; it builds lazily if asked, is seeded eagerly only

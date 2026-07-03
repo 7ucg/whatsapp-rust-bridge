@@ -286,6 +286,7 @@ impl PreKeyUtils {
             signed_pre_key_public,
             signed_pre_key_signature.to_vec(),
             identity_key,
+            None, // no Kyber pre-key in classic WA bundles
         )?;
 
         // Companion devices (device != 0) carry a <device-identity> that ADV-binds

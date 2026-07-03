@@ -65,9 +65,9 @@ use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
 use crate::protocol::state::PreKeyId;
 use crate::protocol::state::SessionState;
 use crate::protocol::{
-    CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionRecord,
-    SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore, session,
+    session, CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore,
+    KeyPair, PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionRecord,
+    SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore,
 };
 
 /// Plaintext plus whether decrypting this message replaced a previously-stored
@@ -202,6 +202,8 @@ async fn message_encrypt_inner(
                 *items.base_key(),
                 local_identity_key,
                 message,
+                items.kyber_pre_key_id(),
+                items.kyber_ciphertext().map(|b| b.to_vec()),
             )?)
         } else {
             CiphertextMessage::SignalMessage(SignalMessage::new(
@@ -313,10 +315,10 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
         (Err(_), Some(snapshot)) => Some(snapshot),
         (Err(_), None) => None,
     };
-    if let Some(record) = store_target
-        && (had_session || record.session_state().is_some())
-    {
-        session_store.store_session(remote_address, record).await?;
+    if let Some(record) = store_target {
+        if had_session || record.session_state().is_some() {
+            session_store.store_session(remote_address, record).await?;
+        }
     }
 
     let (plaintext, pre_key_used, identity_change) = result?;
@@ -349,6 +351,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
         identity_store,
         pre_key_store,
         signed_pre_key_store,
+        None, // kyber_prekey_store — not available in this path
         use_pq_ratchet,
     )
     .await;
@@ -1102,6 +1105,7 @@ mod tests {
         }
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl SessionStore for MemSessionStore {
         async fn load_session(
             &self,
@@ -1137,6 +1141,7 @@ mod tests {
         }
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl IdentityKeyStore for MemIdentityStore {
         async fn get_identity_key_pair(&self) -> error::Result<IdentityKeyPair> {
             Ok(self.pair.clone())
@@ -1179,6 +1184,7 @@ mod tests {
         }
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl PreKeyStore for MemPreKeyStore {
         async fn get_pre_key(&self, id: PreKeyId) -> error::Result<PreKeyRecord> {
             self.0
@@ -1203,6 +1209,7 @@ mod tests {
         }
     }
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl SignedPreKeyStore for MemSignedPreKeyStore {
         async fn get_signed_pre_key(
             &self,
@@ -1286,6 +1293,7 @@ mod tests {
             signed_pair.public_key,
             signed_sig.to_vec(),
             bob_identity_key,
+            None,
         )
         .expect("valid bundle");
 
@@ -1396,6 +1404,7 @@ mod tests {
             signed_pair.public_key,
             signed_sig.to_vec(),
             bob_identity_key,
+            None,
         )
         .expect("valid bundle");
 
@@ -1559,6 +1568,7 @@ mod tests {
                 &bob_identity,
                 &bob_prekeys,
                 &bob_signed,
+                None,
                 UsePQRatchet::No,
             )
             .await
@@ -1572,6 +1582,7 @@ mod tests {
                 &bob_identity,
                 &bob_prekeys,
                 &bob_signed,
+                None,
                 UsePQRatchet::No,
             )
             .await

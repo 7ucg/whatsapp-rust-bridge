@@ -8,12 +8,12 @@ use std::cell::RefCell;
 use rand::{CryptoRng, Rng, RngExt};
 
 use crate::crypto::aes_256_cbc_decrypt_into;
-use crate::crypto::{DecryptionError as DecryptionErrorCrypto, aes_256_cbc_encrypt_into};
-use crate::protocol::SENDERKEY_MESSAGE_CURRENT_VERSION;
+use crate::crypto::{aes_256_cbc_encrypt_into, DecryptionError as DecryptionErrorCrypto};
 use crate::protocol::sender_keys::{SenderKeyState, SenderMessageKey};
+use crate::protocol::SENDERKEY_MESSAGE_CURRENT_VERSION;
 use crate::protocol::{
-    CiphertextMessageType, KeyPair, Result, SenderKeyDistributionMessage, SenderKeyMessage,
-    SenderKeyRecord, SenderKeyStore, SignalProtocolError, consts,
+    consts, CiphertextMessageType, KeyPair, Result, SenderKeyDistributionMessage, SenderKeyMessage,
+    SenderKeyRecord, SenderKeyStore, SignalProtocolError,
 };
 use crate::store::sender_key_name::SenderKeyName;
 
@@ -358,7 +358,7 @@ mod tests {
         keys: HashMap<SenderKeyName, SenderKeyRecord>,
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl SenderKeyStore for InMemorySenderKeyStore {
         async fn store_sender_key(
             &mut self,

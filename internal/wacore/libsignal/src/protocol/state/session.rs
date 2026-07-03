@@ -12,10 +12,10 @@ use subtle::ConstantTimeEq;
 use crate::core::curve::KeyType;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
-use crate::protocol::state::{PreKeyId, SignedPreKeyId};
+use crate::protocol::state::{KyberPreKeyId, PreKeyId, SignedPreKeyId};
 use crate::protocol::stores::session_structure::{self};
 use crate::protocol::stores::{RecordStructure, SessionStructure};
-use crate::protocol::{IdentityKey, KeyPair, PrivateKey, PublicKey, SignalProtocolError, consts};
+use crate::protocol::{consts, IdentityKey, KeyPair, PrivateKey, PublicKey, SignalProtocolError};
 
 /// A distinct error type to keep from accidentally propagating deserialization errors.
 #[derive(Debug)]
@@ -38,6 +38,8 @@ pub struct UnacknowledgedPreKeyMessageItems {
     pre_key_id: Option<PreKeyId>,
     signed_pre_key_id: SignedPreKeyId,
     base_key: PublicKey,
+    kyber_pre_key_id: Option<KyberPreKeyId>,
+    kyber_ciphertext: Option<Vec<u8>>,
 }
 
 impl UnacknowledgedPreKeyMessageItems {
@@ -45,11 +47,15 @@ impl UnacknowledgedPreKeyMessageItems {
         pre_key_id: Option<PreKeyId>,
         signed_pre_key_id: SignedPreKeyId,
         base_key: PublicKey,
+        kyber_pre_key_id: Option<KyberPreKeyId>,
+        kyber_ciphertext: Option<Vec<u8>>,
     ) -> Self {
         Self {
             pre_key_id,
             signed_pre_key_id,
             base_key,
+            kyber_pre_key_id,
+            kyber_ciphertext,
         }
     }
 
@@ -63,6 +69,14 @@ impl UnacknowledgedPreKeyMessageItems {
 
     pub fn base_key(&self) -> &PublicKey {
         &self.base_key
+    }
+
+    pub fn kyber_pre_key_id(&self) -> Option<KyberPreKeyId> {
+        self.kyber_pre_key_id
+    }
+
+    pub fn kyber_ciphertext(&self) -> Option<&[u8]> {
+        self.kyber_ciphertext.as_deref()
     }
 }
 
@@ -525,12 +539,16 @@ impl SessionState {
         pre_key_id: Option<PreKeyId>,
         signed_ec_pre_key_id: SignedPreKeyId,
         base_key: &PublicKey,
+        kyber_pre_key_id: Option<KyberPreKeyId>,
+        kyber_ciphertext: Option<Vec<u8>>,
     ) {
         let signed_ec_pre_key_id: u32 = signed_ec_pre_key_id.into();
         let pending = session_structure::PendingPreKey {
             pre_key_id: pre_key_id.map(PreKeyId::into),
             signed_pre_key_id: Some(signed_ec_pre_key_id as i32),
             base_key: Some(base_key.serialize().to_vec()),
+            kyber_pre_key_id: kyber_pre_key_id.map(|id| id.value()),
+            kyber_ciphertext,
         };
         self.session.pending_pre_key = Some(pending);
     }
@@ -549,6 +567,8 @@ impl SessionState {
                         .ok_or(InvalidSessionError("missing base key"))?,
                 )
                 .map_err(|_| InvalidSessionError("invalid pending PreKey message base key"))?,
+                pending_pre_key.kyber_pre_key_id.map(KyberPreKeyId::new),
+                pending_pre_key.kyber_ciphertext.clone(),
             )))
         } else {
             Ok(None)
@@ -665,13 +685,14 @@ impl SessionRecord {
         version: u32,
         alice_base_key: &[u8],
     ) -> Result<bool, InvalidSessionError> {
-        if let Some(current_session) = &self.current_session
-            && current_session.session_version()? == version
-            && alice_base_key
-                .ct_eq(current_session.alice_base_key())
-                .into()
-        {
-            return Ok(true);
+        if let Some(current_session) = &self.current_session {
+            if current_session.session_version()? == version
+                && alice_base_key
+                    .ct_eq(current_session.alice_base_key())
+                    .into()
+            {
+                return Ok(true);
+            }
         }
 
         // OPTIMIZATION: Find matching session by index without cloning all sessions.
