@@ -1156,6 +1156,28 @@ pub mod conversation {
     pub const AUTH_AGENT_PARENT_COMPANY_NAME: u32 = 61;
     pub const AUTH_AGENT_OBA_PHONE_NUMBER: u32 = 62;
 }
+pub mod create_backup_input {
+    pub const RECOVERY_CODE: u32 = 1;
+    pub const USER_ID: u32 = 2;
+}
+pub mod create_backup_output {
+    pub const DEVICE: u32 = 1;
+    pub const VIRTUAL_DEVICE: u32 = 2;
+    pub const EPOCH0: u32 = 3;
+    pub const MAILBOX_ROOT_KEY: u32 = 4;
+    pub const ERROR: u32 = 5;
+}
+pub mod decrypt_message_input {
+    pub const EPOCH_ROOT_KEY: u32 = 1;
+    pub const EPOCH_ANON_ID: u32 = 2;
+    pub const THREAD_ID: u32 = 3;
+    pub const ENCRYPTION_VERSION: u32 = 4;
+    pub const CIPHERTEXT: u32 = 5;
+}
+pub mod decrypt_message_output {
+    pub const PLAINTEXT_PAYLOAD: u32 = 1;
+    pub const ERROR: u32 = 2;
+}
 pub mod device_capabilities {
     pub const CHAT_LOCK_SUPPORT_LEVEL: u32 = 1;
     pub const LID_MIGRATION: u32 = 2;
@@ -1193,6 +1215,17 @@ pub mod device_list_metadata {
     pub const RECIPIENT_KEY_HASH: u32 = 8;
     pub const RECIPIENT_TIMESTAMP: u32 = 9;
     pub const RECIPIENT_KEY_INDEXES: u32 = 10;
+}
+pub mod device_output {
+    pub const PUBLIC_KEY: u32 = 1;
+    pub const EPOCH_AUTH_PUBLIC_KEY: u32 = 2;
+    pub const EPOCH_AUTH_PUBLIC_KEY_SIG: u32 = 3;
+    pub const EPOCH_STORAGE_PUBLIC_KEY: u32 = 4;
+    pub const EPOCH_STORAGE_PUBLIC_KEY_SIG: u32 = 5;
+    pub const SUPPORTED_ENCRYPTION_VERSIONS: u32 = 6;
+    pub const ENCRYPTION_VERSION_SIGNATURE: u32 = 7;
+    pub const CLIENT_VERSION: u32 = 8;
+    pub const OCMF_CLIENT_STATE: u32 = 9;
 }
 pub mod device_props {
     pub const OS: u32 = 1;
@@ -1264,13 +1297,54 @@ pub mod embedded_music {
     pub const DERIVED_CONTENT_START_TIME_IN_MS: u32 = 13;
     pub const OVERLAP_DURATION_IN_MS: u32 = 14;
 }
+pub mod encrypt_message_input {
+    pub const EPOCH_ROOT_KEY: u32 = 1;
+    pub const MAILBOX_ROOT_KEY: u32 = 2;
+    pub const ORF_CLIENT_STATE: u32 = 3;
+    pub const EPOCH_ANON_ID: u32 = 4;
+    pub const EPOCH_ID: u32 = 5;
+    pub const THREAD_ID: u32 = 6;
+    pub const WA_CANONICAL_USER_FBID: u32 = 7;
+    pub const TIMESTAMP_MS: u32 = 8;
+    pub const BACKUP_ID: u32 = 9;
+    pub const PLAINTEXT_PAYLOAD: u32 = 10;
+    pub const STANZA_ID: u32 = 11;
+}
+pub mod encrypt_message_output {
+    pub const ENCRYPTED_PROTOBUF: u32 = 1;
+    pub const ORF_THREAD_ID: u32 = 2;
+    pub const VALUE_SECRET_REF: u32 = 3;
+    pub const OFFLINE_THREADING_ID: u32 = 4;
+    pub const TIMESTAMP_MS: u32 = 5;
+    pub const MESSAGE_KEY: u32 = 6;
+    pub const ERROR: u32 = 7;
+}
 pub mod encrypted_pairing_request {
     pub const ENCRYPTED_PAYLOAD: u32 = 1;
     pub const IV: u32 = 2;
 }
+pub mod encrypted_secret_values_output {
+    pub const ENCRYPTED_DEVICE_PRIVATE_KEY: u32 = 1;
+    pub const ENCRYPTED_OBLIVIOUS_VALIDATION_TOKEN_BLOB: u32 = 2;
+    pub const ENCRYPTED_EPOCH_STORAGE_PRIVATE_KEY: u32 = 3;
+    pub const ENCRYPTED_OCMF_CLIENT_STATE: u32 = 4;
+    pub const ENCRYPTED_ORF_CLIENT_STATE_V2: u32 = 5;
+    pub const ENCRYPTED_MAILBOX_ROOT_KEY_BLOB: u32 = 6;
+    pub const ENCRYPTED_EPOCH_ANON_ID: u32 = 7;
+    pub const ENCRYPTED_EPOCH_ROOT_KEY: u32 = 8;
+}
 pub mod ephemeral_setting {
     pub const DURATION: u32 = 1;
     pub const TIMESTAMP: u32 = 2;
+}
+pub mod epoch0_output {
+    pub const EPOCH_FBID: u32 = 1;
+    pub const EPOCH_ANON_ID: u32 = 2;
+    pub const EPOCH_DATA: u32 = 3;
+    pub const WRAPPED_ROOT_KEY_FOR_SELF: u32 = 4;
+    pub const EPOCH_SIGNATURE: u32 = 5;
+    pub const EPOCH_ROOT_KEY_FINGERPRINT: u32 = 6;
+    pub const EPOCH_ROOT_KEY: u32 = 7;
 }
 pub mod event_additional_metadata {
     pub const IS_STALE: u32 = 1;
@@ -1543,6 +1617,12 @@ pub mod lid_migration_mapping_sync_message {
 pub mod lid_migration_mapping_sync_payload {
     pub const PN_TO_LID_MAPPINGS: u32 = 1;
     pub const CHAT_DB_MIGRATION_TIMESTAMP: u32 = 2;
+}
+pub mod labyrinth_wa_command {
+    pub const CREATE_BACKUP_INPUT: u32 = 1;
+    pub const ENCRYPT_MESSAGE_INPUT: u32 = 2;
+    pub const DECRYPT_MESSAGE_INPUT: u32 = 3;
+    pub const ORF_THREAD_ID_INPUT: u32 = 4;
 }
 pub mod legacy_message {
     pub const EVENT_RESPONSE_MESSAGE: u32 = 1;
@@ -3076,6 +3156,14 @@ pub mod notification_settings {
     pub const REACTIONS_MUTED: u32 = 5;
     pub const CALL_VIBRATE: u32 = 6;
 }
+pub mod orf_thread_id_input {
+    pub const ORF_CLIENT_STATE: u32 = 1;
+    pub const THREAD_ID: u32 = 2;
+}
+pub mod orf_thread_id_output {
+    pub const ORF_THREAD_ID: u32 = 1;
+    pub const ERROR: u32 = 2;
+}
 pub mod pairing_request {
     pub const COMPANION_PUBLIC_KEY: u32 = 1;
     pub const COMPANION_IDENTITY_KEY: u32 = 2;
@@ -3191,6 +3279,8 @@ pub mod pre_key_signal_message {
     pub const BASE_KEY: u32 = 2;
     pub const IDENTITY_KEY: u32 = 3;
     pub const MESSAGE: u32 = 4;
+    pub const KYBER_PRE_KEY_ID: u32 = 7;
+    pub const KYBER_CIPHERTEXT: u32 = 8;
 }
 pub mod premium_message_info {
     pub const SERVER_CAMPAIGN_ID: u32 = 1;
@@ -3353,6 +3443,8 @@ pub mod session_structure {
         pub const PRE_KEY_ID: u32 = 1;
         pub const SIGNED_PRE_KEY_ID: u32 = 3;
         pub const BASE_KEY: u32 = 2;
+        pub const KYBER_PRE_KEY_ID: u32 = 4;
+        pub const KYBER_CIPHERTEXT: u32 = 5;
     }
 }
 pub mod session_transparency_metadata {
@@ -3528,6 +3620,8 @@ pub mod sync_action_value {
     pub const THREAD_PIN_ACTION: u32 = 85;
     pub const AUTO_ORGANIZE_BUSINESS_CHAT_SETTING: u32 = 86;
     pub const BIZ_AI_SETTINGS_NUDGE_ACTION: u32 = 87;
+    pub const COEX_V2_VERSION_ACTION: u32 = 88;
+    pub const WASA_ROOT_SECRET_ACTION: u32 = 89;
     pub mod agent_action {
         pub const NAME: u32 = 1;
         pub const DEVICE_ID: u32 = 2;
@@ -3601,6 +3695,9 @@ pub mod sync_action_value {
     }
     pub mod clear_chat_action {
         pub const MESSAGE_RANGE: u32 = 1;
+    }
+    pub mod coex_v2_version_action {
+        pub const VERSION: u32 = 1;
     }
     pub mod contact_action {
         pub const FULL_NAME: u32 = 1;
@@ -3928,6 +4025,14 @@ pub mod sync_action_value {
     pub mod username_chat_start_mode_action {
         pub const CHAT_START_MODE: u32 = 1;
     }
+    pub mod wasa_root_secret_action {
+        pub const SECRETS: u32 = 1;
+        pub mod root_secret_entry {
+            pub const ID: u32 = 1;
+            pub const ROOT_SECRET: u32 = 2;
+            pub const EPOCH: u32 = 3;
+        }
+    }
     pub mod waffle_account_link_state_action {
         pub const LINK_STATE: u32 = 2;
     }
@@ -4061,6 +4166,15 @@ pub mod verified_name_certificate {
         pub const LOCALIZED_NAMES: u32 = 8;
         pub const ISSUE_TIME: u32 = 10;
     }
+}
+pub mod virtual_device_output {
+    pub const VD_ID: u32 = 1;
+    pub const VD_PUBLIC_KEY: u32 = 2;
+    pub const VD_EPOCH_STORAGE_PUBLIC_KEY: u32 = 3;
+    pub const VD_EPOCH_STORAGE_PUBLIC_KEY_SIG: u32 = 4;
+    pub const OCMF_ROTATION_TOKEN: u32 = 5;
+    pub const DEVICE_EPOCH_HMAC: u32 = 6;
+    pub const ENCRYPTED_SECRET_VALUES: u32 = 7;
 }
 pub mod wallpaper_settings {
     pub const FILENAME: u32 = 1;
@@ -4201,12 +4315,20 @@ pub mod web_notifications_info {
 pub mod app_data_message {
     pub const REACTION_INFO: u32 = 1;
     pub const TRANSCRIPTION_INFO: u32 = 2;
+    pub const AR_EFFECT_INFO: u32 = 3;
 }
 pub mod app_data_payloads {
     pub const MESSAGES: u32 = 1;
 }
 pub mod aqs_stats {
     pub const AQS: u32 = 1;
+}
+pub mod ar_effect_info {
+    pub const TRANSACTION_ID: u32 = 1;
+    pub const AR_EFFECT_ID: u32 = 2;
+}
+pub mod backup_mute {
+    pub const IS_MUTED: u32 = 1;
 }
 pub mod backup_relay_latency {
     pub const IPV4: u32 = 1;
@@ -4226,6 +4348,19 @@ pub mod backup_relay_latency_report {
 }
 pub mod backup_signal_envelope {
     pub const RELAY_LATENCY: u32 = 1;
+    pub const MUTE: u32 = 2;
+    pub const VIDEO_STATE: u32 = 3;
+    pub const TERMINATE: u32 = 4;
+}
+pub mod backup_terminate {
+    pub const REASON: u32 = 1;
+}
+pub mod backup_video_state {
+    pub const VIDEO_STATE: u32 = 1;
+    pub const TRANSACTION_ID: u32 = 2;
+    pub const DEVICE_ORIENTATION: u32 = 3;
+    pub const CODEC_SCHEME: u32 = 4;
+    pub const VID_DEC_CAPABILITY: u32 = 5;
 }
 pub mod bwa_info {
     pub const ID: u32 = 1;
