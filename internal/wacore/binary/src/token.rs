@@ -13,6 +13,7 @@ pub const BINARY_8: u8 = 252;
 pub const BINARY_20: u8 = 253;
 pub const BINARY_32: u8 = 254;
 pub const NIBBLE_8: u8 = 255;
+pub const INTEROP_JID_TUPLE: u8 = 244;
 pub const INTEROP_JID: u8 = 245;
 pub const FB_JID: u8 = 246;
 pub const AD_JID: u8 = 247;

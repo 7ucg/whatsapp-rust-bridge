@@ -1,11 +1,11 @@
 use crate::error::{BinaryError, Result};
-use crate::jid::{JidRef, push_jid_to_compact};
+use crate::jid::{push_jid_to_compact, JidRef};
 use crate::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef};
 use crate::token;
 use compact_str::CompactString;
 use std::borrow::Cow;
 #[cfg(feature = "simd")]
-use std::simd::{Simd, prelude::*, u8x16};
+use std::simd::{prelude::*, u8x16, Simd};
 
 /// Format a JidRef directly into CompactString using direct push operations,
 /// bypassing `fmt::Display` and `dyn Write` dispatch entirely.
@@ -161,6 +161,33 @@ impl<'a> Decoder<'a> {
         })
     }
 
+    /// INTEROP_JID_TUPLE (0xF4 / 244): user | device(2) | integrator(2) | domain(1)
+    /// Produces: `{integrator}-{user}[:{device}]@interop`
+    fn read_interop_jid_tuple(&mut self) -> Result<CompactString> {
+        let user = self
+            .read_value_as_string()?
+            .ok_or(BinaryError::InvalidNode)?;
+        let device = self.read_u16_be()?;
+        let integrator = self.read_u16_be()?;
+        let domain = self.read_u8()?;
+        if domain != 0 {
+            return Err(BinaryError::AttrParse(format!(
+                "INTEROP_JID_TUPLE invalid domain: {domain}"
+            )));
+        }
+        let mut s = CompactString::with_capacity(user.len() + 24);
+        s.push_str(itoa::Buffer::new().format(integrator));
+        s.push('-');
+        s.push_str(user.as_ref());
+        if device != 0 {
+            s.push(':');
+            s.push_str(itoa::Buffer::new().format(device));
+        }
+        s.push('@');
+        s.push_str(crate::jid::INTEROP_SERVER);
+        Ok(s)
+    }
+
     fn read_interop_jid(&mut self) -> Result<JidRef<'a>> {
         let user = self
             .read_value_as_string()?
@@ -225,6 +252,9 @@ impl<'a> Decoder<'a> {
             token::AD_JID => self
                 .read_ad_jid()
                 .map(|j| Some(NodeStr::Owned(jid_ref_to_compact(&j)))),
+            token::INTEROP_JID_TUPLE => self
+                .read_interop_jid_tuple()
+                .map(|s| Some(NodeStr::Owned(s))),
             token::INTEROP_JID => self
                 .read_interop_jid()
                 .map(|j| Some(NodeStr::Owned(jid_ref_to_compact(&j)))),
@@ -264,6 +294,9 @@ impl<'a> Decoder<'a> {
             }
             token::JID_PAIR => self.read_jid_pair().map(|j| Some(ValueRef::Jid(j))),
             token::AD_JID => self.read_ad_jid().map(|j| Some(ValueRef::Jid(j))),
+            token::INTEROP_JID_TUPLE => self
+                .read_interop_jid_tuple()
+                .map(|s| Some(ValueRef::String(NodeStr::Owned(s)))),
             token::INTEROP_JID => self.read_interop_jid().map(|j| Some(ValueRef::Jid(j))),
             token::FB_JID => self.read_fb_jid().map(|j| Some(ValueRef::Jid(j))),
             token::NIBBLE_8 | token::HEX_8 => self
