@@ -1,14 +1,15 @@
 use serde::Deserialize;
 use tsify_next::Tsify;
-use wasm_bindgen::{JsValue, prelude::*};
+use wasm_bindgen::{prelude::*, JsValue};
 
 use crate::protocol_address::ProtocolAddress;
 use crate::session_record::SessionRecord;
 use crate::storage_adapter::{JsStorageAdapter, SignalStorage};
 use wacore_libsignal::core::curve::PublicKey as CorePublicKey;
+use wacore_libsignal::kem;
 use wacore_libsignal::protocol::{
-    self as libsignal, PreKeyBundle, SessionRecord as CoreSessionRecord, SignalProtocolError,
-    UsePQRatchet,
+    self as libsignal, KyberPreKeyId, PreKeyBundle, SessionRecord as CoreSessionRecord,
+    SignalProtocolError, UsePQRatchet,
 };
 
 fn map_err(e: impl std::fmt::Display) -> JsValue {
@@ -48,6 +49,17 @@ pub struct SignedPreKeyPublicKey {
 #[derive(Deserialize, Tsify)]
 #[tsify(from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
+pub struct KyberPreKeyPublicKey {
+    pub key_id: u32,
+    #[tsify(type = "Uint8Array")]
+    pub public_key: Vec<u8>,
+    #[tsify(type = "Uint8Array")]
+    pub signature: Vec<u8>,
+}
+
+#[derive(Deserialize, Tsify)]
+#[tsify(from_wasm_abi)]
+#[serde(rename_all = "camelCase")]
 pub struct PreKeyBundleInput {
     pub registration_id: u32,
     #[tsify(type = "Uint8Array")]
@@ -55,6 +67,8 @@ pub struct PreKeyBundleInput {
     #[serde(default)]
     pub pre_key: Option<PreKeyPublicKey>,
     pub signed_pre_key: SignedPreKeyPublicKey,
+    #[serde(default)]
+    pub kyber_pre_key: Option<KyberPreKeyPublicKey>,
 }
 
 #[wasm_bindgen(js_name = SessionBuilder)]
@@ -93,6 +107,15 @@ impl SessionBuilder {
         let identity_key =
             libsignal::IdentityKey::decode(&bundle_input.identity_key).map_err(map_err)?;
 
+        let kyber_pre_key = bundle_input
+            .kyber_pre_key
+            .map(|kpk| {
+                kem::PublicKey::deserialize(&kpk.public_key)
+                    .map(|key| (KyberPreKeyId::new(kpk.key_id), key, kpk.signature))
+                    .map_err(map_err)
+            })
+            .transpose()?;
+
         let bundle = PreKeyBundle::new(
             bundle_input.registration_id,
             self.remote_address.0.device_id(),
@@ -101,6 +124,7 @@ impl SessionBuilder {
             signed_pre_key_public,
             bundle_input.signed_pre_key.signature,
             identity_key,
+            kyber_pre_key,
         )
         .map_err(map_err)?;
 

@@ -2298,6 +2298,32 @@ export function generateKeyPair() {
 }
 
 /**
+ * Generate a Kyber1024 pre-key signed by the given identity key.
+ *
+ * The returned `KyberPreKey.keyPair.publicKey` and `.secretKey` are each prefixed
+ * with the key-type byte `0x08` (Kyber1024) as produced by `kem::Key::serialize()`.
+ * The `signature` covers the serialized public key using Ed25519 (Curve25519 private key).
+ * @param {KeyPair} identity_key_pair
+ * @param {number} kyber_key_id
+ * @returns {KyberPreKey}
+ */
+export function generateKyberPreKey(identity_key_pair, kyber_key_id) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.generateKyberPreKey(retptr, addHeapObject(identity_key_pair), kyber_key_id);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * @param {Uint8Array} snapshot_mac
  * @param {Uint8Array[]} value_macs
  * @param {bigint} version
@@ -3444,7 +3470,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_2052(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_2107(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3592,8 +3618,8 @@ function __wbg_get_imports() {
             getObject(arg0).warn(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 224, function: Function { arguments: [Externref], shim_idx: 225, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1197, __wasm_bindgen_func_elem_1199);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 225, function: Function { arguments: [Externref], shim_idx: 226, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1207, __wasm_bindgen_func_elem_1209);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -3635,12 +3661,12 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1199(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_1199(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_1209(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_1209(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_2052(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_2052(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_2107(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_2107(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const CallEngineFinalization = (typeof FinalizationRegistry === 'undefined')

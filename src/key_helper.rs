@@ -3,9 +3,11 @@ use rand::Rng;
 use serde::Serialize;
 use tsify_next::Tsify;
 use wacore_libsignal::core::curve::{KeyPair as CoreKeyPair, PrivateKey as CorePrivateKey};
+use wacore_libsignal::kem::{KeyPair as KemKeyPair, KeyType};
 use wasm_bindgen::prelude::*;
 
 pub use crate::curve::KeyPair;
+use crate::kyber_prekey::{KyberKeyPair, KyberPreKey};
 
 const PRIVATE_KEY_LENGTH: usize = 32;
 
@@ -87,6 +89,36 @@ pub fn generate_pre_key(key_id: u32) -> PreKey {
         key_id,
         key_pair: core_key_pair_to_key_pair(CoreKeyPair::generate(&mut rng())),
     }
+}
+
+/// Generate a Kyber1024 pre-key signed by the given identity key.
+///
+/// The returned `KyberPreKey.keyPair.publicKey` and `.secretKey` are each prefixed
+/// with the key-type byte `0x08` (Kyber1024) as produced by `kem::Key::serialize()`.
+/// The `signature` covers the serialized public key using Ed25519 (Curve25519 private key).
+#[wasm_bindgen(js_name = generateKyberPreKey)]
+pub fn generate_kyber_pre_key(
+    identity_key_pair: KeyPair,
+    kyber_key_id: u32,
+) -> Result<KyberPreKey, JsValue> {
+    let identity_private_key =
+        CorePrivateKey::deserialize(&identity_key_pair.priv_key).map_err(map_err)?;
+
+    let kem_pair = KemKeyPair::generate(KeyType::Kyber1024, &mut rng());
+    let pk_bytes = kem_pair.public_key.serialize().to_vec();
+
+    let signature = identity_private_key
+        .calculate_signature(&pk_bytes, &mut rng())
+        .map_err(map_err)?;
+
+    Ok(KyberPreKey {
+        key_id: kyber_key_id,
+        key_pair: KyberKeyPair {
+            public_key: pk_bytes,
+            secret_key: kem_pair.secret_key.serialize().to_vec(),
+        },
+        signature: signature.to_vec(),
+    })
 }
 
 #[wasm_bindgen(js_name = _serializeIdentityKeyPair)]
