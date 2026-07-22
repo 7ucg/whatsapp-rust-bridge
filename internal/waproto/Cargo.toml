@@ -2,24 +2,36 @@
 name = "waproto"
 version = "0.6.0"
 edition = "2024"
-authors = ["João Lucas <jlucaso@hotmail.com>"]
+authors = ["Baron"]
 license = "MIT"
-repository = "https://github.com/jlucaso1/whatsapp-rust"
+repository = "https://github.com/7ucg/whatsapp-rust-bridge"
 description = "Protocol Buffers definitions for WhatsApp"
+
+# `serde` is referenced only by derives injected into the generated code by
+# `build.rs` (`#[derive(serde::Serialize)]`), so static analysers miss it.
+[package.metadata.cargo-machete]
+ignored = ["serde"]
 
 [features]
 default = []
-generate = ["dep:prost-build", "dep:protoc-bin-vendored", "dep:prost-types", "dep:heck"]
 serde-deserialize = []
 serde-snake-case = ["serde-deserialize"]
+# Enums (de)serialize as their numeric repr instead of the variant name — what
+# the JS bridge / camelCase serializer expects.
+serde-enum-repr = ["dep:serde_repr"]
 
 [dependencies]
-prost = { version = "0.14.3", default-features = false, features = ["std", "derive"] }
-serde = { version = "1.0", features = ["derive", "rc"] }
+buffa = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_repr = { version = "0.1", optional = true }
 
 [build-dependencies]
-prost               = { version = "0.14.3", default-features = false, features = ["std"] }
-prost-build         = { version = "0.14.3", default-features = false, optional = true }
-prost-types         = { version = "0.14.3", default-features = false, features = ["std"], optional = true }
-protoc-bin-vendored = { version = "3", optional = true }
-heck                = { version = "0.5", optional = true }
+# buffa-build does the codegen; buffa-descriptor decodes the committed
+# descriptor so build.rs can emit the wire-tag consts; heck does case
+# conversion; sha2 powers the descriptor-freshness guard.
+buffa = { workspace = true }
+buffa-build = { workspace = true }
+buffa-descriptor = { workspace = true }
+heck = { workspace = true }
+sha2 = { workspace = true }

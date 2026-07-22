@@ -2,28 +2,28 @@ use async_trait::async_trait;
 use base64::prelude::*;
 use js_sys::{Promise, Uint8Array};
 use prost::Message;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_bytes::ByteBuf;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use waproto::whatsapp::{
+    RecordStructure, SenderKeyRecordStructure, SenderKeyStateStructure, SessionStructure,
     sender_key_state_structure::{SenderChainKey, SenderMessageKey, SenderSigningKey},
     session_structure::{
-        chain::{ChainKey, MessageKey},
         Chain,
+        chain::{ChainKey, MessageKey},
     },
-    RecordStructure, SenderKeyRecordStructure, SenderKeyStateStructure, SessionStructure,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use wacore_libsignal::protocol::{
     self as libsignal, Direction as StoreDirection, GenericSignedPreKey as _, IdentityChange,
-    IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair, KyberPreKeyId, KyberPreKeyRecord,
-    KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, PrivateKey, SenderKeyStore,
-    SessionStore, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair, PreKeyId, PreKeyRecord, PreKeyStore,
+    PrivateKey, SenderKeyStore, SessionStore, SignedPreKeyId, SignedPreKeyRecord,
+    SignedPreKeyStore,
 };
 type SignalResult<T> = wacore_libsignal::protocol::error::Result<T>;
 
@@ -48,8 +48,6 @@ export interface SignalStorage {
     loadSignedPreKey(id: number): SignedPreKey | null | undefined | Promise<SignedPreKey | null | undefined>;
     loadSenderKey(keyId: string): Uint8Array | null | undefined | Promise<Uint8Array | null | undefined>;
     storeSenderKey(keyId: string, record: Uint8Array): void | Promise<void>;
-    loadKyberPreKey?(id: number): KyberPreKey | null | undefined | Promise<KyberPreKey | null | undefined>;
-    markKyberPreKeyUsed?(id: number): void | Promise<void>;
 }
 "#;
 
@@ -108,12 +106,6 @@ extern "C" {
         key_id: &str,
         record: &Uint8Array,
     ) -> Result<JsValue, JsValue>;
-
-    #[wasm_bindgen(structural, method, catch, js_name = loadKyberPreKey)]
-    fn js_load_kyber_pre_key(this: &SignalStorage, id: u32) -> Result<JsValue, JsValue>;
-
-    #[wasm_bindgen(structural, method, catch, js_name = markKyberPreKeyUsed)]
-    fn js_mark_kyber_pre_key_used(this: &SignalStorage, id: u32) -> Result<JsValue, JsValue>;
 }
 
 #[derive(Clone)]
@@ -161,10 +153,10 @@ impl JsStorageAdapter {
     fn get_address_string(&self, address: &libsignal::ProtocolAddress) -> String {
         let name = address.name();
         let cache = self.last_address_cache.borrow();
-        if let Some((cached_name, cached_str)) = cache.as_ref() {
-            if cached_name == name {
-                return cached_str.clone();
-            }
+        if let Some((cached_name, cached_str)) = cache.as_ref()
+            && cached_name == name
+        {
+            return cached_str.clone();
         }
         drop(cache);
 
@@ -181,10 +173,11 @@ impl JsStorageAdapter {
         let sender_id = sender_key_name.sender_id();
 
         let cache = self.last_sender_key_cache.borrow();
-        if let Some((cached_group, cached_sender, cached_key_id)) = cache.as_ref() {
-            if cached_group == group_id && cached_sender == sender_id {
-                return cached_key_id.clone();
-            }
+        if let Some((cached_group, cached_sender, cached_key_id)) = cache.as_ref()
+            && cached_group == group_id
+            && cached_sender == sender_id
+        {
+            return cached_key_id.clone();
         }
         drop(cache);
 
@@ -682,10 +675,10 @@ fn js_value_to_bytes(value: &JsValue) -> Option<Vec<u8>> {
         return Some(js_array_to_bytes(&js_sys::Array::from(value)));
     }
 
-    if let Ok(data) = js_sys::Reflect::get(value, &JsValue::from_str("data")) {
-        if js_sys::Array::is_array(&data) {
-            return Some(js_array_to_bytes(&js_sys::Array::from(&data)));
-        }
+    if let Ok(data) = js_sys::Reflect::get(value, &JsValue::from_str("data"))
+        && js_sys::Array::is_array(&data)
+    {
+        return Some(js_array_to_bytes(&js_sys::Array::from(&data)));
     }
 
     None
@@ -727,10 +720,11 @@ fn get_bytes_from_buffer_json(obj: &JsValue, key: &str) -> Option<Vec<u8>> {
     // Check for Buffer-like object { type: "Buffer", data: [...] }
     let type_prop = js_sys::Reflect::get(&val, &JsValue::from_str("type")).ok();
     let data_prop = js_sys::Reflect::get(&val, &JsValue::from_str("data")).ok();
-    if let (Some(t), Some(d)) = (type_prop, data_prop) {
-        if t.as_string().as_deref() == Some("Buffer") && js_sys::Array::is_array(&d) {
-            return Some(js_array_to_bytes(&js_sys::Array::from(&d)));
-        }
+    if let (Some(t), Some(d)) = (type_prop, data_prop)
+        && t.as_string().as_deref() == Some("Buffer")
+        && js_sys::Array::is_array(&d)
+    {
+        return Some(js_array_to_bytes(&js_sys::Array::from(&d)));
     }
 
     // Try Uint8Array
@@ -794,7 +788,10 @@ impl SessionStore for JsStorageAdapter {
         }
     }
 
-    async fn has_session(&self, address: &libsignal::ProtocolAddress) -> SignalResult<bool> {
+    async fn has_session(
+        &self,
+        address: &libsignal::ProtocolAddress,
+    ) -> SignalResult<bool> {
         let address_str = self.get_address_string(address);
         Ok(self.cached_sessions.borrow().contains_key(&address_str))
     }
@@ -894,10 +891,10 @@ impl IdentityKeyStore for JsStorageAdapter {
         let address_name = address.name().to_string();
         let identity_bytes = identity.serialize();
 
-        if let Some(cached_key) = self.cached_identities.borrow().get(&address_name) {
-            if cached_key.as_slice() == identity_bytes.as_slice() {
-                return Ok(true);
-            }
+        if let Some(cached_key) = self.cached_identities.borrow().get(&address_name)
+            && cached_key.as_slice() == identity_bytes.as_slice()
+        {
+            return Ok(true);
         }
 
         let direction_val = match direction {
@@ -1104,89 +1101,5 @@ impl SenderKeyStore for JsStorageAdapter {
             .entry(key)
             .or_insert_with(|| std::sync::Arc::new(async_lock::Mutex::new(())))
             .clone()
-    }
-}
-
-// ── Kyber pre-key deserialization ────────────────────────────────────────────
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JsKyberKeyPairBytes {
-    #[serde(default, alias = "pubKey", alias = "publicKey", alias = "public")]
-    public_key: Option<ByteBuf>,
-    #[serde(default, alias = "privKey", alias = "secretKey", alias = "secret")]
-    secret_key: Option<ByteBuf>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JsKyberPreKeyPayload {
-    #[serde(default, alias = "keyId")]
-    id: Option<u32>,
-    key_pair: JsKyberKeyPairBytes,
-    #[serde(default)]
-    signature: Option<ByteBuf>,
-}
-
-impl JsKyberPreKeyPayload {
-    fn into_record(self, requested_id: KyberPreKeyId) -> SignalResult<KyberPreKeyRecord> {
-        use wacore_libsignal::kem;
-        let effective_id = self.id.map(KyberPreKeyId::new).unwrap_or(requested_id);
-        let public_key_bytes = self
-            .key_pair
-            .public_key
-            .ok_or_else(|| invalid_js_data("load_kyber_pre_key", "Missing public key bytes"))?
-            .into_vec();
-        let secret_key_bytes = self
-            .key_pair
-            .secret_key
-            .ok_or_else(|| invalid_js_data("load_kyber_pre_key", "Missing secret key bytes"))?
-            .into_vec();
-        let signature = self.signature.map(ByteBuf::into_vec).unwrap_or_default();
-
-        let public_key = kem::PublicKey::deserialize(&public_key_bytes)
-            .map_err(|e| invalid_js_data("load_kyber_pre_key", format!("bad public key: {e}")))?;
-        let secret_key = kem::SecretKey::deserialize(&secret_key_bytes)
-            .map_err(|e| invalid_js_data("load_kyber_pre_key", format!("bad secret key: {e}")))?;
-
-        Ok(KyberPreKeyRecord::new(
-            effective_id,
-            0,
-            kem::KeyPair::new(public_key, secret_key),
-            signature,
-        ))
-    }
-}
-
-#[async_trait(?Send)]
-impl KyberPreKeyStore for JsStorageAdapter {
-    async fn get_kyber_pre_key(&self, id: KyberPreKeyId) -> SignalResult<KyberPreKeyRecord> {
-        let result = self
-            .js_storage
-            .js_load_kyber_pre_key(id.value())
-            .map_err(js_to_signal_error)?;
-        let value = resolve_maybe_promise_optional(result).await?;
-        let js_value = value.ok_or(SignalProtocolError::InvalidKyberPreKeyId)?;
-        let payload: JsKyberPreKeyPayload = deserialize_js_value(js_value, "load_kyber_pre_key")?;
-        payload.into_record(id)
-    }
-
-    async fn save_kyber_pre_key(
-        &mut self,
-        _id: KyberPreKeyId,
-        _record: &KyberPreKeyRecord,
-    ) -> SignalResult<()> {
-        Ok(())
-    }
-
-    async fn mark_kyber_pre_key_used(&mut self, id: KyberPreKeyId) -> SignalResult<()> {
-        let result = self
-            .js_storage
-            .js_mark_kyber_pre_key_used(id.value())
-            .map_err(js_to_signal_error)?;
-        resolve_maybe_promise(result)
-            .await
-            .map_err(js_to_signal_error)?;
-        Ok(())
     }
 }

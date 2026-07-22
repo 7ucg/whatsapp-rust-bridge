@@ -10,7 +10,6 @@ pub mod group_types;
 #[cfg(feature = "image")]
 pub mod image_utils;
 pub mod key_helper;
-pub mod kyber_prekey;
 pub mod logger;
 pub mod noise_session;
 pub mod protocol_address;
