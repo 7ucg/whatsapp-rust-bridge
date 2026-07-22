@@ -533,6 +533,16 @@ pub fn build_reject_stanza(params_json: &str) -> Result<JsValue, JsValue> {
     Ok(node_to_js_value(&node))
 }
 
+/// Derive the local participant SSRC `CallEngine.create()`'s config needs, the same way
+/// `wacore`'s own `CallConfig::from_relay` does internally (HKDF-SHA256 over the call id and
+/// participant LID) — exposed so a JS caller building the config by hand doesn't have to
+/// reimplement this bit-exact derivation. `slot_word` is 0 for audio, 1 for video.
+#[wasm_bindgen(js_name = deriveCallParticipantSsrc)]
+pub fn derive_call_participant_ssrc(call_id: &str, self_lid: &str, slot_word: u32) -> u32 {
+    let participant_id = wacore::voip::ssrc::format_e2e_srtp_participant_id(self_lid);
+    wacore::voip::ssrc::derive_wasm_participant_ssrc(call_id, &participant_id, slot_word)
+}
+
 /// OS-RNG STUN transaction-id source (production-safe; consent freshness depends
 /// on unpredictable ids).
 struct RngTxIds;

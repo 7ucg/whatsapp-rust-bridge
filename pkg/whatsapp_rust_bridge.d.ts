@@ -606,6 +606,14 @@ export function decodeAppStateRecord(record_bytes: Uint8Array, keys: ExpandedApp
 export function decodeNode(data: Uint8Array): InternalBinaryNode;
 
 /**
+ * Derive the local participant SSRC `CallEngine.create()`'s config needs, the same way
+ * `wacore`'s own `CallConfig::from_relay` does internally (HKDF-SHA256 over the call id and
+ * participant LID) — exposed so a JS caller building the config by hand doesn't have to
+ * reimplement this bit-exact derivation. `slot_word` is 0 for audio, 1 for video.
+ */
+export function deriveCallParticipantSsrc(call_id: string, self_lid: string, slot_word: number): number;
+
+/**
  * Encode and encrypt a mutation into a `SyncdMutation` (ready to include in a patch).
  *
  * @param operation     0 = SET, 1 = REMOVE
@@ -906,6 +914,7 @@ export interface InitOutput {
     readonly collectAppStateKeyIds: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly decodeAppStateRecord: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly decodeNode: (a: number, b: number, c: number) => void;
+    readonly deriveCallParticipantSsrc: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly encodeAppStateMutation: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => void;
     readonly encodeJid: (a: number, b: number) => void;
     readonly encodeNode: (a: number, b: number) => void;
@@ -1052,9 +1061,9 @@ export interface InitOutput {
     readonly generateKeyPair: () => number;
     readonly updateLogger: (a: number) => void;
     readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1405: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2338: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1407: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1409: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2342: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1411: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

@@ -2252,6 +2252,25 @@ export function decodeNode(data) {
 }
 
 /**
+ * Derive the local participant SSRC `CallEngine.create()`'s config needs, the same way
+ * `wacore`'s own `CallConfig::from_relay` does internally (HKDF-SHA256 over the call id and
+ * participant LID) — exposed so a JS caller building the config by hand doesn't have to
+ * reimplement this bit-exact derivation. `slot_word` is 0 for audio, 1 for video.
+ * @param {string} call_id
+ * @param {string} self_lid
+ * @param {number} slot_word
+ * @returns {number}
+ */
+export function deriveCallParticipantSsrc(call_id, self_lid, slot_word) {
+    const ptr0 = passStringToWasm0(call_id, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(self_lid, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.deriveCallParticipantSsrc(ptr0, len0, ptr1, len1, slot_word);
+    return ret >>> 0;
+}
+
+/**
  * Encode and encrypt a mutation into a `SyncdMutation` (ready to include in a patch).
  *
  * @param operation     0 = SET, 1 = REMOVE
@@ -3637,7 +3656,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_2338(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_2342(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3794,7 +3813,7 @@ function __wbg_get_imports() {
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 287, function: Function { arguments: [Externref], shim_idx: 288, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1405, __wasm_bindgen_func_elem_1407);
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1409, __wasm_bindgen_func_elem_1411);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -3836,12 +3855,12 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1407(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_1407(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_1411(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_1411(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_2338(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_2338(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_2342(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_2342(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const CallEngineFinalization = (typeof FinalizationRegistry === 'undefined')
