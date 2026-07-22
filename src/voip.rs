@@ -3,12 +3,59 @@
 //! Pure, no-runtime primitives for WhatsApp calls: the MLow audio codec, the
 //! E2E SRTP media pipeline, and the sans-io CallEngine signaling/media driver.
 
+use wacore::voip::relay_parse;
 use wacore::voip::{
     AudioConfig, CallConfig, CallDirection, CallEngine as CoreCallEngine, CallEvent, Input,
     MediaPipeline as CoreMediaPipeline, MediaPipelineParams, MlowDecoder as CoreDecoder,
     MlowEncoder as CoreEncoder, Output, TxIdSource, NEVER,
 };
 use wasm_bindgen::prelude::*;
+
+/// Parse the `<relay>` block out of an encoded `<ack>` stanza (as produced by this
+/// bridge's own binary-node encoder) and return the fields `CallEngine.create()`
+/// needs to allocate the media relay: `relay_ip`, `relay_port`, `relay_token`,
+/// `integrity_key`, `warp_mi_tag_len`. Signaling (offer/accept/ringing) stays on
+/// the JS side; this only lifts the one relay-allocation block that CallEngine
+/// can't derive itself, since it takes pre-parsed config, not raw stanzas.
+#[wasm_bindgen(js_name = parseRelayFromAckNode)]
+pub fn parse_relay_from_ack_node(encoded_ack_node: &[u8]) -> Result<JsValue, JsValue> {
+    let node = wacore_binary::marshal::unmarshal_ref(encoded_ack_node)
+        .map_err(|e| JsValue::from_str(&format!("decode error: {e}")))?;
+    let relay_data = relay_parse::parse_relay_data_from_ack(&node)
+        .ok_or_else(|| JsValue::from_str("no <relay> child on this node"))?;
+    let endpoint = relay_parse::get_media_relay_endpoint(&relay_data)
+        .ok_or_else(|| JsValue::from_str("relay has no usable media endpoint"))?;
+    let (relay_ip, relay_port) = relay_parse::get_primary_ipv4_address(endpoint)
+        .ok_or_else(|| JsValue::from_str("relay endpoint has no IPv4 address"))?;
+    let relay_token = relay_data
+        .relay_tokens
+        .get(endpoint.token_id as usize)
+        .filter(|t| !t.is_empty())
+        .cloned()
+        .ok_or_else(|| JsValue::from_str("relay has no token for this endpoint"))?;
+    let integrity_key = relay_data
+        .relay_key_ascii
+        .clone()
+        .ok_or_else(|| JsValue::from_str("relay has no <key> (STUN integrity key)"))?;
+    let warp_mi_tag_len = relay_data.warp_mi_tag_len.unwrap_or(4);
+
+    #[derive(serde::Serialize)]
+    struct RelayConfig {
+        relay_ip: String,
+        relay_port: u16,
+        relay_token: Vec<u8>,
+        integrity_key: Vec<u8>,
+        warp_mi_tag_len: u32,
+    }
+    let out = RelayConfig {
+        relay_ip,
+        relay_port,
+        relay_token,
+        integrity_key,
+        warp_mi_tag_len,
+    };
+    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+}
 
 /// OS-RNG STUN transaction-id source (production-safe; consent freshness depends
 /// on unpredictable ids).

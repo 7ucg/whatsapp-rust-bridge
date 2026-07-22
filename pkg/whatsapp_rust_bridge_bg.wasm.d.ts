@@ -164,6 +164,7 @@ export const noisesession_processHandshakeInit: (a: number, b: number, c: number
 export const noisexxfallbacksession_buildClientFinish: (a: number, b: number) => void;
 export const noisexxfallbacksession_finish: (a: number, b: number) => void;
 export const parseJid: (a: number, b: number) => number;
+export const parseRelayFromAckNode: (a: number, b: number, c: number) => void;
 export const protocoladdress_deviceId: (a: number) => number;
 export const protocoladdress_from: (a: number, b: number) => void;
 export const protocoladdress_id: (a: number, b: number) => void;
@@ -196,9 +197,9 @@ export const aesEncryptCTR: (a: number, b: number, c: number, d: number, e: numb
 export const generateKeyPair: () => number;
 export const updateLogger: (a: number) => void;
 export const __wbg_sessioncipher_free: (a: number, b: number) => void;
-export const __wasm_bindgen_func_elem_1237: (a: number, b: number) => void;
-export const __wasm_bindgen_func_elem_2143: (a: number, b: number, c: number, d: number) => void;
-export const __wasm_bindgen_func_elem_1239: (a: number, b: number, c: number) => void;
+export const __wasm_bindgen_func_elem_1260: (a: number, b: number) => void;
+export const __wasm_bindgen_func_elem_2168: (a: number, b: number, c: number, d: number) => void;
+export const __wasm_bindgen_func_elem_1262: (a: number, b: number, c: number) => void;
 export const __wbindgen_export: (a: number, b: number) => number;
 export const __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
 export const __wbindgen_export3: (a: number) => void;

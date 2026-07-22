@@ -780,6 +780,16 @@ export function md5(buffer: Uint8Array): Uint8Array;
  */
 export function parseJid(jid_str: string): JidInfo | undefined;
 
+/**
+ * Parse the `<relay>` block out of an encoded `<ack>` stanza (as produced by this
+ * bridge's own binary-node encoder) and return the fields `CallEngine.create()`
+ * needs to allocate the media relay: `relay_ip`, `relay_port`, `relay_token`,
+ * `integrity_key`, `warp_mi_tag_len`. Signaling (offer/accept/ringing) stays on
+ * the JS side; this only lifts the one relay-allocation block that CallEngine
+ * can't derive itself, since it takes pre-parsed config, not raw stanzas.
+ */
+export function parseRelayFromAckNode(encoded_ack_node: Uint8Array): any;
+
 export function setLogger(logger: ILogger): void;
 
 export function sha256(buffer: Uint8Array): Uint8Array;
@@ -955,6 +965,7 @@ export interface InitOutput {
     readonly noisexxfallbacksession_buildClientFinish: (a: number, b: number) => void;
     readonly noisexxfallbacksession_finish: (a: number, b: number) => void;
     readonly parseJid: (a: number, b: number) => number;
+    readonly parseRelayFromAckNode: (a: number, b: number, c: number) => void;
     readonly protocoladdress_deviceId: (a: number) => number;
     readonly protocoladdress_from: (a: number, b: number) => void;
     readonly protocoladdress_id: (a: number, b: number) => void;
@@ -987,9 +998,9 @@ export interface InitOutput {
     readonly generateKeyPair: () => number;
     readonly updateLogger: (a: number) => void;
     readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1237: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2143: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1239: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1260: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2168: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1262: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

@@ -3104,6 +3104,34 @@ export function parseJid(jid_str) {
 }
 
 /**
+ * Parse the `<relay>` block out of an encoded `<ack>` stanza (as produced by this
+ * bridge's own binary-node encoder) and return the fields `CallEngine.create()`
+ * needs to allocate the media relay: `relay_ip`, `relay_port`, `relay_token`,
+ * `integrity_key`, `warp_mi_tag_len`. Signaling (offer/accept/ringing) stays on
+ * the JS side; this only lifts the one relay-allocation block that CallEngine
+ * can't derive itself, since it takes pre-parsed config, not raw stanzas.
+ * @param {Uint8Array} encoded_ack_node
+ * @returns {any}
+ */
+export function parseRelayFromAckNode(encoded_ack_node) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(encoded_ack_node, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.parseRelayFromAckNode(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * @param {ILogger} logger
  */
 export function setLogger(logger) {
@@ -3446,7 +3474,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_2143(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_2168(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3594,8 +3622,8 @@ function __wbg_get_imports() {
             getObject(arg0).warn(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 237, function: Function { arguments: [Externref], shim_idx: 238, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1237, __wasm_bindgen_func_elem_1239);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 240, function: Function { arguments: [Externref], shim_idx: 241, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1260, __wasm_bindgen_func_elem_1262);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -3637,12 +3665,12 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1239(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_1239(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_1262(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_1262(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_2143(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_2143(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_2168(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_2168(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const CallEngineFinalization = (typeof FinalizationRegistry === 'undefined')
