@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use base64::prelude::*;
 use js_sys::{Promise, Uint8Array};
-use prost::Message;
+use buffa::{Message, MessageField};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_bytes::ByteBuf;
@@ -354,7 +354,7 @@ impl JsStorageAdapter {
             sender_chain_struct = Some(Chain {
                 sender_ratchet_key: Some(pub_key),
                 sender_ratchet_key_private: Some(priv_key),
-                chain_key: Some(ChainKey {
+                chain_key: MessageField::some(ChainKey {
                     index: Some(counter),
                     key: Some(chain_key.into()),
                 }),
@@ -377,7 +377,7 @@ impl JsStorageAdapter {
             receiver_chains_vec.push(Chain {
                 sender_ratchet_key: Some(sender_ratchet),
                 sender_ratchet_key_private: None,
-                chain_key: Some(ChainKey {
+                chain_key: MessageField::some(ChainKey {
                     index: Some(counter),
                     key: Some(chain_key.into()),
                 }),
@@ -393,10 +393,10 @@ impl JsStorageAdapter {
             remote_identity_public: Some(remote_identity),
             root_key: Some(root_key),
             previous_counter: Some(previous_counter),
-            sender_chain: sender_chain_struct,
+            sender_chain: sender_chain_struct.map_or_else(MessageField::none, MessageField::some),
             receiver_chains: receiver_chains_vec,
-            pending_key_exchange: None,
-            pending_pre_key: None,
+            pending_key_exchange: MessageField::none(),
+            pending_pre_key: MessageField::none(),
             remote_registration_id: Some(registration_id),
             local_registration_id: Some(local_reg_id),
             needs_refresh: None,
@@ -404,7 +404,7 @@ impl JsStorageAdapter {
         };
 
         let record = RecordStructure {
-            current_session: Some(session),
+            current_session: MessageField::some(session),
             previous_sessions: Vec::new(),
         };
 
@@ -475,8 +475,8 @@ impl JsStorageAdapter {
 
             sender_key_states.push(SenderKeyStateStructure {
                 sender_key_id: Some(sender_key_id),
-                sender_chain_key: Some(chain_key),
-                sender_signing_key: Some(signing_key),
+                sender_chain_key: MessageField::some(chain_key),
+                sender_signing_key: MessageField::some(signing_key),
                 sender_message_keys,
             });
         }

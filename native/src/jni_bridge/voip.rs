@@ -292,9 +292,10 @@ pub extern "system" fn Java_com_whatsapp_bridge_Voip_callEngineStart(
     _class: JClass<'_>,
     handle: jlong,
     now: jlong,
+    wallclock_ms: jlong,
 ) {
     if let Some(e) = engine(handle) {
-        e.inner.start(now as u64);
+        e.inner.start(now as u64, wallclock_ms as u64);
     }
 }
 

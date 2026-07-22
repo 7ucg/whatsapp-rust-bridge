@@ -9,7 +9,7 @@
 use super::crypto::{write_out_pub, BridgeError};
 use std::slice;
 use wacore::voip::{
-    CallConfig, CallDirection, CallEngine, CallEvent, Input, MediaPipeline, MediaPipelineParams,
+    AudioConfig, CallConfig, CallDirection, CallEngine, CallEvent, Input, MediaPipeline, MediaPipelineParams,
     MlowDecoder, MlowEncoder, Output, TxIdSource, NEVER,
 };
 
@@ -320,13 +320,15 @@ pub(crate) fn call_config_from_json(json: &str) -> Option<CallConfig> {
         peer_lid: c.peer_lid,
         call_key: c.call_key,
         ssrc: c.ssrc,
-        samples_per_packet: c.samples_per_packet,
+        // buffa/voip rework: per-packet framing now lives in AudioConfig.
+        audio: AudioConfig::MLOW_PCM,
         relay_token: c.relay_token,
         relay_ip: c.relay_ip,
         relay_port: c.relay_port,
         integrity_key: c.integrity_key,
         warp_mi_tag_len: c.warp_mi_tag_len,
         enable_media: c.enable_media,
+        enable_video: false,
         enable_sframe: c.enable_sframe,
     })
 }
@@ -373,9 +375,9 @@ pub unsafe extern "C" fn wa_call_engine_free(eng: *mut WaCallEngine) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wa_call_engine_start(eng: *mut WaCallEngine, now: u64) {
+pub unsafe extern "C" fn wa_call_engine_start(eng: *mut WaCallEngine, now: u64, wallclock_ms: u64) {
     if let Some(e) = unsafe { eng.as_mut() } {
-        e.inner.start(now);
+        e.inner.start(now, wallclock_ms);
     }
 }
 

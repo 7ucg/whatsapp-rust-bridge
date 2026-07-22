@@ -81,8 +81,8 @@ public final class Voip {
     /** Free an engine handle. */
     public static native void callEngineFree(long handle);
 
-    /** Start the call (kick off relay allocate). */
-    public static native void callEngineStart(long handle, long nowMs);
+    /** Start the call (kick off relay allocate). wallclockMs = unix epoch ms. */
+    public static native void callEngineStart(long handle, long nowMs, long wallclockMs);
 
     /** Feed an inbound relay-channel packet. */
     public static native void callEngineHandleRelayPacket(long handle, long nowMs, byte[] packet);

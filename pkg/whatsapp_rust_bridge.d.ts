@@ -31,24 +31,8 @@ export interface SignalStorage {
     loadSignedPreKey(id: number): SignedPreKey | null | undefined | Promise<SignedPreKey | null | undefined>;
     loadSenderKey(keyId: string): Uint8Array | null | undefined | Promise<Uint8Array | null | undefined>;
     storeSenderKey(keyId: string, record: Uint8Array): void | Promise<void>;
-    loadKyberPreKey?(id: number): KyberPreKey | null | undefined | Promise<KyberPreKey | null | undefined>;
-    markKyberPreKeyUsed?(id: number): void | Promise<void>;
 }
 
-
-/**
- * A Kyber1024 public/secret key pair, serialized with a one-byte key-type prefix.
- */
-export interface KyberKeyPair {
-    /**
-     * Serialized public key (key-type prefix byte + raw key bytes).
-     */
-    publicKey: Uint8Array;
-    /**
-     * Serialized secret key (key-type prefix byte + raw key bytes).
-     */
-    secretKey: Uint8Array;
-}
 
 /**
  * A WhatsApp JID (Jabber ID) — identifies a user, group, broadcast, etc.
@@ -95,15 +79,6 @@ export interface DecodedMutation {
 }
 
 /**
- * A signed Kyber1024 pre-key (id + key pair + identity signature over the public key).
- */
-export interface KyberPreKey {
-    keyId: number;
-    keyPair: KyberKeyPair;
-    signature: Uint8Array;
-}
-
-/**
  * Enabled features in this build.
  * Use this to check feature availability at runtime before calling feature-gated functions.
  */
@@ -145,12 +120,6 @@ export interface HkdfInfo {
     info?: Uint8Array | string | undefined;
 }
 
-export interface KyberPreKeyPublicKey {
-    keyId: number;
-    publicKey: Uint8Array;
-    signature: Uint8Array;
-}
-
 export interface PreKey {
     keyId: number;
     keyPair: KeyPair;
@@ -161,7 +130,6 @@ export interface PreKeyBundleInput {
     identityKey: Uint8Array;
     preKey?: PreKeyPublicKey | undefined;
     signedPreKey: SignedPreKeyPublicKey;
-    kyberPreKey?: KyberPreKeyPublicKey | undefined;
 }
 
 export interface PreKeyPublicKey {
@@ -246,9 +214,10 @@ export class CallEngine {
      */
     rekeyRecv(answering_peer_lid: string): boolean;
     /**
-     * Start the call (kick off relay allocate). `now` = monotonic ms.
+     * Start the call (kick off relay allocate). `now` = monotonic ms,
+     * `wallclockMs` = unix epoch ms (the engine stamps signaling with it).
      */
-    start(now: number): void;
+    start(now: number, wallclock_ms: number): void;
     /**
      * Payload of a `ForeignAudio` event (a non-MLow inbound frame to decode
      * with a platform codec).
@@ -637,15 +606,6 @@ export function generateIndexMac(index_bytes: Uint8Array, key: Uint8Array): Uint
 
 export function generateKeyPair(): KeyPair;
 
-/**
- * Generate a Kyber1024 pre-key signed by the given identity key.
- *
- * The returned `KyberPreKey.keyPair.publicKey` and `.secretKey` are each prefixed
- * with the key-type byte `0x08` (Kyber1024) as produced by `kem::Key::serialize()`.
- * The `signature` covers the serialized public key using Ed25519 (Curve25519 private key).
- */
-export function generateKyberPreKey(identity_key_pair: KeyPair, kyber_key_id: number): KyberPreKey;
-
 export function generatePatchMac(snapshot_mac: Uint8Array, value_macs: Uint8Array[], version: bigint, name: string, key: Uint8Array): Uint8Array;
 
 export function generatePreKey(key_id: number): PreKey;
@@ -876,7 +836,7 @@ export interface InitOutput {
     readonly callengine_pollOutput: (a: number) => number;
     readonly callengine_pollTimeout: (a: number) => number;
     readonly callengine_rekeyRecv: (a: number, b: number, c: number) => number;
-    readonly callengine_start: (a: number, b: number) => void;
+    readonly callengine_start: (a: number, b: number, c: number) => void;
     readonly callengine_takeForeignAudio: (a: number, b: number) => void;
     readonly callengine_takePlayout: (a: number, b: number) => void;
     readonly callengine_takeTransmit: (a: number, b: number) => void;
@@ -895,7 +855,6 @@ export interface InitOutput {
     readonly generateContentMac: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly generateIdentityKeyPair: () => number;
     readonly generateIndexMac: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly generateKyberPreKey: (a: number, b: number, c: number) => void;
     readonly generatePatchMac: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => void;
     readonly generatePreKey: (a: number) => number;
     readonly generateRegistrationId: () => number;
@@ -1028,9 +987,9 @@ export interface InitOutput {
     readonly generateKeyPair: () => number;
     readonly updateLogger: (a: number) => void;
     readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1207: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2107: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1209: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1237: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2143: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1239: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

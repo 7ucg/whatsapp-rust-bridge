@@ -339,7 +339,7 @@ typedef struct WaCallEngine WaCallEngine;
 WaCallEngine *wa_call_engine_new(const uint8_t *config_json, size_t config_json_len);
 void wa_call_engine_free(WaCallEngine *eng);
 
-void wa_call_engine_start(WaCallEngine *eng, uint64_t now);
+void wa_call_engine_start(WaCallEngine *eng, uint64_t now, uint64_t wallclock_ms);
 void wa_call_engine_handle_relay_packet(
     WaCallEngine *eng, uint64_t now, const uint8_t *packet, size_t packet_len);
 void wa_call_engine_handle_mic_frame(

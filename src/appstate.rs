@@ -1,12 +1,12 @@
+use buffa::{Enumeration as _, Message};
 use js_sys::Uint8Array;
-use prost::Message;
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 use wasm_bindgen::prelude::*;
 
 use wacore_appstate::{
-    ExpandedAppStateKeys as RustExpandedAppStateKeys, LTHash, WAPATCH_INTEGRITY,
     collect_key_ids_from_patch_list, decode_record, encode_record, expand_app_state_keys,
+    ExpandedAppStateKeys as RustExpandedAppStateKeys, LTHash, WAPATCH_INTEGRITY,
 };
 use waproto::whatsapp as wa;
 
@@ -340,11 +340,11 @@ pub fn decode_app_state_record(
     operation: i32,
     validate_macs: bool,
 ) -> Result<DecodedMutation, JsValue> {
-    let record = wa::SyncdRecord::decode(record_bytes)
+    let record = wa::SyncdRecord::decode_from_slice(record_bytes)
         .map_err(|e| JsValue::from_str(&format!("Failed to decode SyncdRecord: {}", e)))?;
 
-    let op = wa::syncd_mutation::SyncdOperation::try_from(operation)
-        .map_err(|_| JsValue::from_str(&format!("Invalid operation: {}", operation)))?;
+    let op = wa::syncd_mutation::SyncdOperation::from_i32(operation)
+        .ok_or_else(|| JsValue::from_str(&format!("Invalid operation: {}", operation)))?;
 
     let (mutation, macs) = decode_record(op, &record, &keys.inner, key_id, validate_macs)
         .map_err(|e| JsValue::from_str(&format!("decode_record failed: {}", e)))?;
@@ -353,7 +353,7 @@ pub fn decode_app_state_record(
         .action_value
         .map(|v| {
             let mut buf = Vec::new();
-            v.encode(&mut buf).unwrap_or(());
+            v.encode(&mut buf);
             buf
         })
         .unwrap_or_default();
@@ -410,24 +410,31 @@ pub fn encode_app_state_mutation(
     iv: &[u8],
     version: i32,
 ) -> Result<EncodedMutation, JsValue> {
-    let op = wa::syncd_mutation::SyncdOperation::try_from(operation)
-        .map_err(|_| JsValue::from_str(&format!("Invalid operation: {}", operation)))?;
+    let op = wa::syncd_mutation::SyncdOperation::from_i32(operation)
+        .ok_or_else(|| JsValue::from_str(&format!("Invalid operation: {}", operation)))?;
 
     let iv_arr: [u8; 16] = iv
         .try_into()
         .map_err(|_| JsValue::from_str("IV must be exactly 16 bytes"))?;
 
-    let action = wa::SyncActionValue::decode(action_bytes)
+    let action = wa::SyncActionValue::decode_from_slice(action_bytes)
         .map_err(|e| JsValue::from_str(&format!("Failed to decode SyncActionValue: {}", e)))?;
 
-    let (mutation, value_mac) =
-        encode_record(op, index_bytes, &action, &keys.inner, key_id, &iv_arr, version);
+    let (mutation, value_mac) = encode_record(
+        op,
+        index_bytes,
+        &action,
+        &keys.inner,
+        key_id,
+        &iv_arr,
+        version,
+    );
 
     // Extract index_mac from the encoded record
     let index_mac = mutation
         .record
-        .as_ref()
-        .and_then(|r| r.index.as_ref())
+        .as_option()
+        .and_then(|r| r.index.as_option())
         .and_then(|i| i.blob.clone())
         .unwrap_or_default();
 
@@ -454,7 +461,7 @@ pub fn collect_app_state_key_ids(
         None
     } else {
         Some(
-            wa::SyncdSnapshot::decode(snapshot_bytes)
+            wa::SyncdSnapshot::decode_from_slice(snapshot_bytes)
                 .map_err(|e| JsValue::from_str(&format!("Failed to decode snapshot: {}", e)))?,
         )
     };
@@ -464,7 +471,7 @@ pub fn collect_app_state_key_ids(
         .map(|arr| {
             let mut buf = vec![0u8; arr.length() as usize];
             arr.copy_to(&mut buf);
-            wa::SyncdPatch::decode(buf.as_slice())
+            wa::SyncdPatch::decode_from_slice(buf.as_slice())
                 .map_err(|e| JsValue::from_str(&format!("Failed to decode patch: {}", e)))
         })
         .collect::<Result<Vec<_>, _>>()?;

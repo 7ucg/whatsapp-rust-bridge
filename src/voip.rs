@@ -4,7 +4,7 @@
 //! E2E SRTP media pipeline, and the sans-io CallEngine signaling/media driver.
 
 use wacore::voip::{
-    CallConfig, CallDirection, CallEngine as CoreCallEngine, CallEvent, Input,
+    AudioConfig, CallConfig, CallDirection, CallEngine as CoreCallEngine, CallEvent, Input,
     MediaPipeline as CoreMediaPipeline, MediaPipelineParams, MlowDecoder as CoreDecoder,
     MlowEncoder as CoreEncoder, Output, TxIdSource, NEVER,
 };
@@ -59,13 +59,15 @@ pub(crate) fn call_config_from_json(json: &str) -> Result<CallConfig, String> {
         peer_lid: c.peer_lid,
         call_key: c.call_key,
         ssrc: c.ssrc,
-        samples_per_packet: c.samples_per_packet,
+        // buffa/voip rework: the per-packet framing now lives in AudioConfig.
+        audio: AudioConfig::MLOW_PCM,
         relay_token: c.relay_token,
         relay_ip: c.relay_ip,
         relay_port: c.relay_port,
         integrity_key: c.integrity_key,
         warp_mi_tag_len: c.warp_mi_tag_len,
         enable_media: c.enable_media,
+        enable_video: false,
         enable_sframe: c.enable_sframe,
     })
 }
@@ -247,9 +249,10 @@ impl CallEngine {
             .map_err(|e| JsValue::from_str(&format!("CallEngine.create: {e}")))
     }
 
-    /// Start the call (kick off relay allocate). `now` = monotonic ms.
-    pub fn start(&mut self, now: f64) {
-        self.inner.start(now as u64);
+    /// Start the call (kick off relay allocate). `now` = monotonic ms,
+    /// `wallclockMs` = unix epoch ms (the engine stamps signaling with it).
+    pub fn start(&mut self, now: f64, wallclock_ms: f64) {
+        self.inner.start(now as u64, wallclock_ms as u64);
     }
 
     /// Feed an inbound relay-channel packet.
