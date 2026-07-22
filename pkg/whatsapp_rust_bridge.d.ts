@@ -549,6 +549,36 @@ export function aesEncryptGCM(plaintext: Uint8Array, key: Uint8Array, iv: Uint8A
  */
 export function areSameUser(a: string, b: string): boolean;
 
+/**
+ * Build a `<call><accept>...</accept></call>` stanza to answer an incoming offer.
+ */
+export function buildAcceptStanza(params_json: string): any;
+
+/**
+ * Build a `<call><offer>...</offer></call>` stanza for an outbound call. `device_keys`
+ * carries one entry per destination device with the callKey already Signal-encrypted
+ * for it (this bridge builds/parses stanzas only — it doesn't touch Signal sessions).
+ * Returns a plain `{tag, attrs, content}` object ready for `sock.sendNode()`.
+ */
+export function buildOfferStanza(params_json: string): any;
+
+/**
+ * Build a `<call><preaccept>...</preaccept></call>` stanza: the early "ringing,
+ * about to answer" ack sent before the real `<accept>`.
+ */
+export function buildPreacceptStanza(params_json: string): any;
+
+/**
+ * Build a `<call><reject>...</reject></call>` stanza to decline an incoming offer.
+ */
+export function buildRejectStanza(params_json: string): any;
+
+/**
+ * Build a `<call><terminate>...</terminate></call>` stanza to end a call (hangup,
+ * reject an offer already accepted elsewhere, etc).
+ */
+export function buildTerminateStanza(params_json: string): any;
+
 export function calculateAgreement(public_key_bytes: Uint8Array, private_key_bytes: Uint8Array): Uint8Array;
 
 export function calculateSignature(private_key_bytes: Uint8Array, message: Uint8Array): Uint8Array;
@@ -848,6 +878,11 @@ export interface InitOutput {
     readonly aesEncrypt: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly aesEncryptGCM: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly areSameUser: (a: number, b: number, c: number, d: number) => number;
+    readonly buildAcceptStanza: (a: number, b: number, c: number) => void;
+    readonly buildOfferStanza: (a: number, b: number, c: number) => void;
+    readonly buildPreacceptStanza: (a: number, b: number, c: number) => void;
+    readonly buildRejectStanza: (a: number, b: number, c: number) => void;
+    readonly buildTerminateStanza: (a: number, b: number, c: number) => void;
     readonly calculateAgreement: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly calculateSignature: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly callengine_callId: (a: number, b: number) => void;
@@ -1017,9 +1052,9 @@ export interface InitOutput {
     readonly generateKeyPair: () => number;
     readonly updateLogger: (a: number) => void;
     readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1346: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2277: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1348: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1405: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2338: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1407: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

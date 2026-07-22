@@ -29,6 +29,11 @@ export const aesEncrypWithIV: (a: number, b: number, c: number, d: number, e: nu
 export const aesEncrypt: (a: number, b: number, c: number, d: number, e: number) => void;
 export const aesEncryptGCM: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
 export const areSameUser: (a: number, b: number, c: number, d: number) => number;
+export const buildAcceptStanza: (a: number, b: number, c: number) => void;
+export const buildOfferStanza: (a: number, b: number, c: number) => void;
+export const buildPreacceptStanza: (a: number, b: number, c: number) => void;
+export const buildRejectStanza: (a: number, b: number, c: number) => void;
+export const buildTerminateStanza: (a: number, b: number, c: number) => void;
 export const calculateAgreement: (a: number, b: number, c: number, d: number, e: number) => void;
 export const calculateSignature: (a: number, b: number, c: number, d: number, e: number) => void;
 export const callengine_callId: (a: number, b: number) => void;
@@ -198,9 +203,9 @@ export const aesEncryptCTR: (a: number, b: number, c: number, d: number, e: numb
 export const generateKeyPair: () => number;
 export const updateLogger: (a: number) => void;
 export const __wbg_sessioncipher_free: (a: number, b: number) => void;
-export const __wasm_bindgen_func_elem_1346: (a: number, b: number) => void;
-export const __wasm_bindgen_func_elem_2277: (a: number, b: number, c: number, d: number) => void;
-export const __wasm_bindgen_func_elem_1348: (a: number, b: number, c: number) => void;
+export const __wasm_bindgen_func_elem_1405: (a: number, b: number) => void;
+export const __wasm_bindgen_func_elem_2338: (a: number, b: number, c: number, d: number) => void;
+export const __wasm_bindgen_func_elem_1407: (a: number, b: number, c: number) => void;
 export const __wbindgen_export: (a: number, b: number) => number;
 export const __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
 export const __wbindgen_export3: (a: number) => void;

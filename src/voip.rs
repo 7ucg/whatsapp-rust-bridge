@@ -280,6 +280,259 @@ pub fn parse_call_stanza_js(
     to_js_object(&out)
 }
 
+/// Convert a built `Node` into the plain `{tag, attrs, content}` shape `sock.sendNode()`
+/// already expects (the same shape `encodeBinaryNode`'s caller builds by hand), so a
+/// caller never has to touch this bridge's internal `Node`/`Attrs`/`NodeContent` types.
+fn node_to_js_value(node: &wacore_binary::Node) -> JsValue {
+    let obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("tag"),
+        &JsValue::from_str(&node.tag),
+    );
+
+    let attrs = js_sys::Object::new();
+    for (k, v) in node.attrs.iter() {
+        let s = match v {
+            wacore_binary::NodeValue::String(s) => s.to_string(),
+            wacore_binary::NodeValue::Jid(j) => j.to_string(),
+        };
+        let _ = js_sys::Reflect::set(&attrs, &JsValue::from_str(k), &JsValue::from_str(&s));
+    }
+    let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("attrs"), &attrs);
+
+    // encodeNode() treats an explicit `content: null` as real (empty) content and chokes on
+    // it — omit the key entirely when there's none, matching what a hand-built JS node with
+    // no content looks like. Byte content must be a real Uint8Array (encodeNode rejects a
+    // plain number array), so this builds the JsValue tree directly rather than round-tripping
+    // through serde_json::Value, which has no byte-array type of its own.
+    if let Some(content) = &node.content {
+        let value: JsValue = match content {
+            wacore_binary::NodeContent::Bytes(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
+            wacore_binary::NodeContent::String(s) => JsValue::from_str(s),
+            wacore_binary::NodeContent::Nodes(ns) => {
+                let arr = js_sys::Array::new();
+                for n in ns.iter() {
+                    arr.push(&node_to_js_value(n));
+                }
+                arr.into()
+            }
+        };
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("content"), &value);
+    }
+    obj.into()
+}
+
+fn parse_jid(s: &str) -> Result<wacore_binary::Jid, JsValue> {
+    s.parse()
+        .map_err(|_| JsValue::from_str(&format!("invalid JID: {s}")))
+}
+
+#[derive(serde::Deserialize)]
+struct OfferDeviceKeyJson {
+    device_jid: String,
+    ciphertext: Vec<u8>,
+    enc_type: String,
+}
+
+#[derive(serde::Deserialize)]
+struct OfferParamsJson {
+    call_id: String,
+    to: String,
+    call_creator: String,
+    device_keys: Vec<OfferDeviceKeyJson>,
+    #[serde(default)]
+    privacy_token: Option<Vec<u8>>,
+    #[serde(default)]
+    capability: Option<Vec<u8>>,
+    #[serde(default)]
+    device_identity: Option<Vec<u8>>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    multi_device: bool,
+    #[serde(default)]
+    video: bool,
+    audio_rates: Vec<String>,
+}
+
+/// Build a `<call><offer>...</offer></call>` stanza for an outbound call. `device_keys`
+/// carries one entry per destination device with the callKey already Signal-encrypted
+/// for it (this bridge builds/parses stanzas only — it doesn't touch Signal sessions).
+/// Returns a plain `{tag, attrs, content}` object ready for `sock.sendNode()`.
+#[wasm_bindgen(js_name = buildOfferStanza)]
+pub fn build_offer_stanza(params_json: &str) -> Result<JsValue, JsValue> {
+    let p: OfferParamsJson = serde_json::from_str(params_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid offer params JSON: {e}")))?;
+
+    let to = parse_jid(&p.to)?;
+    let call_creator = parse_jid(&p.call_creator)?;
+    let mut device_keys = Vec::with_capacity(p.device_keys.len());
+    for dk in &p.device_keys {
+        device_keys.push(wacore::stanza::call::OfferDeviceKey {
+            device_jid: parse_jid(&dk.device_jid)?,
+            ciphertext: dk.ciphertext.clone(),
+            enc_type: dk.enc_type.clone(),
+        });
+    }
+    let audio_rates: Vec<&str> = p.audio_rates.iter().map(String::as_str).collect();
+
+    let node = wacore::stanza::call::build_offer(&wacore::stanza::call::OfferParams {
+        call_id: &p.call_id,
+        to: &to,
+        call_creator: &call_creator,
+        device_keys: &device_keys,
+        privacy_token: p.privacy_token.as_deref(),
+        capability: p.capability.as_deref(),
+        device_identity: p.device_identity.as_deref(),
+        id: p.id.as_deref(),
+        multi_device: p.multi_device,
+        video: p.video,
+        audio_rates: &audio_rates,
+    });
+
+    Ok(node_to_js_value(&node))
+}
+
+#[derive(serde::Deserialize)]
+struct AcceptParamsJson {
+    call_id: String,
+    to: String,
+    id: String,
+    call_creator: String,
+    audio_rates: Vec<String>,
+    #[serde(default)]
+    relay_te: Option<Vec<u8>>,
+    #[serde(default)]
+    rte: Option<Vec<u8>>,
+    #[serde(default)]
+    voip_settings: Option<Vec<u8>>,
+    #[serde(default)]
+    capability: Option<Vec<u8>>,
+    #[serde(default)]
+    video: bool,
+    #[serde(default)]
+    peer_abtest_bucket: Option<String>,
+    #[serde(default)]
+    peer_abtest_bucket_id_list: Option<String>,
+}
+
+/// Build a `<call><accept>...</accept></call>` stanza to answer an incoming offer.
+#[wasm_bindgen(js_name = buildAcceptStanza)]
+pub fn build_accept_stanza(params_json: &str) -> Result<JsValue, JsValue> {
+    let p: AcceptParamsJson = serde_json::from_str(params_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid accept params JSON: {e}")))?;
+
+    let to = parse_jid(&p.to)?;
+    let call_creator = parse_jid(&p.call_creator)?;
+    let audio_rates: Vec<&str> = p.audio_rates.iter().map(String::as_str).collect();
+
+    let node = wacore::stanza::call::build_accept(&wacore::stanza::call::AcceptParams {
+        call_id: &p.call_id,
+        to: &to,
+        id: &p.id,
+        call_creator: &call_creator,
+        audio_rates: &audio_rates,
+        relay_te: p.relay_te.as_deref(),
+        rte: p.rte.as_deref(),
+        voip_settings: p.voip_settings.as_deref(),
+        capability: p.capability.as_deref(),
+        video: p.video,
+        peer_abtest_bucket: p.peer_abtest_bucket.as_deref(),
+        peer_abtest_bucket_id_list: p.peer_abtest_bucket_id_list.as_deref(),
+    });
+
+    Ok(node_to_js_value(&node))
+}
+
+#[derive(serde::Deserialize)]
+struct PreacceptParamsJson {
+    call_id: String,
+    to: String,
+    call_creator: String,
+    wrapper_id: String,
+    audio_rates: Vec<String>,
+    #[serde(default)]
+    video: bool,
+}
+
+/// Build a `<call><preaccept>...</preaccept></call>` stanza: the early "ringing,
+/// about to answer" ack sent before the real `<accept>`.
+#[wasm_bindgen(js_name = buildPreacceptStanza)]
+pub fn build_preaccept_stanza(params_json: &str) -> Result<JsValue, JsValue> {
+    let p: PreacceptParamsJson = serde_json::from_str(params_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid preaccept params JSON: {e}")))?;
+
+    let to = parse_jid(&p.to)?;
+    let call_creator = parse_jid(&p.call_creator)?;
+    let audio_rates: Vec<&str> = p.audio_rates.iter().map(String::as_str).collect();
+
+    let node = wacore::stanza::call::build_preaccept(
+        &p.call_id,
+        &to,
+        &call_creator,
+        &p.wrapper_id,
+        &audio_rates,
+        p.video,
+    );
+
+    Ok(node_to_js_value(&node))
+}
+
+#[derive(serde::Deserialize)]
+struct TerminateParamsJson {
+    call_id: String,
+    to: String,
+    #[serde(default)]
+    id: Option<String>,
+    call_creator: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Build a `<call><terminate>...</terminate></call>` stanza to end a call (hangup,
+/// reject an offer already accepted elsewhere, etc).
+#[wasm_bindgen(js_name = buildTerminateStanza)]
+pub fn build_terminate_stanza(params_json: &str) -> Result<JsValue, JsValue> {
+    let p: TerminateParamsJson = serde_json::from_str(params_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid terminate params JSON: {e}")))?;
+
+    let to = parse_jid(&p.to)?;
+    let call_creator = parse_jid(&p.call_creator)?;
+
+    let node = wacore::stanza::call::build_terminate(&wacore::stanza::call::TerminateParams {
+        call_id: &p.call_id,
+        to: &to,
+        id: p.id.as_deref(),
+        call_creator: &call_creator,
+        reason: p.reason.as_deref(),
+    });
+
+    Ok(node_to_js_value(&node))
+}
+
+#[derive(serde::Deserialize)]
+struct RejectParamsJson {
+    call_id: String,
+    to: String,
+    call_creator: String,
+    wrapper_id: String,
+}
+
+/// Build a `<call><reject>...</reject></call>` stanza to decline an incoming offer.
+#[wasm_bindgen(js_name = buildRejectStanza)]
+pub fn build_reject_stanza(params_json: &str) -> Result<JsValue, JsValue> {
+    let p: RejectParamsJson = serde_json::from_str(params_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid reject params JSON: {e}")))?;
+
+    let to = parse_jid(&p.to)?;
+    let call_creator = parse_jid(&p.call_creator)?;
+
+    let node = wacore::stanza::call::build_reject(&p.call_id, &to, &call_creator, &p.wrapper_id);
+
+    Ok(node_to_js_value(&node))
+}
+
 /// OS-RNG STUN transaction-id source (production-safe; consent freshness depends
 /// on unpredictable ids).
 struct RngTxIds;

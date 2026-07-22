@@ -1994,6 +1994,126 @@ export function areSameUser(a, b) {
 }
 
 /**
+ * Build a `<call><accept>...</accept></call>` stanza to answer an incoming offer.
+ * @param {string} params_json
+ * @returns {any}
+ */
+export function buildAcceptStanza(params_json) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(params_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.buildAcceptStanza(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Build a `<call><offer>...</offer></call>` stanza for an outbound call. `device_keys`
+ * carries one entry per destination device with the callKey already Signal-encrypted
+ * for it (this bridge builds/parses stanzas only — it doesn't touch Signal sessions).
+ * Returns a plain `{tag, attrs, content}` object ready for `sock.sendNode()`.
+ * @param {string} params_json
+ * @returns {any}
+ */
+export function buildOfferStanza(params_json) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(params_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.buildOfferStanza(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Build a `<call><preaccept>...</preaccept></call>` stanza: the early "ringing,
+ * about to answer" ack sent before the real `<accept>`.
+ * @param {string} params_json
+ * @returns {any}
+ */
+export function buildPreacceptStanza(params_json) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(params_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.buildPreacceptStanza(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Build a `<call><reject>...</reject></call>` stanza to decline an incoming offer.
+ * @param {string} params_json
+ * @returns {any}
+ */
+export function buildRejectStanza(params_json) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(params_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.buildRejectStanza(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Build a `<call><terminate>...</terminate></call>` stanza to end a call (hangup,
+ * reject an offer already accepted elsewhere, etc).
+ * @param {string} params_json
+ * @returns {any}
+ */
+export function buildTerminateStanza(params_json) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(params_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.buildTerminateStanza(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * @param {Uint8Array} public_key_bytes
  * @param {Uint8Array} private_key_bytes
  * @returns {Uint8Array}
@@ -3517,7 +3637,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_2277(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_2338(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3673,8 +3793,8 @@ function __wbg_get_imports() {
             getObject(arg0).warn(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 277, function: Function { arguments: [Externref], shim_idx: 278, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1346, __wasm_bindgen_func_elem_1348);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 287, function: Function { arguments: [Externref], shim_idx: 288, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1405, __wasm_bindgen_func_elem_1407);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -3716,12 +3836,12 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1348(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_1348(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_1407(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_1407(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_2277(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_2277(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_2338(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_2338(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const CallEngineFinalization = (typeof FinalizationRegistry === 'undefined')
