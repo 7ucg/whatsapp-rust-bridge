@@ -92,6 +92,26 @@ impl<'a> AttrParserRef<'a> {
         })
     }
 
+    /// Get an optional JID attribute, failing when a present value is invalid.
+    pub fn optional_jid_result(&mut self, key: &str) -> Result<Option<Jid>> {
+        match self.get_raw(key, false) {
+            None => Ok(None),
+            Some(ValueRef::Jid(jid)) => Ok(Some(jid.to_owned())),
+            Some(ValueRef::String(value)) => {
+                Jid::from_str(value).map(Some).map_err(BinaryError::from)
+            }
+        }
+    }
+
+    /// Get a required JID attribute, failing immediately when it is missing or invalid.
+    ///
+    /// Structured JIDs are converted directly from their decoded representation;
+    /// string attributes are parsed exactly once.
+    pub fn required_jid(&mut self, key: &str) -> Result<Jid> {
+        self.optional_jid_result(key)?
+            .ok_or_else(|| BinaryError::MissingAttr(key.to_string()))
+    }
+
     pub fn jid(&mut self, key: &str) -> Jid {
         self.get_raw(key, true);
         self.optional_jid(key).unwrap_or_default()
@@ -118,8 +138,13 @@ impl<'a> AttrParserRef<'a> {
             })
     }
 
+    /// Parse an optional protocol boolean while preserving absence.
+    pub fn optional_bool_value(&mut self, key: &str) -> Option<bool> {
+        self.get_bool(key, false)
+    }
+
     pub fn optional_bool(&mut self, key: &str) -> bool {
-        self.get_bool(key, false).unwrap_or(false)
+        self.optional_bool_value(key).unwrap_or(false)
     }
 
     pub fn bool(&mut self, key: &str) -> bool {
@@ -243,6 +268,17 @@ impl<'a> AttrParser<'a> {
         })
     }
 
+    /// Get a required JID attribute, failing immediately when it is missing or invalid.
+    pub fn required_jid(&mut self, key: &str) -> Result<Jid> {
+        match self
+            .get_raw(key, false)
+            .ok_or_else(|| BinaryError::MissingAttr(key.to_string()))?
+        {
+            NodeValue::Jid(jid) => Ok(jid.clone()),
+            NodeValue::String(value) => Jid::from_str(value).map_err(BinaryError::from),
+        }
+    }
+
     pub fn jid(&mut self, key: &str) -> Jid {
         self.get_raw(key, true); // Push "not found" error if needed.
         self.optional_jid(key).unwrap_or_default()
@@ -266,8 +302,13 @@ impl<'a> AttrParser<'a> {
             })
     }
 
+    /// Parse an optional protocol boolean while preserving absence.
+    pub fn optional_bool_value(&mut self, key: &str) -> Option<bool> {
+        self.get_bool(key, false)
+    }
+
     pub fn optional_bool(&mut self, key: &str) -> bool {
-        self.get_bool(key, false).unwrap_or(false)
+        self.optional_bool_value(key).unwrap_or(false)
     }
 
     pub fn bool(&mut self, key: &str) -> bool {

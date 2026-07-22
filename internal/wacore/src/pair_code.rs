@@ -20,13 +20,13 @@
 //! - Bundle encryption: AES-256-GCM after HKDF key derivation
 
 use crate::companion_reg::{
-    CompanionWebClientType, companion_platform_display, companion_web_client_type_for_props,
+    CompanionWebClientType, companion_platform_display, companion_platform_display_raw,
+    companion_web_client_type_for_props,
 };
 use crate::libsignal::crypto::{CryptoProviderError, aes_256_gcm_encrypt};
 use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
 use aes::cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
-use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::RngExt;
 use sha2::Sha256;
@@ -83,6 +83,10 @@ fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], rounds: u32, output: &mut [u
 /// Validity duration for pair codes (approximately).
 const PAIR_CODE_VALIDITY_SECS: u64 = 180;
 
+/// Max `primary_hello` notifications processed per code before the flow is
+/// abandoned. Matches WA Web `DeviceLinkingApi` (`T = 3`, `MaxPrimaryHelloError`).
+const PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS: u32 = 3;
+
 fn build_id_and_display(
     id: CompanionWebClientType,
     props: &wa::DeviceProps,
@@ -98,8 +102,9 @@ pub fn derive_companion_platform(props: &wa::DeviceProps) -> (CompanionWebClient
     build_id_and_display(companion_web_client_type_for_props(props), props)
 }
 
-/// Honours `PairCodeOptions::platform_id` override; display is always
-/// derived (no override — WA Web has none, server rejects arbitrary strings).
+/// Honours `PairCodeOptions::platform_id` (browser) and `display_os` (OS)
+/// overrides. By default the OS is canonicalized from `DeviceProps::os`; a
+/// non-empty `display_os` is sent verbatim instead (advanced — see the field).
 pub fn resolve_companion_platform(
     options: &PairCodeOptions,
     props: &wa::DeviceProps,
@@ -107,7 +112,12 @@ pub fn resolve_companion_platform(
     let id = options
         .platform_id
         .unwrap_or_else(|| companion_web_client_type_for_props(props));
-    build_id_and_display(id, props)
+    let display = match options.display_os.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => companion_platform_display_raw(id, raw),
+        // None, or an all-whitespace override, falls back to the safe coercion.
+        _ => build_id_and_display(id, props).1,
+    };
+    (id, display)
 }
 
 /// Options for pair code authentication.
@@ -121,6 +131,13 @@ pub struct PairCodeOptions {
     pub custom_code: Option<String>,
     /// `None` auto-derives from `Device.device_props.platform_type`.
     pub platform_id: Option<CompanionWebClientType>,
+    /// Advanced OS override for `companion_platform_display`. `None` (default)
+    /// canonicalizes `DeviceProps::os` to a small server-safe set (branding →
+    /// `Linux`). `Some(os)` sends `os` **verbatim**, bypassing that coercion — use
+    /// it to keep a real OS name the server accepts but our canonical set drops
+    /// (e.g. `"Ubuntu"`, `"Fedora"`). At your own risk: the server rejects a
+    /// non-OS string with `bad-request`. An all-whitespace value is ignored.
+    pub display_os: Option<String>,
 }
 
 impl Default for PairCodeOptions {
@@ -130,6 +147,7 @@ impl Default for PairCodeOptions {
             show_push_notification: true,
             custom_code: None,
             platform_id: None,
+            display_os: None,
         }
     }
 }
@@ -160,6 +178,13 @@ pub enum PairCodeState {
         pair_code: String,
         /// Ephemeral keypair generated for this session.
         ephemeral_keypair: Box<KeyPair>,
+        /// Unix seconds when the code was generated. Enforces the ~180s validity
+        /// window: a `primary_hello` arriving later is rejected (WA Web `OldCodeError`).
+        code_generation_ts: i64,
+        /// Count of `primary_hello` notifications processed for this code. WA Web
+        /// (`DeviceLinkingApi`) caps this at 3 per code (`MaxPrimaryHelloError`);
+        /// the primary may retry, re-deriving fresh key material each time.
+        primary_hello_attempt_count: u32,
     },
     /// Pairing completed (success or failure).
     Completed,
@@ -208,7 +233,9 @@ impl PairCodeUtils {
     /// Encodes 5 bytes to an 8-character Crockford Base32 string.
     ///
     /// 5 bytes = 40 bits = 8 × 5-bit groups, each mapped to the alphabet.
-    fn encode_crockford(bytes: &[u8; 5]) -> String {
+    /// `pub(crate)` so the Shortcake passkey flow reuses the exact same encoder
+    /// for its verification code (see `crate::shortcake`).
+    pub(crate) fn encode_crockford(bytes: &[u8; 5]) -> String {
         // Combine 5 bytes into a 40-bit value
         let mut accumulator: u64 = 0;
         for &byte in bytes {
@@ -336,9 +363,10 @@ impl PairCodeUtils {
                 NodeBuilder::new("companion_platform_display")
                     .bytes(platform_display.as_bytes().to_vec())
                     .build(),
-                // Nonce is sent as string "0" (matching whatsmeow/baileys)
+                // 0x00, not ASCII '0' (0x30): matches WA Web `new Uint8Array(1)`
+                // (`Alt/DeviceLinkingIq.js`) / whatsmeow `[]byte{0}`.
                 NodeBuilder::new("link_code_pairing_nonce")
-                    .bytes(b"0".to_vec())
+                    .bytes(vec![0u8])
                     .build(),
             ])
             .build();
@@ -444,10 +472,8 @@ impl PairCodeUtils {
         combined_secret.extend_from_slice(&identity_shared);
         combined_secret.extend_from_slice(&random_bytes);
 
-        let hk_adv = Hkdf::<Sha256>::new(None, &combined_secret);
         let mut new_adv_secret = [0u8; 32];
-        hk_adv
-            .expand(b"adv_secret", &mut new_adv_secret)
+        crate::crypto::hkdf_sha256_into(&combined_secret, None, b"adv_secret", &mut new_adv_secret)
             .map_err(|_| PairCodeError::AdvSecretKeyDerivation)?;
 
         // Prepare bundle: companion_identity_pub (32) + primary_identity_pub (32) + random_bytes (32) = 96 bytes
@@ -462,11 +488,14 @@ impl PairCodeUtils {
 
         // Derive bundle encryption key using HKDF
         // HKDF(IKM=ephemeral_shared, salt=random_salt, info="link_code_pairing_key_bundle_encryption_key")
-        let hk_bundle = Hkdf::<Sha256>::new(Some(&key_bundle_salt), &ephemeral_shared);
         let mut enc_key = [0u8; 32];
-        hk_bundle
-            .expand(b"link_code_pairing_key_bundle_encryption_key", &mut enc_key)
-            .map_err(|_| PairCodeError::BundleKeyDerivation)?;
+        crate::crypto::hkdf_sha256_into(
+            &ephemeral_shared,
+            Some(&key_bundle_salt),
+            b"link_code_pairing_key_bundle_encryption_key",
+            &mut enc_key,
+        )
+        .map_err(|_| PairCodeError::BundleKeyDerivation)?;
 
         // Generate random IV for AES-GCM (12 bytes)
         let mut iv = [0u8; 12];
@@ -485,6 +514,11 @@ impl PairCodeUtils {
     /// Returns the pair code validity duration.
     pub fn code_validity() -> std::time::Duration {
         std::time::Duration::from_secs(PAIR_CODE_VALIDITY_SECS)
+    }
+
+    /// Max number of `primary_hello` notifications processed per code (WA Web `T`).
+    pub fn max_primary_hello_attempts() -> u32 {
+        PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS
     }
 }
 
@@ -685,14 +719,14 @@ mod tests {
     fn props(os: Option<&str>, pt: Option<wa::device_props::PlatformType>) -> wa::DeviceProps {
         wa::DeviceProps {
             os: os.map(|s| s.to_string()),
-            platform_type: pt.map(|v| v as i32),
+            platform_type: pt,
             ..Default::default()
         }
     }
 
     #[test]
     fn derive_chrome_linux_matches_wa_web() {
-        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::Chrome));
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::CHROME));
         assert_eq!(
             derive_companion_platform(&p),
             (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
@@ -701,7 +735,7 @@ mod tests {
 
     #[test]
     fn derive_firefox_uses_companion_web_client_wire() {
-        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::Firefox));
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::FIREFOX));
         let (id, display) = derive_companion_platform(&p);
         assert_eq!(id, CompanionWebClientType::Firefox);
         assert_eq!(id.wire_byte(), b'3');
@@ -710,7 +744,7 @@ mod tests {
 
     #[test]
     fn derive_edge_uses_companion_web_client_wire() {
-        let p = props(Some("Windows"), Some(wa::device_props::PlatformType::Edge));
+        let p = props(Some("Windows"), Some(wa::device_props::PlatformType::EDGE));
         let (id, display) = derive_companion_platform(&p);
         assert_eq!(id, CompanionWebClientType::Edge);
         assert_eq!(id.wire_byte(), b'2');
@@ -720,7 +754,7 @@ mod tests {
     #[test]
     fn derive_android_platform_types_map_to_chrome() {
         use wa::device_props::PlatformType as P;
-        for pt in [P::AndroidPhone, P::AndroidTablet, P::AndroidAmbiguous] {
+        for pt in [P::ANDROID_PHONE, P::ANDROID_TABLET, P::ANDROID_AMBIGUOUS] {
             let (id, display) = derive_companion_platform(&props(Some("Android"), Some(pt)));
             assert_eq!(id, CompanionWebClientType::Chrome, "{pt:?}");
             assert_eq!(id.wire_byte(), b'1', "{pt:?}");
@@ -730,7 +764,7 @@ mod tests {
 
     #[test]
     fn derive_ios_phone_falls_back_to_other_web_client_and_chrome() {
-        let p = props(Some("iOS"), Some(wa::device_props::PlatformType::IosPhone));
+        let p = props(Some("iOS"), Some(wa::device_props::PlatformType::IOS_PHONE));
         let (id, display) = derive_companion_platform(&p);
         assert_eq!(id, CompanionWebClientType::OtherWebClient);
         assert_eq!(display, "Chrome (iOS)");
@@ -738,7 +772,7 @@ mod tests {
 
     #[test]
     fn derive_no_os_substitutes_linux() {
-        let p = props(None, Some(wa::device_props::PlatformType::Chrome));
+        let p = props(None, Some(wa::device_props::PlatformType::CHROME));
         assert_eq!(
             derive_companion_platform(&p),
             (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
@@ -747,7 +781,7 @@ mod tests {
 
     #[test]
     fn derive_empty_os_substitutes_linux() {
-        let p = props(Some("   "), Some(wa::device_props::PlatformType::Chrome));
+        let p = props(Some("   "), Some(wa::device_props::PlatformType::CHROME));
         assert_eq!(
             derive_companion_platform(&p),
             (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
@@ -774,31 +808,31 @@ mod tests {
             "Chrome", "Edge", "Firefox", "IE", "Opera", "Safari", "Android",
         ];
         for pt in [
-            P::Unknown,
-            P::Chrome,
-            P::Firefox,
-            P::Ie,
-            P::Opera,
-            P::Safari,
-            P::Edge,
-            P::Desktop,
-            P::Ipad,
-            P::AndroidTablet,
-            P::Ohana,
-            P::Aloha,
-            P::Catalina,
-            P::TclTv,
-            P::IosPhone,
-            P::IosCatalyst,
-            P::AndroidPhone,
-            P::AndroidAmbiguous,
-            P::WearOs,
-            P::ArWrist,
-            P::ArDevice,
-            P::Uwp,
-            P::Vr,
-            P::CloudApi,
-            P::Smartglasses,
+            P::UNKNOWN,
+            P::CHROME,
+            P::FIREFOX,
+            P::IE,
+            P::OPERA,
+            P::SAFARI,
+            P::EDGE,
+            P::DESKTOP,
+            P::IPAD,
+            P::ANDROID_TABLET,
+            P::OHANA,
+            P::ALOHA,
+            P::CATALINA,
+            P::TCL_TV,
+            P::IOS_PHONE,
+            P::IOS_CATALYST,
+            P::ANDROID_PHONE,
+            P::ANDROID_AMBIGUOUS,
+            P::WEAR_OS,
+            P::AR_WRIST,
+            P::AR_DEVICE,
+            P::UWP,
+            P::VR,
+            P::CLOUD_API,
+            P::SMARTGLASSES,
         ] {
             let p = props(Some("Linux"), Some(pt));
             let (id, display) = derive_companion_platform(&p);
@@ -823,7 +857,7 @@ mod tests {
     fn resolve_explicit_id_overrides_derived() {
         let p = props(
             Some("Android"),
-            Some(wa::device_props::PlatformType::AndroidPhone),
+            Some(wa::device_props::PlatformType::ANDROID_PHONE),
         );
         let opts = PairCodeOptions {
             platform_id: Some(CompanionWebClientType::Chrome),
@@ -840,11 +874,53 @@ mod tests {
 
     #[test]
     fn resolve_default_uses_derived() {
-        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::Edge));
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::EDGE));
         assert_eq!(
             resolve_companion_platform(&PairCodeOptions::default(), &p),
             (CompanionWebClientType::Edge, "Edge (Linux)".to_string())
         );
+    }
+
+    /// `display_os` sends the OS verbatim (bypassing canonicalization), so an
+    /// advanced caller can keep a real distro name the server accepts.
+    #[test]
+    fn resolve_display_os_override_is_verbatim() {
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::CHROME));
+        let opts = PairCodeOptions {
+            display_os: Some("Ubuntu".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_companion_platform(&opts, &p),
+            (
+                CompanionWebClientType::Chrome,
+                "Chrome (Ubuntu)".to_string()
+            )
+        );
+    }
+
+    /// The override wins even over a branding `DeviceProps::os` that would
+    /// otherwise coerce to Linux.
+    #[test]
+    fn resolve_display_os_override_beats_branding_props_os() {
+        let p = props(Some("Veloz"), Some(wa::device_props::PlatformType::CHROME));
+        let opts = PairCodeOptions {
+            display_os: Some("Fedora".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_companion_platform(&opts, &p).1, "Chrome (Fedora)");
+    }
+
+    /// An all-whitespace override is ignored — it falls back to the safe coercion
+    /// (never emits an empty OS, which the server rejects).
+    #[test]
+    fn resolve_display_os_override_whitespace_falls_back_to_coercion() {
+        let p = props(Some("Veloz"), Some(wa::device_props::PlatformType::CHROME));
+        let opts = PairCodeOptions {
+            display_os: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_companion_platform(&opts, &p).1, "Chrome (Linux)");
     }
 
     #[test]
@@ -1070,8 +1146,9 @@ mod tests {
             Some("true")
         );
 
-        // Nonce is the string "0", per whatsmeow/baileys parity.
-        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), b"0");
+        // Nonce is a single zero byte (0x00), matching WA Web's
+        // `new Uint8Array(1)` and whatsmeow's `[]byte{0}` — not ASCII '0'.
+        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), &[0u8]);
     }
 
     #[test]
@@ -1105,7 +1182,7 @@ mod tests {
     fn android_device_props_emit_server_accepted_companion_hello() {
         let props = wa::DeviceProps {
             os: Some("Android".into()),
-            platform_type: Some(wa::device_props::PlatformType::AndroidPhone as i32),
+            platform_type: Some(wa::device_props::PlatformType::ANDROID_PHONE),
             ..Default::default()
         };
         let (pid, pdisp) = resolve_companion_platform(&PairCodeOptions::default(), &props);
@@ -1128,7 +1205,7 @@ mod tests {
     fn explicit_options_override_id_and_display_follows() {
         let props = wa::DeviceProps {
             os: Some("Android".into()),
-            platform_type: Some(wa::device_props::PlatformType::AndroidPhone as i32),
+            platform_type: Some(wa::device_props::PlatformType::ANDROID_PHONE),
             ..Default::default()
         };
         let opts = PairCodeOptions {
@@ -1144,7 +1221,7 @@ mod tests {
     #[test]
     fn pair_code_id_matches_qr_id_for_same_device_props() {
         use crate::companion_reg::companion_web_client_type_for_props;
-        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::Edge));
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::EDGE));
         let (pair_code_id, _) = derive_companion_platform(&p);
         let qr_id = companion_web_client_type_for_props(&p);
         assert_eq!(pair_code_id, qr_id);

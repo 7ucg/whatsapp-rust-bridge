@@ -95,26 +95,26 @@ mod peer_message_options {
     use super::*;
     use crate::types::message::{PrivacySensitiveType, PushPriority};
 
-    fn pdo_message_raw(request_type: i32) -> wa::Message {
+    fn pdo_message_raw(
+        request_type: Option<wa::message::PeerDataOperationRequestType>,
+    ) -> wa::Message {
         wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(
-                    wa::message::protocol_message::Type::PeerDataOperationRequestMessage as i32,
-                ),
-                peer_data_operation_request_message: Some(
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::PeerDataOperationRequestMessage),
+                peer_data_operation_request_message: buffa::MessageField::some(
                     wa::message::PeerDataOperationRequestMessage {
-                        peer_data_operation_request_type: Some(request_type),
+                        peer_data_operation_request_type: request_type,
                         ..Default::default()
                     },
                 ),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         }
     }
 
     fn pdo_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {
-        pdo_message_raw(request_type as i32)
+        pdo_message_raw(Some(request_type))
     }
 
     #[test]
@@ -177,17 +177,19 @@ mod peer_message_options {
     #[test]
     fn non_pdo_and_unknown_pdo_keep_peer_defaults() {
         let app_state_key_request = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest as i32),
-                app_state_sync_key_request: Some(wa::message::AppStateSyncKeyRequest {
-                    key_ids: Vec::new(),
-                }),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+                app_state_sync_key_request: buffa::MessageField::some(
+                    wa::message::AppStateSyncKeyRequest {
+                        key_ids: Vec::new(),
+                    },
+                ),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
-        for msg in [app_state_key_request, pdo_message_raw(99)] {
+        for msg in [app_state_key_request, pdo_message_raw(None)] {
             let options = peer_message_options_from_message(&msg);
             assert_eq!(options.push_priority(), PushPriority::High);
             assert_eq!(options.privacy_sensitive(), None);
@@ -201,10 +203,10 @@ mod status_carries_privacy_meta {
     #[test]
     fn true_for_text_post() {
         let msg = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some("hi".into()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
@@ -213,7 +215,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn true_for_image_post() {
         let msg = wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage::default())),
+            image_message: buffa::MessageField::some(wa::message::ImageMessage::default()),
             ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
@@ -222,10 +224,10 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction() {
         let msg = wa::Message {
-            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
                 text: Some("💚".into()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(
@@ -237,7 +239,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_enc_reaction() {
         let msg = wa::Message {
-            enc_reaction_message: Some(Box::default()),
+            enc_reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -246,10 +248,10 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_revoke() {
         let msg = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -260,10 +262,10 @@ mod status_carries_privacy_meta {
         // Other ProtocolMessage types (e.g., EphemeralSettings) aren't
         // reactions and aren't revokes — treat as posts for now.
         let msg = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::EphemeralSetting as i32),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::EphemeralSetting),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
@@ -272,13 +274,13 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction_inside_ephemeral_wrapper() {
         let inner = wa::Message {
-            reaction_message: Some(Box::default()),
+            reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         let msg = wa::Message {
-            ephemeral_message: Some(Box::new(wa::message::FutureProofMessage {
-                message: Some(Box::new(inner)),
-            })),
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(inner),
+            }),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -287,18 +289,18 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_revoke_inside_device_sent_wrapper() {
         let inner = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let msg = wa::Message {
-            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+            device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
                 destination_jid: Some(String::new()),
-                message: Some(Box::new(inner)),
+                message: buffa::MessageField::some(inner),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -308,16 +310,19 @@ mod status_carries_privacy_meta {
 #[test]
 fn build_member_label_message_sets_fields() {
     let msg = build_member_label_message("VIP".to_string(), 1_766_847_151);
-    let pm = msg.protocol_message.as_ref().expect("protocol_message set");
+    let pm = msg
+        .protocol_message
+        .as_option()
+        .expect("protocol_message set");
     assert_eq!(
         pm.r#type,
-        Some(wa::message::protocol_message::Type::GroupMemberLabelChange as i32)
+        Some(wa::message::protocol_message::Type::GroupMemberLabelChange)
     );
-    let ml = pm.member_label.as_ref().expect("member_label set");
+    let ml = pm.member_label.as_option().expect("member_label set");
     assert_eq!(ml.label.as_deref(), Some("VIP"));
     assert_eq!(ml.label_timestamp, Some(1_766_847_151));
     assert!(
-        pm.key.is_none(),
+        pm.key.is_unset(),
         "MessageKey must NOT be set (WA Web parity)"
     );
 }
@@ -327,10 +332,10 @@ fn build_member_label_message_clear_uses_empty_string() {
     let msg = build_member_label_message(String::new(), 1);
     let ml = msg
         .protocol_message
-        .as_ref()
+        .as_option()
         .unwrap()
         .member_label
-        .as_ref()
+        .as_option()
         .unwrap();
     assert_eq!(ml.label.as_deref(), Some(""));
 }
@@ -340,10 +345,10 @@ fn build_member_label_message_preserves_unicode() {
     let msg = build_member_label_message("🚀 BOT".to_string(), 2);
     let ml = msg
         .protocol_message
-        .as_ref()
+        .as_option()
         .unwrap()
         .member_label
-        .as_ref()
+        .as_option()
         .unwrap();
     assert_eq!(ml.label.as_deref(), Some("🚀 BOT"));
 }
@@ -662,8 +667,8 @@ fn test_cloud_api_device_without_prekey() {
 /// # Why filter hosted devices from groups?
 ///
 /// WhatsApp Web explicitly excludes hosted devices from group message fanout.
-/// From the JS code (`getFanOutList`):
-/// ```javascript
+/// From the reference client (`getFanOutList`):
+/// ```text
 /// var isHosted = e.id === 99 || e.isHosted === true;
 /// var includeInFanout = !isHosted || isOneToOneChat;
 /// ```
@@ -795,6 +800,30 @@ fn create_mock_bundle() -> PreKeyBundle {
         *identity_pair.identity_key(),
     )
     .expect("Failed to create PreKeyBundle")
+}
+
+/// A bundle whose signed-prekey signature actually verifies, so
+/// `process_prekey_bundle` establishes a session. Contrast `create_mock_bundle`,
+/// whose zeroed signature deliberately fails X3DH (used to exercise the reject path).
+fn signed_prekey_bundle() -> PreKeyBundle {
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let receiver = IdentityKeyPair::generate(&mut rng);
+    let spk = KeyPair::generate(&mut rng);
+    let opk = KeyPair::generate(&mut rng);
+    let sig = receiver
+        .private_key()
+        .calculate_signature(&spk.public_key.serialize(), &mut rng)
+        .unwrap();
+    PreKeyBundle::new(
+        1,
+        1u32.into(),
+        Some((1u32.into(), opk.public_key)),
+        1u32.into(),
+        spk.public_key,
+        sig.to_vec(),
+        *receiver.identity_key(),
+    )
+    .unwrap()
 }
 
 // These tests validate the fix for the LID-PN session mismatch issue.
@@ -1026,7 +1055,9 @@ fn test_dm_encryption_excludes_sender_device() {
         Jid::lid_device("987654321".to_string(), 0),          // Recipient
     ];
 
-    let (recipient_devices, own_other_devices) = partition_dm_devices(all_devices, &own_jid, None);
+    let partitioned = partition_dm_devices(all_devices, &own_jid, None);
+    let recipient_devices = partitioned.recipient_devices();
+    let own_other_devices = partitioned.own_other_devices();
 
     // Verifications
 
@@ -1073,8 +1104,9 @@ fn test_dm_encryption_treats_own_lid_devices_as_self() {
         Jid::lid_device("987654321012345".to_string(), 0),  // Recipient
     ];
 
-    let (recipient_devices, own_other_devices) =
-        partition_dm_devices(all_devices, &own_pn, Some(&own_lid));
+    let partitioned = partition_dm_devices(all_devices, &own_pn, Some(&own_lid));
+    let recipient_devices = partitioned.recipient_devices();
+    let own_other_devices = partitioned.own_other_devices();
 
     assert!(
         !own_other_devices
@@ -1207,8 +1239,8 @@ fn test_lid_prekey_lookup_normalization() {
 mod group_retry {
     use super::*;
     use crate::libsignal::protocol::{
-        Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair,
-        PreKeyBundle, ProtocolAddress, SessionStore, process_prekey_bundle,
+        Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, ProtocolAddress,
+        SessionStore, process_prekey_bundle,
     };
     use crate::types::message::AddressingMode;
     use std::collections::HashMap;
@@ -1295,23 +1327,7 @@ mod group_retry {
     async fn setup_session() -> (MemSessionStore, MemIdentityStore, Jid) {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let sender = IdentityKeyPair::generate(&mut rng);
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
+        let bundle = signed_prekey_bundle();
         let jid: Jid = "559911112222@s.whatsapp.net".parse().unwrap();
         let addr = jid.to_protocol_address();
         let mut ss = MemSessionStore::new();
@@ -1547,7 +1563,7 @@ mod group_retry {
     async fn dm_retry_pkmsg_with_account_has_device_identity() {
         let (mut ss, mut is, jid) = setup_session().await;
         let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
-        let acc = wa::AdvSignedDeviceIdentity {
+        let acc = wa::ADVSignedDeviceIdentity {
             details: Some(b"t".to_vec()),
             ..Default::default()
         };
@@ -1581,7 +1597,7 @@ mod group_retry {
         let (mut ss, mut is, jid) = setup_session().await;
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
-        let acc = wa::AdvSignedDeviceIdentity {
+        let acc = wa::ADVSignedDeviceIdentity {
             details: Some(b"t".to_vec()),
             ..Default::default()
         };
@@ -1634,7 +1650,7 @@ mod group_retry {
             &wa::Message::default(),
             "m2".into(),
             3,
-            Some(&wa::AdvSignedDeviceIdentity::default()),
+            Some(&wa::ADVSignedDeviceIdentity::default()),
             AddressingMode::Lid,
             None,
         )
@@ -1726,10 +1742,10 @@ mod group_retry {
     // layer skips session promotion. Mirrors whatsmeow's
     // `preparePeerMessageNode`.
 
-    fn pkmsg_account_proto() -> wa::AdvSignedDeviceIdentity {
+    fn pkmsg_account_proto() -> wa::ADVSignedDeviceIdentity {
         // Opaque placeholder bytes — the assertions only check that
         // the element carries non-empty content.
-        wa::AdvSignedDeviceIdentity {
+        wa::ADVSignedDeviceIdentity {
             details: Some(vec![0u8; 32]),
             account_signature_key: Some(vec![0u8; 32]),
             account_signature: Some(vec![0u8; 64]),
@@ -1738,13 +1754,13 @@ mod group_retry {
     }
 
     async fn build_peer_stanza(
-        account: Option<&wa::AdvSignedDeviceIdentity>,
+        account: Option<&wa::ADVSignedDeviceIdentity>,
     ) -> wacore_binary::Node {
         build_peer_stanza_with_options(account, PeerMessageOptions::default()).await
     }
 
     async fn build_peer_stanza_with_options(
-        account: Option<&wa::AdvSignedDeviceIdentity>,
+        account: Option<&wa::ADVSignedDeviceIdentity>,
         options: PeerMessageOptions,
     ) -> wacore_binary::Node {
         let (mut ss, mut is, jid) = setup_session().await;
@@ -2119,7 +2135,7 @@ mod decrypt_fail {
     #[test]
     fn reaction() {
         let msg = wa::Message {
-            reaction_message: Some(Box::default()),
+            reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2128,7 +2144,7 @@ mod decrypt_fail {
     #[test]
     fn pin() {
         let msg = wa::Message {
-            pin_in_chat_message: Some(Box::default()),
+            pin_in_chat_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2137,10 +2153,10 @@ mod decrypt_fail {
     #[test]
     fn poll_vote() {
         let msg = wa::Message {
-            poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
-                vote: Some(Default::default()),
+            poll_update_message: buffa::MessageField::some(wa::message::PollUpdateMessage {
+                vote: buffa::MessageField::some(Default::default()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2149,7 +2165,7 @@ mod decrypt_fail {
     #[test]
     fn poll_update_without_vote() {
         let msg = wa::Message {
-            poll_update_message: Some(Box::default()),
+            poll_update_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(!should_hide_decrypt_fail(&msg));
@@ -2158,12 +2174,12 @@ mod decrypt_fail {
     #[test]
     fn reaction_inside_ephemeral_wrapper() {
         let msg = wa::Message {
-            ephemeral_message: Some(Box::new(wa::message::FutureProofMessage {
-                message: Some(Box::new(wa::Message {
-                    reaction_message: Some(Box::default()),
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    reaction_message: buffa::MessageField::some(Default::default()),
                     ..Default::default()
-                })),
-            })),
+                }),
+            }),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2172,7 +2188,7 @@ mod decrypt_fail {
     #[test]
     fn conditional_reveal() {
         let msg = wa::Message {
-            conditional_reveal_message: Some(Box::default()),
+            conditional_reveal_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2182,10 +2198,12 @@ mod decrypt_fail {
     fn poll_add_option_edit() {
         use wa::message::secret_encrypted_message::SecretEncType;
         let msg = wa::Message {
-            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-                secret_enc_type: Some(SecretEncType::PollAddOption as i32),
-                ..Default::default()
-            })),
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(SecretEncType::PollAddOption),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2231,7 +2249,7 @@ mod decrypt_fail_for_send {
     fn revoke_does_not_block_content_based_hide() {
         // A reaction still hides on its own merits even under a revoke edit.
         let msg = wa::Message {
-            reaction_message: Some(Box::default()),
+            reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail_for_send(
@@ -2247,10 +2265,12 @@ mod stanza_type {
 
     fn secret(enc: SecretEncType) -> wa::Message {
         wa::Message {
-            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-                secret_enc_type: Some(enc as i32),
-                ..Default::default()
-            })),
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(enc),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         }
     }
@@ -2274,7 +2294,7 @@ mod stanza_type {
     #[test]
     fn album_is_text() {
         let msg = wa::Message {
-            album_message: Some(Box::default()),
+            album_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
@@ -2283,10 +2303,10 @@ mod stanza_type {
     // Helpers for wrapper tests. WA Web's typeAttributeFromProtobuf unwraps
     // FutureProofMessage wrappers (via getUnwrappedProtobufMessage) and then
     // classifies the inner message.
-    fn fpm(inner: wa::Message) -> Box<wa::message::FutureProofMessage> {
-        Box::new(wa::message::FutureProofMessage {
-            message: Some(Box::new(inner)),
-        })
+    fn fpm(inner: wa::Message) -> wa::message::FutureProofMessage {
+        wa::message::FutureProofMessage {
+            message: buffa::MessageField::some(inner),
+        }
     }
     fn text_inner() -> wa::Message {
         wa::Message {
@@ -2296,7 +2316,7 @@ mod stanza_type {
     }
     fn image_inner() -> wa::Message {
         wa::Message {
-            image_message: Some(Box::default()),
+            image_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         }
     }
@@ -2304,7 +2324,7 @@ mod stanza_type {
     #[test]
     fn group_status_v2_classifies_by_inner() {
         let txt = wa::Message {
-            group_status_message_v2: Some(fpm(text_inner())),
+            group_status_message_v2: buffa::MessageField::some(fpm(text_inner())),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&txt), stanza::MSG_TYPE_TEXT);
@@ -2313,7 +2333,7 @@ mod stanza_type {
         // mediatype and silently dropped the stanza. WA Web unwraps it and
         // sends type="media" mediatype="image".
         let img = wa::Message {
-            group_status_message_v2: Some(fpm(image_inner())),
+            group_status_message_v2: buffa::MessageField::some(fpm(image_inner())),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
@@ -2326,7 +2346,7 @@ mod stanza_type {
         // (ephemeral/groupMentioned/botInvoke/deviceSent), so it falls through
         // to the media default in both WA Web and here.
         let m = wa::Message {
-            group_status_message_v2: Some(Box::default()),
+            group_status_message_v2: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
@@ -2337,23 +2357,23 @@ mod stanza_type {
         // Payment family classifies as text; the media default would be dropped.
         let cases = [
             wa::Message {
-                request_payment_message: Some(Box::default()),
+                request_payment_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
             wa::Message {
-                send_payment_message: Some(Box::default()),
+                send_payment_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
             wa::Message {
-                decline_payment_request_message: Some(Box::default()),
+                decline_payment_request_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
             wa::Message {
-                cancel_payment_request_message: Some(Box::default()),
+                cancel_payment_request_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
             wa::Message {
-                payment_invite_message: Some(Box::default()),
+                payment_invite_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
         ];
@@ -2366,13 +2386,13 @@ mod stanza_type {
     #[test]
     fn backfilled_wrappers_classify_by_inner() {
         let spoiler = wa::Message {
-            spoiler_message: Some(fpm(text_inner())),
+            spoiler_message: buffa::MessageField::some(fpm(text_inner())),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&spoiler), stanza::MSG_TYPE_TEXT);
 
         let status_mention = wa::Message {
-            status_mention_message: Some(fpm(image_inner())),
+            status_mention_message: buffa::MessageField::some(fpm(image_inner())),
             ..Default::default()
         };
         assert_eq!(
@@ -2382,13 +2402,13 @@ mod stanza_type {
         assert_eq!(media_type_from_message(&status_mention), Some("image"));
 
         let question = wa::Message {
-            question_message: Some(fpm(text_inner())),
+            question_message: buffa::MessageField::some(fpm(text_inner())),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&question), stanza::MSG_TYPE_TEXT);
 
         let group_status_v1 = wa::Message {
-            group_status_message: Some(fpm(text_inner())),
+            group_status_message: buffa::MessageField::some(fpm(text_inner())),
             ..Default::default()
         };
         assert_eq!(
@@ -2401,11 +2421,11 @@ mod stanza_type {
     fn nested_wrappers_reach_innermost() {
         // ephemeral { viewOnceV2 { image } } -> media + mediatype.
         let inner = wa::Message {
-            view_once_message_v2: Some(fpm(image_inner())),
+            view_once_message_v2: buffa::MessageField::some(fpm(image_inner())),
             ..Default::default()
         };
         let m = wa::Message {
-            ephemeral_message: Some(fpm(inner)),
+            ephemeral_message: buffa::MessageField::some(fpm(inner)),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
@@ -2415,19 +2435,19 @@ mod stanza_type {
     #[test]
     fn preserved_classifier_branches() {
         let r = wa::Message {
-            reaction_message: Some(Box::default()),
+            reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&r), stanza::MSG_TYPE_REACTION);
 
         let ev = wa::Message {
-            event_message: Some(Box::default()),
+            event_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&ev), stanza::MSG_TYPE_EVENT);
 
         let poll = wa::Message {
-            poll_creation_message_v3: Some(Box::default()),
+            poll_creation_message_v3: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&poll), stanza::MSG_TYPE_POLL);
@@ -2442,16 +2462,16 @@ mod stanza_type {
         );
 
         let proto = wa::Message {
-            protocol_message: Some(Box::default()),
+            protocol_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&proto), stanza::MSG_TYPE_TEXT);
 
         let url = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 matched_text: Some("https://example.com".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&url), stanza::MSG_TYPE_MEDIA);
@@ -2462,14 +2482,14 @@ mod stanza_type {
         // WA Web's mediaTypeFromProtobuf maps these to concrete mediatypes;
         // omitting the attribute makes the server drop the type="media" stanza.
         let list = wa::Message {
-            list_message: Some(Box::default()),
+            list_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&list), stanza::MSG_TYPE_MEDIA);
         assert_eq!(media_type_from_message(&list), Some("list"));
 
         let list_response = wa::Message {
-            list_response_message: Some(Box::default()),
+            list_response_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -2478,7 +2498,7 @@ mod stanza_type {
         );
 
         let buttons_response = wa::Message {
-            buttons_response_message: Some(Box::default()),
+            buttons_response_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -2487,19 +2507,19 @@ mod stanza_type {
         );
 
         let order = wa::Message {
-            order_message: Some(Box::default()),
+            order_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(media_type_from_message(&order), Some("order"));
 
         let product = wa::Message {
-            product_message: Some(Box::default()),
+            product_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(media_type_from_message(&product), Some("product"));
 
         let interactive_response = wa::Message {
-            interactive_response_message: Some(Box::default()),
+            interactive_response_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -2508,7 +2528,7 @@ mod stanza_type {
         );
 
         let history_bundle = wa::Message {
-            message_history_bundle: Some(Box::default()),
+            message_history_bundle: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -2523,7 +2543,7 @@ mod stanza_type {
         // mapper has no Button case (returns null/DROP_ATTR), so the attribute
         // is omitted. Adding a "buttons" mediatype would diverge from WA Web.
         let buttons = wa::Message {
-            buttons_message: Some(Box::default()),
+            buttons_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(media_type_from_message(&buttons), None);
@@ -2532,8 +2552,8 @@ mod stanza_type {
     #[test]
     fn ephemeral_wrapped_list_reaches_list_mediatype() {
         let m = wa::Message {
-            ephemeral_message: Some(fpm(wa::Message {
-                list_message: Some(Box::default()),
+            ephemeral_message: buffa::MessageField::some(fpm(wa::Message {
+                list_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             })),
             ..Default::default()
@@ -2547,7 +2567,7 @@ mod stanza_type {
         // as a terminal "sticker" and does NOT recurse into it, unlike the
         // stanza-type path which unwraps it.
         let lottie = wa::Message {
-            lottie_sticker_message: Some(fpm(image_inner())),
+            lottie_sticker_message: buffa::MessageField::some(fpm(image_inner())),
             ..Default::default()
         };
         assert_eq!(media_type_from_message(&lottie), Some("sticker"));
@@ -2854,6 +2874,65 @@ mod mark_full_distribution_list {
         }
     }
 
+    /// An ungated sender-chain advance puts group ciphertext on the wire before
+    /// the advance is durable, so a reload re-derives the same iteration: one
+    /// (key, IV) reused toward every member.
+    #[tokio::test]
+    async fn encrypt_group_message_leases_the_sender_chain() {
+        use crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
+        use crate::libsignal::protocol::{KeyPair, SenderKeyRecord};
+
+        let name = SenderKeyName::new("g@g.us".to_string(), "me.0".to_string());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let kp = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(3, 1, 0, &[7u8; 32], kp.public_key, Some(kp.private_key))
+            .expect("valid sender key state");
+
+        let mut sks = MemSenderKeyStore::default();
+        sks.records.insert(name.clone(), record);
+
+        crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+            .await
+            .expect("group encrypt");
+
+        let stored = sks
+            .load_sender_key(&name)
+            .await
+            .expect("load")
+            .expect("record present");
+        assert_eq!(
+            stored.reserved_iteration(),
+            SENDER_CHAIN_RESERVATION_BATCH,
+            "encrypt_group_message must lease the sender chain"
+        );
+    }
+
+    /// The warm-send recovery downcasts NoSenderKeyState to clear stale device
+    /// tracking and retry with SKDM redistribution, so erasing the concrete
+    /// error type here would silently cost the self-heal.
+    #[tokio::test]
+    async fn encrypt_group_message_preserves_no_sender_key_state() {
+        use crate::libsignal::protocol::SignalProtocolError;
+
+        let name = SenderKeyName::new("g@g.us".to_string(), "me.0".to_string());
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        // Empty store: no local SenderKeyRecord for `name`.
+        let mut sks = MemSenderKeyStore::default();
+
+        let err = crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+            .await
+            .expect_err("a missing sender key must error");
+        assert!(
+            matches!(
+                err.downcast_ref::<SignalProtocolError>(),
+                Some(SignalProtocolError::NoSenderKeyState(_))
+            ),
+            "NoSenderKeyState must survive the delegation for the SKDM-redistribution retry, got: {err:#}"
+        );
+    }
+
     // Outgoing group encryption never consumes our own prekeys, and device B
     // has no bundle (so no session is established for it) — these are never
     // called; present only to satisfy the generic bounds.
@@ -2915,23 +2994,7 @@ mod mark_full_distribution_list {
     async fn established_stores(a: &Jid) -> (MemSessionStore, MemIdentityStore) {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let sender = IdentityKeyPair::generate(&mut rng);
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
+        let bundle = signed_prekey_bundle();
         let mut ss = MemSessionStore::default();
         let mut is = MemIdentityStore {
             pair: sender,
@@ -3003,6 +3066,7 @@ mod mark_full_distribution_list {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("prepare_group_stanza should succeed even when a device fails to encrypt");
@@ -3087,6 +3151,7 @@ mod mark_full_distribution_list {
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             .expect("prepare_group_stanza should succeed");
@@ -3119,10 +3184,10 @@ mod mark_full_distribution_list {
 
         // Excluded type (reaction) → no secret, no <reporting> node.
         let reaction = wa::Message {
-            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
                 text: Some("👍".into()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let (node, has_secret) = prepare(
@@ -3182,27 +3247,8 @@ mod mark_full_distribution_list {
             signed_prekey_store: &spks,
         };
 
-        // Verifiable bundle (create_mock_bundle's zeroed signature fails X3DH).
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
-
         let resolver = MockSendContextResolver::new()
-            .with_bundle(b.clone(), bundle)
+            .with_bundle(b.clone(), signed_prekey_bundle())
             .with_chain_lock_probe(probe.clone());
         let rt = TokioTestRuntime;
 
@@ -3229,6 +3275,7 @@ mod mark_full_distribution_list {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("prepare_group_stanza should succeed");
@@ -3257,6 +3304,86 @@ mod mark_full_distribution_list {
             participants.children().map(|c| c.len()).unwrap_or(0),
             1,
             "B must receive a pairwise SKDM via the pre-established session"
+        );
+    }
+
+    /// One participant's session-setup failure must NOT abort the SKDM for the
+    /// rest of the cohort: the good device still gets its pairwise SKDM, the bad
+    /// one is dropped. Before the fix, the failing device's process_prekey_bundle
+    /// error nulled the whole session_plan, so no device got an SKDM (and the
+    /// cohort was still marked has_key=true, orphaning own companions).
+    #[tokio::test]
+    async fn group_skdm_setup_failure_is_isolated_to_the_bad_device() {
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000001@lid".parse().unwrap();
+        // good: valid bundle → session establishes. bad: create_mock_bundle's
+        // zeroed signature fails X3DH inside process_prekey_bundle.
+        let good: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let bad: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        let resolver = MockSendContextResolver::new()
+            .with_bundle(good.clone(), signed_prekey_bundle())
+            .with_bundle(bad.clone(), create_mock_bundle());
+        let rt = TokioTestRuntime;
+
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), good.to_non_ad(), bad.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &rt,
+            &mut stores,
+            &resolver,
+            &group_info,
+            &own_jid,
+            &own_lid,
+            None,
+            group,
+            &msg,
+            "TESTREQID_ISO".into(),
+            false,
+            Some(vec![good.clone(), bad.clone()]),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("prepare_group_stanza must succeed despite one device's setup failure");
+
+        let participants = prepared
+            .node
+            .get_optional_child("participants")
+            .expect("the good device's SKDM must still be distributed");
+        assert_eq!(
+            participants.children().map(|c| c.len()).unwrap_or(0),
+            1,
+            "only the good device receives an SKDM; the failed one is skipped, \
+             not aborting the whole cohort"
         );
     }
 }
@@ -3477,6 +3604,176 @@ mod local_identity_change_on_send {
         fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
             None
         }
+    }
+
+    /// Prekey bundle with a valid signed-prekey signature (create_mock_bundle's
+    /// zeroed signature fails X3DH, so it can't establish a real session).
+    fn verifiable_bundle(rng: &mut rand::rngs::StdRng) -> PreKeyBundle {
+        let identity = IdentityKeyPair::generate(rng);
+        let spk = KeyPair::generate(rng);
+        let opk = KeyPair::generate(rng);
+        let sig = identity
+            .private_key()
+            .calculate_signature(&spk.public_key.serialize(), rng)
+            .unwrap();
+        PreKeyBundle::new(
+            1,
+            1u32.into(),
+            Some((1u32.into(), opk.public_key)),
+            1u32.into(),
+            spk.public_key,
+            sig.to_vec(),
+            *identity.identity_key(),
+        )
+        .unwrap()
+    }
+
+    fn raw_fanout_stores<'a>(
+        sender_key_store: &'a mut MemSenderKeyStore,
+        session_store: &'a mut MemSessionStore,
+        identity_store: &'a mut MemIdentityStore,
+        prekey_store: &'a mut UnusedPreKeyStore,
+        signed_prekey_store: &'a UnusedSignedPreKeyStore,
+    ) -> SignalStores<'a> {
+        SignalStores {
+            sender_key_store,
+            session_store,
+            identity_store,
+            prekey_store,
+            signed_prekey_store,
+        }
+    }
+
+    /// Establish a real Signal session for each device directly on the stores
+    /// (the module's per-value MemSessionStore would lose sessions written
+    /// through the fan-out's clone_box, so setup must not go through spawns).
+    async fn stores_with_sessions(devices: &[Jid]) -> (MemSessionStore, MemIdentityStore) {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut session_store = MemSessionStore::default();
+        let mut identity_store = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            known: HashMap::new(),
+        };
+        for d in devices {
+            process_prekey_bundle(
+                &d.to_protocol_address(),
+                &mut session_store,
+                &mut identity_store,
+                &verifiable_bundle(&mut rng),
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("session established");
+        }
+        (session_store, identity_store)
+    }
+
+    /// Happy path: the chunked fan-out returns a ciphertext for every device,
+    /// spanning more than one ENCRYPT_FANOUT_CONCURRENCY chunk.
+    #[tokio::test]
+    async fn encrypt_for_devices_with_sessions_raw_encrypts_every_device() {
+        let devices: Vec<Jid> = (0..20u16)
+            .map(|i| Jid::pn_device(format!("1555000{i:04}"), 0))
+            .collect();
+
+        let (mut session_store, mut identity_store) = stores_with_sessions(&devices).await;
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = raw_fanout_stores(
+            &mut sender_key_store,
+            &mut session_store,
+            &mut identity_store,
+            &mut prekey_store,
+            &signed_prekey_store,
+        );
+        let rt = TokioTestRuntime;
+
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &rt,
+            &mut stores,
+            &devices,
+            b"payload",
+            SessionPlan::assume_ready(devices.len()),
+        )
+        .await
+        .expect("fan-out succeeds");
+
+        assert_eq!(raw.devices.len(), devices.len());
+        assert!(raw.includes_prekey_message, "fresh sessions emit pkmsg");
+    }
+
+    /// Bad path: a device without a session is skipped while the rest still
+    /// encrypt.
+    #[tokio::test]
+    async fn encrypt_for_devices_with_sessions_raw_skips_sessionless_device() {
+        let device_ok = Jid::pn_device("15550000000", 0);
+        let device_bad = Jid::pn_device("15550000001", 0);
+
+        let (mut session_store, mut identity_store) =
+            stores_with_sessions(std::slice::from_ref(&device_ok)).await;
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = raw_fanout_stores(
+            &mut sender_key_store,
+            &mut session_store,
+            &mut identity_store,
+            &mut prekey_store,
+            &signed_prekey_store,
+        );
+        let rt = TokioTestRuntime;
+
+        let devices = vec![device_ok.clone(), device_bad];
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &rt,
+            &mut stores,
+            &devices,
+            b"payload",
+            SessionPlan::assume_ready(devices.len()),
+        )
+        .await
+        .expect("fan-out succeeds despite the sessionless device");
+
+        assert_eq!(raw.devices.len(), 1);
+        assert_eq!(raw.devices[0].device_jid, device_ok);
+    }
+
+    /// Regression: the chunked fan-out must return empty, not divide by zero, for
+    /// an empty device set (reachable on the cold force-SKDM path).
+    #[tokio::test]
+    async fn encrypt_for_devices_with_sessions_raw_handles_empty_device_set() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut session_store = MemSessionStore::default();
+        let mut identity_store = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            known: HashMap::new(),
+        };
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_key_store,
+            session_store: &mut session_store,
+            identity_store: &mut identity_store,
+            prekey_store: &mut prekey_store,
+            signed_prekey_store: &signed_prekey_store,
+        };
+        let rt = TokioTestRuntime;
+
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &rt,
+            &mut stores,
+            &[],
+            b"x",
+            SessionPlan::assume_ready(0),
+        )
+        .await
+        .expect("empty fan-out must succeed, not panic");
+
+        assert!(raw.devices.is_empty());
+        assert!(!raw.includes_prekey_message);
     }
 
     /// The send path must report a replaced identity via the resolver when

@@ -1,11 +1,11 @@
 use crate::error::{BinaryError, Result};
-use crate::jid::{push_jid_to_compact, JidRef};
+use crate::jid::{JidRef, push_jid_to_compact};
 use crate::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef};
 use crate::token;
 use compact_str::CompactString;
 use std::borrow::Cow;
 #[cfg(feature = "simd")]
-use std::simd::{prelude::*, u8x16, Simd};
+use std::simd::{Simd, prelude::*, u8x16};
 
 /// Format a JidRef directly into CompactString using direct push operations,
 /// bypassing `fmt::Display` and `dyn Write` dispatch entirely.
@@ -14,6 +14,10 @@ fn jid_ref_to_compact(j: &JidRef<'_>) -> CompactString {
     push_jid_to_compact(&j.user, j.server, j.agent, j.device, &mut s);
     s
 }
+
+/// Node-nesting cap rejecting deep-`LIST` frames that would overflow the stack via
+/// unbounded `read_node_ref` recursion (real WA trees are well under 20 levels).
+const MAX_NODE_DEPTH: usize = 128;
 
 pub(crate) struct Decoder<'a> {
     data: &'a [u8],
@@ -99,9 +103,16 @@ impl<'a> Decoder<'a> {
     #[inline(always)]
     fn read_string(&mut self, len: usize) -> Result<NodeStr<'a>> {
         let bytes = self.read_bytes(len)?;
-        match std::str::from_utf8(bytes) {
-            Ok(s) => Ok(NodeStr::Borrowed(s)),
-            Err(e) => Err(BinaryError::InvalidUtf8(e)),
+        // smoothutf8 has a faster fast-path for the short strings dominating the
+        // wire (tags, attribute values, JID parts). It only answers valid/invalid,
+        // so the cold rejection path reuses std to recover the precise Utf8Error.
+        if let Some(s) = smoothutf8::from_utf8(bytes) {
+            Ok(NodeStr::Borrowed(s))
+        } else {
+            match std::str::from_utf8(bytes) {
+                Ok(s) => Ok(NodeStr::Borrowed(s)),
+                Err(e) => Err(BinaryError::InvalidUtf8(e)),
+            }
         }
     }
 
@@ -133,9 +144,9 @@ impl<'a> Decoder<'a> {
     fn read_ad_jid(&mut self) -> Result<JidRef<'a>> {
         let agent = self.read_u8()?;
         let device = self.read_u8()? as u16;
-        let user: NodeStr<'a> = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
+        let Some(user) = self.read_value_as_string()? else {
+            return Err(BinaryError::InvalidNode);
+        };
 
         // Domain type mapping must mirror WA Web decodeJidU.
         // WA Web: 0=WHATSAPP, 1=LID, even+bit7=HOSTED, 129=HOSTED_LID, else throw.
@@ -161,37 +172,10 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    /// INTEROP_JID_TUPLE (0xF4 / 244): user | device(2) | integrator(2) | domain(1)
-    /// Produces: `{integrator}-{user}[:{device}]@interop`
-    fn read_interop_jid_tuple(&mut self) -> Result<CompactString> {
-        let user = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
-        let device = self.read_u16_be()?;
-        let integrator = self.read_u16_be()?;
-        let domain = self.read_u8()?;
-        if domain != 0 {
-            return Err(BinaryError::AttrParse(format!(
-                "INTEROP_JID_TUPLE invalid domain: {domain}"
-            )));
-        }
-        let mut s = CompactString::with_capacity(user.len() + 24);
-        s.push_str(itoa::Buffer::new().format(integrator));
-        s.push('-');
-        s.push_str(user.as_ref());
-        if device != 0 {
-            s.push(':');
-            s.push_str(itoa::Buffer::new().format(device));
-        }
-        s.push('@');
-        s.push_str(crate::jid::INTEROP_SERVER);
-        Ok(s)
-    }
-
     fn read_interop_jid(&mut self) -> Result<JidRef<'a>> {
-        let user = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
+        let Some(user) = self.read_value_as_string()? else {
+            return Err(BinaryError::InvalidNode);
+        };
         let device = self.read_u16_be()?;
         let integrator = self.read_u16_be()?;
         let server_str = self.read_value_as_string()?.unwrap_or_default();
@@ -208,9 +192,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_fb_jid(&mut self) -> Result<JidRef<'a>> {
-        let user = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
+        let Some(user) = self.read_value_as_string()? else {
+            return Err(BinaryError::InvalidNode);
+        };
         let device = self.read_u16_be()?;
         let server_str = self.read_value_as_string()?.unwrap_or_default();
         if server_str.as_ref() != crate::jid::MESSENGER_SERVER {
@@ -252,9 +236,6 @@ impl<'a> Decoder<'a> {
             token::AD_JID => self
                 .read_ad_jid()
                 .map(|j| Some(NodeStr::Owned(jid_ref_to_compact(&j)))),
-            token::INTEROP_JID_TUPLE => self
-                .read_interop_jid_tuple()
-                .map(|s| Some(NodeStr::Owned(s))),
             token::INTEROP_JID => self
                 .read_interop_jid()
                 .map(|j| Some(NodeStr::Owned(jid_ref_to_compact(&j)))),
@@ -266,13 +247,15 @@ impl<'a> Decoder<'a> {
             }
             tag @ token::DICTIONARY_0..=token::DICTIONARY_3 => {
                 let index = self.read_u8()?;
-                token::get_double_token(tag - token::DICTIONARY_0, index)
-                    .map(|s| Some(NodeStr::Borrowed(s)))
-                    .ok_or(BinaryError::InvalidToken(tag))
+                match token::get_double_token(tag - token::DICTIONARY_0, index) {
+                    Some(s) => Ok(Some(NodeStr::Borrowed(s))),
+                    None => Err(BinaryError::InvalidToken(tag)),
+                }
             }
-            _ => token::get_single_token(tag)
-                .map(|s| Some(NodeStr::Borrowed(s)))
-                .ok_or(BinaryError::InvalidToken(tag)),
+            _ => match token::get_single_token(tag) {
+                Some(s) => Ok(Some(NodeStr::Borrowed(s))),
+                None => Err(BinaryError::InvalidToken(tag)),
+            },
         }
     }
 
@@ -294,9 +277,6 @@ impl<'a> Decoder<'a> {
             }
             token::JID_PAIR => self.read_jid_pair().map(|j| Some(ValueRef::Jid(j))),
             token::AD_JID => self.read_ad_jid().map(|j| Some(ValueRef::Jid(j))),
-            token::INTEROP_JID_TUPLE => self
-                .read_interop_jid_tuple()
-                .map(|s| Some(ValueRef::String(NodeStr::Owned(s)))),
             token::INTEROP_JID => self.read_interop_jid().map(|j| Some(ValueRef::Jid(j))),
             token::FB_JID => self.read_fb_jid().map(|j| Some(ValueRef::Jid(j))),
             token::NIBBLE_8 | token::HEX_8 => self
@@ -304,13 +284,15 @@ impl<'a> Decoder<'a> {
                 .map(|s| Some(ValueRef::String(NodeStr::Owned(s)))),
             tag @ token::DICTIONARY_0..=token::DICTIONARY_3 => {
                 let index = self.read_u8()?;
-                token::get_double_token(tag - token::DICTIONARY_0, index)
-                    .map(|s| Some(ValueRef::String(NodeStr::Borrowed(s))))
-                    .ok_or(BinaryError::InvalidToken(tag))
+                match token::get_double_token(tag - token::DICTIONARY_0, index) {
+                    Some(s) => Ok(Some(ValueRef::String(NodeStr::Borrowed(s)))),
+                    None => Err(BinaryError::InvalidToken(tag)),
+                }
             }
-            _ => token::get_single_token(tag)
-                .map(|s| Some(ValueRef::String(NodeStr::Borrowed(s))))
-                .ok_or(BinaryError::InvalidToken(tag)),
+            _ => match token::get_single_token(tag) {
+                Some(s) => Ok(Some(ValueRef::String(NodeStr::Borrowed(s)))),
+                None => Err(BinaryError::InvalidToken(tag)),
+            },
         }
     }
 
@@ -465,24 +447,29 @@ impl<'a> Decoder<'a> {
         }
         let mut v = Vec::with_capacity(size);
         for _ in 0..size {
-            let key = self
-                .read_value_as_string()?
-                .ok_or(BinaryError::NonStringKey)?;
-            let value = self
-                .read_value()?
-                .unwrap_or(ValueRef::String(NodeStr::Borrowed("")));
+            let Some(key) = self.read_value_as_string()? else {
+                return Err(BinaryError::NonStringKey);
+            };
+            let value = match self.read_value()? {
+                Some(v) => v,
+                None => ValueRef::String(NodeStr::Borrowed("")),
+            };
             v.push((key, value));
         }
         Ok(AttrsRef::from_vec(v))
     }
 
-    fn read_content(&mut self) -> Result<Option<NodeContentRef<'a>>> {
+    fn read_content(&mut self, depth: usize) -> Result<Option<NodeContentRef<'a>>> {
         let tag = self.read_u8()?;
-        self.read_content_from_tag(tag)
+        self.read_content_from_tag(tag, depth)
     }
 
     #[inline(always)]
-    fn read_content_from_tag(&mut self, tag: u8) -> Result<Option<NodeContentRef<'a>>> {
+    fn read_content_from_tag(
+        &mut self,
+        tag: u8,
+        depth: usize,
+    ) -> Result<Option<NodeContentRef<'a>>> {
         match tag {
             token::LIST_EMPTY => Ok(None),
 
@@ -490,7 +477,7 @@ impl<'a> Decoder<'a> {
                 let size = self.read_list_size(tag)?;
                 let mut nodes = Vec::with_capacity(size);
                 for _ in 0..size {
-                    nodes.push(self.read_node_ref()?);
+                    nodes.push(self.read_node_ref_at(depth + 1)?);
                 }
                 Ok(Some(NodeContentRef::Nodes(nodes.into_boxed_slice())))
             }
@@ -523,22 +510,31 @@ impl<'a> Decoder<'a> {
     }
 
     pub(crate) fn read_node_ref(&mut self) -> Result<NodeRef<'a>> {
+        self.read_node_ref_at(0)
+    }
+
+    fn read_node_ref_at(&mut self, depth: usize) -> Result<NodeRef<'a>> {
+        // Reject before recursing, so a hostile deep-LIST frame errors instead of
+        // aborting the process on a stack overflow.
+        if depth >= MAX_NODE_DEPTH {
+            return Err(BinaryError::MaxDepthExceeded);
+        }
         let tag = self.read_u8()?;
         let list_size = self.read_list_size(tag)?;
         if list_size == 0 {
             return Err(BinaryError::InvalidNode);
         }
 
-        let tag = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
+        let Some(tag) = self.read_value_as_string()? else {
+            return Err(BinaryError::InvalidNode);
+        };
 
         let attr_count = (list_size - 1) / 2;
         let has_content = list_size.is_multiple_of(2);
 
         let attrs = self.read_attributes(attr_count)?;
         let content = if has_content {
-            self.read_content()?.map(Box::new)
+            self.read_content(depth)?.map(Box::new)
         } else {
             None
         };
@@ -898,5 +894,53 @@ mod tests {
         // Verify top level tag
         assert_eq!(decoded.tag, "level49");
         Ok(())
+    }
+
+    fn encode_nested(levels: usize) -> Vec<u8> {
+        let mut current = Node::new("leaf", Attrs::new(), None);
+        for i in 0..levels {
+            current = Node::new(
+                format!("l{i}"),
+                Attrs::new(),
+                Some(crate::node::NodeContent::Nodes(vec![current])),
+            );
+        }
+        let mut buffer = Vec::new();
+        {
+            let mut encoder =
+                crate::encoder::Encoder::new(std::io::Cursor::new(&mut buffer)).unwrap();
+            encoder.write_node(&current).unwrap();
+        }
+        buffer
+    }
+
+    fn is_max_depth_err(buffer: &[u8]) -> bool {
+        matches!(
+            Decoder::new(&buffer[1..]).read_node_ref(),
+            Err(BinaryError::MaxDepthExceeded)
+        )
+    }
+
+    /// The deepest accepted nesting (a leaf at depth `MAX_NODE_DEPTH - 1`) decodes.
+    /// Pins the exact accept side of the cap so a `>`/`>=` flip is caught.
+    #[test]
+    fn deeply_nested_at_cap_decodes() -> TestResult {
+        let buffer = encode_nested(MAX_NODE_DEPTH - 1);
+        let decoded = Decoder::new(&buffer[1..]).read_node_ref()?;
+        assert_eq!(decoded.tag, format!("l{}", MAX_NODE_DEPTH - 2).as_str());
+        Ok(())
+    }
+
+    /// Exactly one level past the accepted range is rejected (pins the reject side).
+    #[test]
+    fn deeply_nested_one_past_cap_is_rejected() {
+        assert!(is_max_depth_err(&encode_nested(MAX_NODE_DEPTH)));
+    }
+
+    /// A frame nested far past the cap must return `MaxDepthExceeded`, not overflow
+    /// the native stack — this test completing at all is the assertion against abort.
+    #[test]
+    fn deeply_nested_far_past_cap_is_rejected() {
+        assert!(is_max_depth_err(&encode_nested(MAX_NODE_DEPTH * 3)));
     }
 }

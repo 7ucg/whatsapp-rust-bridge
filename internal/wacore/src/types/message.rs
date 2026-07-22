@@ -106,10 +106,15 @@ pub struct MessageSource {
     pub sender: Jid,
     pub is_from_me: bool,
     pub is_group: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub addressing_mode: Option<AddressingMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_alt: Option<Jid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient_alt: Option<Jid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast_list_owner: Option<Jid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient: Option<Jid>,
 }
 
@@ -198,42 +203,41 @@ impl EditAttribute {
 
         let msg = crate::send::unwrap_message(msg);
 
-        if msg.pin_in_chat_message.is_some() {
+        if msg.pin_in_chat_message.is_set() {
             return Some(Self::PinInChat);
         }
-        if msg.edited_message.is_some() {
+        if msg.edited_message.is_set() {
             return Some(Self::MessageEdit);
         }
-        if let Some(pm) = msg.protocol_message.as_deref() {
-            if pm.r#type == Some(ProtocolType::Revoke as i32) {
-                let from_me = pm.key.as_ref().and_then(|k| k.from_me).unwrap_or(false);
+        if let Some(pm) = msg.protocol_message.as_option() {
+            if pm.r#type == Some(ProtocolType::REVOKE) {
+                let from_me = pm.key.as_option().and_then(|k| k.from_me).unwrap_or(false);
                 return Some(if from_me {
                     Self::SenderRevoke
                 } else {
                     Self::AdminRevoke
                 });
             }
-            if pm.r#type == Some(ProtocolType::MessageEdit as i32) || pm.edited_message.is_some() {
+            if pm.r#type == Some(ProtocolType::MESSAGE_EDIT) || pm.edited_message.is_set() {
                 return Some(Self::MessageEdit);
             }
         }
-        if let Some(sec) = msg.secret_encrypted_message.as_ref()
+        if let Some(sec) = msg.secret_encrypted_message.as_option()
             && let Some(enc_type) = sec.secret_enc_type
-            && (enc_type == SecretEncType::MessageEdit as i32
-                || enc_type == SecretEncType::EventEdit as i32)
+            && (enc_type == SecretEncType::MESSAGE_EDIT || enc_type == SecretEncType::EVENT_EDIT)
         {
             return Some(Self::MessageEdit);
         }
         // Reaction with empty text == sender-revoke of a previous reaction.
-        if let Some(react) = msg.reaction_message.as_ref()
+        if let Some(react) = msg.reaction_message.as_option()
             && react.text.as_deref() == Some("")
         {
             return Some(Self::SenderRevoke);
         }
         // KeepInChat UNDO_KEEP_FOR_ALL is a sender-revoke at the wire level.
-        if let Some(keep) = msg.keep_in_chat_message.as_ref()
-            && keep.key.as_ref().and_then(|k| k.from_me) == Some(true)
-            && keep.keep_type == Some(waproto::whatsapp::KeepType::UndoKeepForAll as i32)
+        if let Some(keep) = msg.keep_in_chat_message.as_option()
+            && keep.key.as_option().and_then(|k| k.from_me) == Some(true)
+            && keep.keep_type == Some(waproto::whatsapp::KeepType::UNDO_KEEP_FOR_ALL)
         {
             return Some(Self::SenderRevoke);
         }
@@ -260,21 +264,30 @@ impl BotEditType {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MsgBotInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_type: Option<BotEditType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_target_id: Option<MessageId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_sender_timestamp_ms: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MsgMetaInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<MessageId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_sender: Option<Jid>,
     /// `<meta target_chat_jid="…">` — present when the bot reply addresses a
     /// chat distinct from the stanza-level `from` (used for msmsg secret
     /// lookup; see WA Web `decryptMsmsgBotMessage`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_chat: Option<Jid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecated_lid_session: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_message_id: Option<MessageId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_message_sender_jid: Option<Jid>,
     /// `<meta content_type=...>` attr. Server marks reactions/edits as
     /// `"add_on"`; mirrors `WAWebHandleMsgParser` b()'s metadata read.
@@ -303,21 +316,27 @@ pub struct MessageInfo {
     pub server_id: MessageServerId,
     pub r#type: String,
     pub push_name: String,
+    #[serde(serialize_with = "chrono::serde::ts_seconds::serialize")]
     pub timestamp: DateTime<Utc>,
     pub category: MessageCategory,
     pub multicast: bool,
     pub media_type: String,
     pub edit: EditAttribute,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_info: Option<MsgBotInfo>,
     pub meta_info: MsgMetaInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_name: Option<wa::VerifiedNameCertificate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub device_sent_meta: Option<DeviceSentMeta>,
     /// Ephemeral duration in seconds, extracted from `contextInfo.expiration`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ephemeral_expiration: Option<u32>,
     /// Whether this message was delivered during offline sync.
     pub is_offline: bool,
     /// Set when this message was recovered via PDO rather than normal decryption.
     /// Contains the PDO request message ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_request_id: Option<String>,
     /// Server-store timestamp in microseconds (envelope `sts` attr). Used by
     /// WA Web for read-self watermark ordering across companion devices.
@@ -363,6 +382,42 @@ impl MessageInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa::MessageField;
+
+    #[test]
+    fn message_info_serde_omits_only_absent_optional_fields() {
+        let mut info = MessageInfo::default();
+        info.source.sender_alt = Some("15550000001@lid".parse().unwrap());
+        info.meta_info.target_id = Some("TARGET".to_owned());
+        info.unavailable_request_id = Some("REQUEST".to_owned());
+
+        let serialized = serde_json::to_value(info).expect("serialize message info");
+        let root = serialized.as_object().expect("message info object");
+        let source = root
+            .get("source")
+            .expect("serialized message info should contain source")
+            .as_object()
+            .expect("message source object");
+        let meta = root
+            .get("meta_info")
+            .expect("serialized message info should contain meta_info")
+            .as_object()
+            .expect("message meta object");
+
+        assert!(source.contains_key("sender_alt"));
+        assert!(!source.contains_key("recipient_alt"));
+        assert!(meta.contains_key("target_id"));
+        assert!(!meta.contains_key("target_sender"));
+        assert!(root.contains_key("unavailable_request_id"));
+        assert!(!root.contains_key("bot_info"));
+        assert!(!root.contains_key("verified_name"));
+        assert!(!root.contains_key("device_sent_meta"));
+        assert!(!root.contains_key("ephemeral_expiration"));
+        assert_eq!(
+            root.get("timestamp").and_then(|value| value.as_i64()),
+            Some(0)
+        );
+    }
 
     #[test]
     fn is_self_fanout_matches_only_own_dm_with_recipient() {
@@ -527,14 +582,14 @@ mod tests {
     #[test]
     fn infer_from_message_admin_revoke() {
         let msg = waproto::whatsapp::Message {
-            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
-                key: Some(waproto::whatsapp::MessageKey {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                key: MessageField::some(waproto::whatsapp::MessageKey {
                     from_me: Some(false),
                     ..Default::default()
                 }),
-                r#type: Some(waproto::whatsapp::message::protocol_message::Type::Revoke as i32),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::REVOKE),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert_eq!(
@@ -546,14 +601,14 @@ mod tests {
     #[test]
     fn infer_from_message_sender_revoke() {
         let msg = waproto::whatsapp::Message {
-            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
-                key: Some(waproto::whatsapp::MessageKey {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                key: MessageField::some(waproto::whatsapp::MessageKey {
                     from_me: Some(true),
                     ..Default::default()
                 }),
-                r#type: Some(waproto::whatsapp::message::protocol_message::Type::Revoke as i32),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::REVOKE),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert_eq!(
@@ -565,9 +620,9 @@ mod tests {
     #[test]
     fn infer_from_message_top_level_edit() {
         let msg = waproto::whatsapp::Message {
-            edited_message: Some(Box::new(waproto::whatsapp::message::FutureProofMessage {
-                message: Some(Box::new(waproto::whatsapp::Message::default())),
-            })),
+            edited_message: MessageField::some(waproto::whatsapp::message::FutureProofMessage {
+                message: MessageField::some(waproto::whatsapp::Message::default()),
+            }),
             ..Default::default()
         };
         assert_eq!(
@@ -579,10 +634,10 @@ mod tests {
     #[test]
     fn infer_from_message_legacy_edit() {
         let msg = waproto::whatsapp::Message {
-            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
-                edited_message: Some(Box::new(waproto::whatsapp::Message::default())),
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                edited_message: MessageField::some(waproto::whatsapp::Message::default()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert_eq!(
@@ -594,17 +649,15 @@ mod tests {
     #[test]
     fn infer_from_message_message_edit_sender() {
         let msg = waproto::whatsapp::Message {
-            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
-                key: Some(waproto::whatsapp::MessageKey {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                key: MessageField::some(waproto::whatsapp::MessageKey {
                     from_me: Some(true),
                     ..Default::default()
                 }),
-                r#type: Some(
-                    waproto::whatsapp::message::protocol_message::Type::MessageEdit as i32,
-                ),
-                edited_message: Some(Box::new(waproto::whatsapp::Message::default())),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::MESSAGE_EDIT),
+                edited_message: MessageField::some(waproto::whatsapp::Message::default()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert_eq!(
@@ -625,20 +678,20 @@ mod tests {
     #[test]
     fn infer_from_message_unwraps_neutral_wrappers() {
         let inner_revoke = waproto::whatsapp::Message {
-            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
-                key: Some(waproto::whatsapp::MessageKey {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                key: MessageField::some(waproto::whatsapp::MessageKey {
                     from_me: Some(false),
                     ..Default::default()
                 }),
-                r#type: Some(waproto::whatsapp::message::protocol_message::Type::Revoke as i32),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::REVOKE),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let wrapped = waproto::whatsapp::Message {
-            ephemeral_message: Some(Box::new(waproto::whatsapp::message::FutureProofMessage {
-                message: Some(Box::new(inner_revoke)),
-            })),
+            ephemeral_message: MessageField::some(waproto::whatsapp::message::FutureProofMessage {
+                message: MessageField::some(inner_revoke),
+            }),
             ..Default::default()
         };
         assert_eq!(
@@ -648,22 +701,26 @@ mod tests {
 
         // Same for pin wrapped in view_once and device_sent (double nesting).
         let inner_pin = waproto::whatsapp::Message {
-            pin_in_chat_message: Some(Box::default()),
+            pin_in_chat_message: MessageField::some(
+                waproto::whatsapp::message::PinInChatMessage::default(),
+            ),
             ..Default::default()
         };
         let wrapped_pin = waproto::whatsapp::Message {
-            device_sent_message: Some(Box::new(waproto::whatsapp::message::DeviceSentMessage {
-                destination_jid: Some(String::new()),
-                message: Some(Box::new(waproto::whatsapp::Message {
-                    view_once_message: Some(Box::new(
-                        waproto::whatsapp::message::FutureProofMessage {
-                            message: Some(Box::new(inner_pin)),
-                        },
-                    )),
+            device_sent_message: MessageField::some(
+                waproto::whatsapp::message::DeviceSentMessage {
+                    destination_jid: Some(String::new()),
+                    message: MessageField::some(waproto::whatsapp::Message {
+                        view_once_message: MessageField::some(
+                            waproto::whatsapp::message::FutureProofMessage {
+                                message: MessageField::some(inner_pin),
+                            },
+                        ),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                })),
-                ..Default::default()
-            })),
+                },
+            ),
             ..Default::default()
         };
         assert_eq!(

@@ -11,10 +11,8 @@
 //! WAWebHandleMediaRetryNotification.
 
 use anyhow::{Result, anyhow};
-use hkdf::Hkdf;
-use prost::Message;
+use buffa::MessageView;
 use rand::Rng;
-use sha2::Sha256;
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeContentRef, NodeRef};
@@ -40,9 +38,8 @@ pub enum MediaRetryResult {
 ///
 /// WA Web: `WACryptoHkdf.extractAndExpand(mediaKey, "WhatsApp Media Retry Notification", 32)`
 fn derive_media_retry_key(media_key: &[u8]) -> Result<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(None, media_key);
     let mut key = [0u8; 32];
-    hk.expand(MEDIA_RETRY_HKDF_INFO.as_bytes(), &mut key)
+    crate::crypto::hkdf_sha256_into(media_key, None, MEDIA_RETRY_HKDF_INFO.as_bytes(), &mut key)
         .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
     Ok(key)
 }
@@ -72,7 +69,7 @@ pub fn encrypt_media_retry_receipt(
     let receipt = wa::ServerErrorReceipt {
         stanza_id: Some(stanza_id.to_string()),
     };
-    let plaintext = receipt.encode_to_vec();
+    let plaintext = waproto::codec::server_error_receipt_to_vec(&receipt);
 
     let mut ciphertext = Vec::with_capacity(plaintext.len() + 16);
     aes_256_gcm_encrypt(&key, &iv, stanza_id.as_bytes(), &plaintext, &mut ciphertext)
@@ -81,7 +78,9 @@ pub fn encrypt_media_retry_receipt(
     Ok((ciphertext, iv))
 }
 
-/// Decrypt a `MediaRetryNotification` protobuf from the server response.
+/// Decrypt a media-retry notification, returning the plaintext protobuf bytes.
+/// Decode them with [`wa::MediaRetryNotificationView`] to read the handful of
+/// needed fields without an owned decode.
 ///
 /// WA Web: `WAWebCryptoMediaRetry.decryptMediaRetryNotification(mediaKey, stanzaId, iv, ciphertext)`
 pub fn decrypt_media_retry_notification(
@@ -89,7 +88,7 @@ pub fn decrypt_media_retry_notification(
     stanza_id: &str,
     iv: &[u8],
     ciphertext: &[u8],
-) -> Result<wa::MediaRetryNotification> {
+) -> Result<Vec<u8>> {
     let key = derive_media_retry_key(media_key)?;
     let nonce: &[u8; 12] = iv.try_into().map_err(|_| anyhow!("Invalid IV length"))?;
 
@@ -103,8 +102,7 @@ pub fn decrypt_media_retry_notification(
     )
     .map_err(|e| anyhow!("AES-GCM decrypt failed: {e}"))?;
 
-    wa::MediaRetryNotification::decode(plaintext.as_slice())
-        .map_err(|e| anyhow!("protobuf decode failed: {e}"))
+    Ok(plaintext)
 }
 
 /// Build the `<receipt type="server-error">` node for a media retry request.
@@ -226,11 +224,13 @@ pub fn parse_media_retry_notification(
         .and_then(get_bytes_content_ref)
         .ok_or_else(|| anyhow!("missing enc_iv in encrypt node"))?;
 
-    let notification = decrypt_media_retry_notification(media_key, &msg_id, enc_iv, enc_p)?;
+    let plaintext = decrypt_media_retry_notification(media_key, &msg_id, enc_iv, enc_p)?;
+    let notification = wa::MediaRetryNotificationView::decode_view(&plaintext)
+        .map_err(|e| anyhow!("protobuf decode failed: {e}"))?;
 
     // Validate stanza ID matches
-    if let Some(ref returned_id) = notification.stanza_id
-        && returned_id != &msg_id
+    if let Some(returned_id) = notification.stanza_id
+        && returned_id != msg_id.as_str()
     {
         return Err(anyhow!(
             "stanza ID mismatch: expected {msg_id}, got {returned_id}"
@@ -238,16 +238,19 @@ pub fn parse_media_retry_notification(
     }
 
     // Check result enum
-    let result_type = notification.result.unwrap_or(0);
-    match wa::media_retry_notification::ResultType::try_from(result_type) {
-        Ok(wa::media_retry_notification::ResultType::Success) => {
+    let result_type = notification
+        .result
+        .unwrap_or(wa::media_retry_notification::ResultType::GENERAL_ERROR);
+    match result_type {
+        wa::media_retry_notification::ResultType::SUCCESS => {
             let direct_path = notification
                 .direct_path
-                .ok_or_else(|| anyhow!("SUCCESS result but no directPath"))?;
+                .ok_or_else(|| anyhow!("SUCCESS result but no directPath"))?
+                .to_string();
             Ok(MediaRetryResult::Success { direct_path })
         }
-        Ok(wa::media_retry_notification::ResultType::NotFound) => Ok(MediaRetryResult::NotFound),
-        Ok(wa::media_retry_notification::ResultType::DecryptionError) => {
+        wa::media_retry_notification::ResultType::NOT_FOUND => Ok(MediaRetryResult::NotFound),
+        wa::media_retry_notification::ResultType::DECRYPTION_ERROR => {
             Ok(MediaRetryResult::DecryptionError)
         }
         _ => Ok(MediaRetryResult::GeneralError),
@@ -265,10 +268,11 @@ mod tests {
 
         let (ciphertext, iv) = encrypt_media_retry_receipt(&media_key, stanza_id).unwrap();
 
-        let notification =
+        let plaintext =
             decrypt_media_retry_notification(&media_key, stanza_id, &iv, &ciphertext).unwrap();
+        let notification = wa::MediaRetryNotificationView::decode_view(&plaintext).unwrap();
 
-        assert_eq!(notification.stanza_id.as_deref(), Some(stanza_id));
+        assert_eq!(notification.stanza_id, Some(stanza_id));
     }
 
     #[test]

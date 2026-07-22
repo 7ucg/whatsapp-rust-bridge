@@ -9,11 +9,18 @@
 //! ];
 //! let zip_result = create_sticker_pack_zip("pack-id", &stickers, &cover_webp)?;
 //!
-//! let zip_upload = client.upload(zip_result.zip_bytes.clone(), MediaType::StickerPack, Default::default()).await?;
-//! let thumb_upload = client.upload(
-//!     thumbnail_jpeg, MediaType::StickerPackThumbnail,
-//!     UploadOptions::new().with_media_key(zip_upload.media_key),
-//! ).await?;
+//! // The pack zip and its thumbnail are independent uploads that share one
+//! // media key. Generate the key up front and upload both concurrently instead
+//! // of chaining the thumbnail behind the zip's result — two CDN round-trips
+//! // collapse into one wall-clock. (`upload` takes `&self`, so concurrent calls
+//! // are fine.)
+//! let media_key: [u8; 32] = rand::random();
+//! let (zip_upload, thumb_upload) = futures::try_join!(
+//!     client.upload(zip_result.zip_bytes.clone(), MediaType::StickerPack,
+//!         UploadOptions::new().with_media_key(media_key)),
+//!     client.upload(thumbnail_jpeg, MediaType::StickerPackThumbnail,
+//!         UploadOptions::new().with_media_key(media_key)),
+//! )?;
 //!
 //! let metadata = StickerPackMetadata::new(pack_id, "My Pack".into(), "Me".into());
 //! let msg = build_sticker_pack_message(&zip_result, &zip_upload.into(), &thumb_upload.into(), metadata)?;
@@ -182,7 +189,7 @@ pub fn create_sticker_pack_zip(
             accessibility_label: input.accessibility_label.clone(),
             is_lottie: Some(false),
             mimetype: Some("image/webp".to_string()),
-            premium: None,
+            ..Default::default()
         });
     }
 
@@ -234,7 +241,7 @@ pub fn build_sticker_pack_message(
     };
 
     Ok(wa::Message {
-        sticker_pack_message: Some(Box::new(pack_msg)),
+        sticker_pack_message: buffa::MessageField::some(pack_msg),
         ..Default::default()
     })
 }
@@ -520,7 +527,7 @@ mod tests {
 
         let msg =
             build_sticker_pack_message(&zip_result, &zip_upload, &thumb_upload, metadata).unwrap();
-        let pack = msg.sticker_pack_message.unwrap();
+        let pack = msg.sticker_pack_message.as_option().unwrap();
 
         assert_eq!(pack.sticker_pack_id.as_deref(), Some("msg-test"));
         assert_eq!(pack.name.as_deref(), Some("Test Pack"));

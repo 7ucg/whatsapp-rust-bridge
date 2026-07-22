@@ -11,7 +11,7 @@ use arrayref::array_ref;
 use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
-use crate::protocol::{crypto, stores::session_structure, PrivateKey, PublicKey, Result};
+use crate::protocol::{PrivateKey, PublicKey, Result, crypto, stores::session_structure};
 
 /// Lazy message key generator that defers key derivation and avoids re-serialization.
 ///
@@ -79,7 +79,7 @@ impl MessageKeyGenerator {
             Self::Serialized(pb) => pb,
             // Need to serialize: derive keys and convert
             Self::Seed(_) | Self::Keys(_) => {
-                use prost::bytes::Bytes;
+                use bytes::Bytes;
                 let keys = self.generate_keys();
                 session_structure::chain::MessageKey {
                     cipher_key: Some(Bytes::copy_from_slice(keys.cipher_key())),

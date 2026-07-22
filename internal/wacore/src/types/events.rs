@@ -107,7 +107,7 @@ impl LazyHistorySync {
         self.progress
     }
 
-    /// `None` for server-pushed syncs (e.g. `INITIAL_BOOTSTRAP`).
+    /// `None` for server-pushed syncs (e.g. `InitialBootstrap`).
     pub fn peer_data_request_session_id(&self) -> Option<&str> {
         self.peer_data_request_session_id.as_deref()
     }
@@ -216,9 +216,10 @@ pub enum EventKind {
     LoggedOut,
     PairingQrCode,
     PairingCode,
+    PairingCodeRefresh,
     QrScannedWithoutMultidevice,
     ClientOutdated,
-    Message,
+    Messages,
     Receipt,
     UndecryptableMessage,
     Notification,
@@ -250,6 +251,7 @@ pub enum EventKind {
     HistorySync,
     OfflineSyncPreview,
     OfflineSyncCompleted,
+    DirtyState,
     DeviceListUpdate,
     IdentityChange,
     BusinessStatusUpdate,
@@ -261,30 +263,34 @@ pub enum EventKind {
     NewsletterLiveUpdate,
     RawNode,
     MexNotification,
-    // When adding a variant, mind the 64-kind ceiling below (EventInterest packs
-    // each discriminant as a bit in a u64) and keep the guard pointing at the
+    PairPasskeyRequest,
+    PairPasskeyConfirmation,
+    PairPasskeyError,
+    ServerAck,
+    // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
+    // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
 }
 
 impl EventKind {
     /// Bit-index ceiling: [`EventInterest`] packs each kind's discriminant into a
-    /// `u64`, so there can be at most 64 kinds.
-    pub const CAPACITY: u8 = 64;
+    /// `u128`, so there can be at most 128 kinds.
+    pub const CAPACITY: u8 = 128;
 }
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::MexNotification as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::ServerAck as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. The event bus skips
 /// materializing and dispatching events whose kind no handler wants, so a
 /// handler that subscribes to a few kinds never pays for boxing the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EventInterest(u64);
+pub struct EventInterest(u128);
 
 impl EventInterest {
     /// Every kind. Default for handlers that don't narrow their interest.
-    pub const ALL: EventInterest = EventInterest(u64::MAX);
+    pub const ALL: EventInterest = EventInterest(u128::MAX);
 
     /// No kinds.
     pub const fn none() -> Self {
@@ -293,10 +299,10 @@ impl EventInterest {
 
     /// Interest in exactly the given kinds.
     pub fn of(kinds: &[EventKind]) -> Self {
-        let mut bits = 0u64;
+        let mut bits = 0u128;
         let mut i = 0;
         while i < kinds.len() {
-            bits |= 1u64 << (kinds[i] as u8);
+            bits |= 1u128 << (kinds[i] as u8);
             i += 1;
         }
         EventInterest(bits)
@@ -304,13 +310,13 @@ impl EventInterest {
 
     /// Add a kind to the set.
     pub const fn with(self, kind: EventKind) -> Self {
-        EventInterest(self.0 | (1u64 << (kind as u8)))
+        EventInterest(self.0 | (1u128 << (kind as u8)))
     }
 
     /// Whether `kind` is in the set.
     #[inline]
     pub const fn wants(self, kind: EventKind) -> bool {
-        self.0 & (1u64 << (kind as u8)) != 0
+        self.0 & (1u128 << (kind as u8)) != 0
     }
 
     /// Set union, for aggregating the interests of several handlers behind one
@@ -434,7 +440,8 @@ impl CoreEventBus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct SelfPushNameUpdated {
     pub from_server: bool,
     pub old_name: String,
@@ -467,7 +474,8 @@ impl From<crate::stanza::devices::DeviceNotificationType> for DeviceListUpdateTy
 }
 
 /// Device information from notification.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct DeviceNotificationInfo {
     /// Device ID (extracted from JID)
     pub device_id: u32,
@@ -478,7 +486,8 @@ pub struct DeviceNotificationInfo {
 
 /// Device list update notification.
 /// Emitted when a user's device list changes (device added/removed/updated).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct DeviceListUpdate {
     /// The user whose device list changed (from attribute)
     pub user: Jid,
@@ -499,7 +508,8 @@ pub struct DeviceListUpdate {
 
 /// Identity key changed for a user (e.g., user reinstalled WhatsApp).
 /// Emitted after device record cleanup so sessions and sender keys are cleared.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct IdentityChange {
     /// The user whose identity changed
     pub user: Jid,
@@ -560,7 +570,8 @@ impl From<crate::stanza::business::BusinessNotificationType> for BusinessUpdateT
 }
 
 /// Business status update notification.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct BusinessStatusUpdate {
     /// The business account whose status changed.
     pub jid: Jid,
@@ -586,7 +597,8 @@ pub struct BusinessStatusUpdate {
 /// Sent by the server as `<notification type="disappearing_mode">`.
 /// WA Web: `WAWebHandleDisappearingModeNotification` →
 /// `WAWebUpdateDisappearingModeForContact`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct DisappearingModeChanged {
     /// The contact whose setting changed.
     pub from: Jid,
@@ -598,7 +610,25 @@ pub struct DisappearingModeChanged {
     pub setting_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// An event dispatched by the client to registered handlers.
+///
+/// # Stability
+///
+/// The enum is `#[non_exhaustive]`, so match arms must keep a `_` catch-all.
+/// Every payload struct is sealed the same way — `#[non_exhaustive]` plus a
+/// `bon` builder for construction — so a payload can gain fields without
+/// breaking consumers. Read the fields you need (`ack.class`) or keep a `..`
+/// rest when destructuring, rather than binding every field. Construct payloads
+/// via their generated builder (`ServerAck::builder()…build()`), not a struct
+/// literal; a maybe-absent field is always modeled as `Option<T>` (with a
+/// `maybe_*` setter), never an empty-string / zero sentinel. Even the
+/// unit-marker events are empty sealed structs built as
+/// `Connected::builder().build()`, so a new payload must follow the pattern.
+///
+/// `Debug` output is intentionally variant-name-only (`{:?}` prints e.g.
+/// `Messages`): a derived impl would drag the entire generated proto `Debug`
+/// graph into the binary. `Serialize` the event when full contents are needed.
+#[derive(Clone, Serialize)]
 #[non_exhaustive]
 pub enum Event {
     Connected(Connected),
@@ -606,23 +636,35 @@ pub enum Event {
     PairSuccess(PairSuccess),
     PairError(PairError),
     LoggedOut(LoggedOut),
-    PairingQrCode {
-        code: String,
-        timeout: std::time::Duration,
-    },
-    /// Generated pair code for phone number linking.
-    /// User should enter this code on their phone in WhatsApp > Linked Devices.
-    PairingCode {
-        /// The 8-character pairing code to display.
-        code: String,
-        /// Approximate validity duration (~180 seconds).
-        timeout: std::time::Duration,
-    },
+    PairingQrCode(PairingQrCode),
+    PairingCode(PairingCode),
+    PairingCodeRefresh(PairingCodeRefresh),
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
 
-    Message(Arc<wa::Message>, Arc<MessageInfo>),
+    /// One or more decrypted inbound messages, in arrival order. Live traffic arrives as single-message
+    /// batches; an offline drain delivers one batch per durable commit, so a
+    /// consumer never sees a message that a registered durability hook has
+    /// not committed. The `Arc` slice is shared with the hook call — same
+    /// items, same order, no copies.
+    ///
+    /// With a hook registered this event is at-least-once, like the hook: a
+    /// redelivery whose buffered copy survived (e.g. the post-commit cleanup
+    /// failed and the ack was lost) replays through the same commit and
+    /// dispatches again. Exceptions that bypass the hook: newsletter
+    /// messages (plaintext, acked on their own path, never redelivered) and
+    /// PDO placeholder recoveries (identified by
+    /// `info.unavailable_request_id`) dispatch event-only.
+    Messages(MessageBatch),
     Receipt(Receipt),
+    /// The server `<ack>`-ed (or nack-ed) an outgoing stanza.
+    ///
+    /// Observe-only: dispatched for every server `<ack>` that carries an id,
+    /// before and independently of the internal ack-waiter resolution, so it
+    /// never interacts with the send/phash flow. Lets consumers measure
+    /// send → server-accept latency and surface nack codes programmatically
+    /// (today nacks are only visible as `warn!` logs).
+    ServerAck(ServerAck),
     UndecryptableMessage(UndecryptableMessage),
     #[serde(skip)]
     Notification(Arc<OwnedNodeRef>),
@@ -670,6 +712,8 @@ pub enum Event {
     HistorySync(Box<LazyHistorySync>),
     OfflineSyncPreview(OfflineSyncPreview),
     OfflineSyncCompleted(OfflineSyncCompleted),
+    /// The server marked one of its cached protocol domains dirty.
+    DirtyState(DirtyState),
 
     /// Device list changed for a user (device added/removed/updated)
     DeviceListUpdate(DeviceListUpdate),
@@ -700,12 +744,56 @@ pub enum Event {
     /// Server-pushed MEX (GraphQL) update. Routed by the textual `op_name`,
     /// which is stable across WA Web bundle releases.
     MexNotification(MexNotification),
+
+    /// SHORTCAKE_PASSKEY: the server asked for a WebAuthn assertion to gate this
+    /// companion link. Carries the verbatim `PublicKeyCredentialRequestOptions`
+    /// JSON; the host obtains an assertion (via [`crate::sync_marker`]-agnostic
+    /// authenticator) and the client sends it back. If a passkey authenticator is
+    /// registered the client drives this automatically; this event is for hosts
+    /// that drive the assertion manually.
+    PairPasskeyRequest(PairPasskeyRequest),
+
+    /// SHORTCAKE_PASSKEY: the link reached the verification stage. `code` is the
+    /// 8-char (dashed) pairing code; when `skip_handoff_ux` is set, continuity was
+    /// proven via the handoff proof and the code need not be shown to the user.
+    PairPasskeyConfirmation(PairPasskeyConfirmation),
+
+    /// SHORTCAKE_PASSKEY: the passkey link failed. `continuation` distinguishes a
+    /// failure during the continuation/verification stage from the initial request.
+    PairPasskeyError(PairPasskeyError),
+}
+
+/// Payload for [`Event::PairPasskeyRequest`].
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairPasskeyRequest {
+    /// Verbatim `PublicKeyCredentialRequestOptions` JSON from the server. Pass it
+    /// straight to a WebAuthn `get` (e.g. Android Credential Manager), or parse it
+    /// with `whatsapp_rust::passkey::parse_request_options`.
+    pub request_options_json: String,
+}
+
+/// Payload for [`Event::PairPasskeyConfirmation`].
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairPasskeyConfirmation {
+    pub code: String,
+    pub skip_handoff_ux: bool,
+}
+
+/// Payload for [`Event::PairPasskeyError`].
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairPasskeyError {
+    pub error: String,
+    pub continuation: bool,
 }
 
 /// `payload` shape depends on `op_name`. `offline` mirrors the raw string
 /// the server sets when replaying backlog (often a timestamp); presence
 /// alone signals backlog vs live.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct MexNotification {
     pub op_name: String,
     pub from: Option<Jid>,
@@ -724,11 +812,12 @@ impl Event {
             Event::PairSuccess(_) => EventKind::PairSuccess,
             Event::PairError(_) => EventKind::PairError,
             Event::LoggedOut(_) => EventKind::LoggedOut,
-            Event::PairingQrCode { .. } => EventKind::PairingQrCode,
-            Event::PairingCode { .. } => EventKind::PairingCode,
+            Event::PairingQrCode(_) => EventKind::PairingQrCode,
+            Event::PairingCode(_) => EventKind::PairingCode,
+            Event::PairingCodeRefresh(_) => EventKind::PairingCodeRefresh,
             Event::QrScannedWithoutMultidevice(_) => EventKind::QrScannedWithoutMultidevice,
             Event::ClientOutdated(_) => EventKind::ClientOutdated,
-            Event::Message(_, _) => EventKind::Message,
+            Event::Messages(_) => EventKind::Messages,
             Event::Receipt(_) => EventKind::Receipt,
             Event::UndecryptableMessage(_) => EventKind::UndecryptableMessage,
             Event::Notification(_) => EventKind::Notification,
@@ -760,6 +849,7 @@ impl Event {
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
+            Event::DirtyState(_) => EventKind::DirtyState,
             Event::DeviceListUpdate(_) => EventKind::DeviceListUpdate,
             Event::IdentityChange(_) => EventKind::IdentityChange,
             Event::BusinessStatusUpdate(_) => EventKind::BusinessStatusUpdate,
@@ -771,26 +861,105 @@ impl Event {
             Event::NewsletterLiveUpdate(_) => EventKind::NewsletterLiveUpdate,
             Event::RawNode(_) => EventKind::RawNode,
             Event::MexNotification(_) => EventKind::MexNotification,
+            Event::PairPasskeyRequest(_) => EventKind::PairPasskeyRequest,
+            Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
+            Event::PairPasskeyError(_) => EventKind::PairPasskeyError,
+            Event::ServerAck(_) => EventKind::ServerAck,
         }
     }
 
-    pub fn as_message(&self) -> Option<(&Arc<wa::Message>, &MessageInfo)> {
-        if let Event::Message(msg, info) = self {
-            Some((msg, &**info))
-        } else {
-            None
+    /// This event as its [`MessageBatch`], or `None` for any other event kind.
+    /// Use this when you need the batch's [`origin`](MessageBatch::origin) or
+    /// want to treat the messages as a whole; to just iterate the messages,
+    /// prefer [`messages`](Self::messages).
+    pub fn as_messages(&self) -> Option<&MessageBatch> {
+        match self {
+            Event::Messages(batch) => Some(batch),
+            _ => None,
         }
     }
 
-    pub fn message_text(&self) -> Option<&str> {
-        let (msg, _) = self.as_message()?;
-        msg.conversation.as_deref()
+    /// The inbound messages carried by this event, in arrival order; an empty
+    /// iterator for every other event kind (so it drops cleanly into a
+    /// `for msg in event.messages()` scan over a mixed event stream).
+    pub fn messages(&self) -> impl Iterator<Item = &InboundMessage> {
+        self.as_messages().into_iter().flatten()
+    }
+}
+
+// Variant name only, on purpose: Messages/HistorySync transitively contain
+// `wa::Message`, so a derived impl would keep the entire generated proto Debug
+// graph (hundreds of KiB) in the binary. Serialize the event for full contents.
+impl fmt::Debug for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.kind(), f)
+    }
+}
+
+/// One decrypted inbound message. The same items (and order) back both
+/// consumer surfaces: the durability hook's batch and [`Event::Messages`].
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct InboundMessage {
+    pub message: Arc<wa::Message>,
+    pub info: Arc<MessageInfo>,
+}
+
+/// How a [`MessageBatch`] was delivered. This describes the delivery shape,
+/// not a message's provenance: whether a stanza came from the offline queue
+/// is `info.is_offline` on each [`InboundMessage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BatchOrigin {
+    /// Delivered immediately as a batch of one: live traffic, and redelivery
+    /// replays that commit outside an accumulated batch.
+    Live,
+    /// An accumulated batch from the offline drain, one per durable commit
+    /// (WA Web's MessageProcessorCache snapshot granularity).
+    OfflineDrain,
+}
+
+/// Payload of [`Event::Messages`]: the decrypted messages of one durable
+/// commit, in arrival order. Behaves as a collection of its messages —
+/// `for msg in &batch`, `batch.iter()`, `batch.len()` — with `origin`
+/// carrying the delivery shape alongside.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct MessageBatch {
+    pub messages: Arc<[InboundMessage]>,
+    pub origin: BatchOrigin,
+}
+
+impl MessageBatch {
+    pub fn iter(&self) -> std::slice::Iter<'_, InboundMessage> {
+        self.messages.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn first(&self) -> Option<&InboundMessage> {
+        self.messages.first()
+    }
+}
+
+impl<'a> IntoIterator for &'a MessageBatch {
+    type Item = &'a InboundMessage;
+    type IntoIter = std::slice::Iter<'a, InboundMessage>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.messages.iter()
     }
 }
 
 /// A newsletter live update notification, typically containing updated
 /// reaction counts for one or more messages.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct NewsletterLiveUpdate {
     /// The newsletter channel this update belongs to.
     pub newsletter_jid: Jid,
@@ -798,20 +967,23 @@ pub struct NewsletterLiveUpdate {
 }
 
 /// A single message entry in a newsletter live update.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct NewsletterLiveUpdateMessage {
     pub server_id: u64,
     pub reactions: Vec<NewsletterLiveUpdateReaction>,
 }
 
 /// A reaction count in a newsletter live update.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct NewsletterLiveUpdateReaction {
     pub code: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PairSuccess {
     pub id: Jid,
     pub lid: Jid,
@@ -819,7 +991,8 @@ pub struct PairSuccess {
     pub platform: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PairError {
     pub id: Jid,
     pub lid: Jid,
@@ -828,23 +1001,62 @@ pub struct PairError {
     pub error: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct QrScannedWithoutMultidevice;
+/// A QR code the consumer renders during multi-device pairing.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairingQrCode {
+    /// The QR payload to render.
+    pub code: String,
+    /// How long this code stays valid before the next one rotates in.
+    pub timeout: std::time::Duration,
+}
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ClientOutdated;
+/// Generated pair code for phone number linking.
+/// User should enter this code on their phone in WhatsApp > Linked Devices.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairingCode {
+    /// The 8-character pairing code to display.
+    pub code: String,
+    /// Approximate validity duration (~180 seconds).
+    pub timeout: std::time::Duration,
+}
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Connected;
+/// The server asked the companion to refresh an in-progress phone-number
+/// pairing code (WA Web `refreshAltLinkingCode` / `forceManualRefresh`).
+/// Only emitted while a pair-code flow is outstanding and the server's ref
+/// matches it. The consumer should request a fresh code via
+/// `pair_with_code`; the previous code is no longer guaranteed valid.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairingCodeRefresh {
+    /// `true` when the server set `force_manual_refresh` — the code must be
+    /// re-requested explicitly rather than auto-rotated.
+    pub force_manual: bool,
+}
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct QrScannedWithoutMultidevice {}
+
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ClientOutdated {}
+
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct Connected {}
+
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct LoggedOut {
     pub on_connect: bool,
     pub reason: ConnectFailureReason,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamReplaced;
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct StreamReplaced {}
 
 #[derive(Debug, Clone, PartialEq, Eq, crate::WireEnum)]
 #[wire(kind = "int")]
@@ -881,7 +1093,8 @@ impl fmt::Display for TempBanReason {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct TemporaryBan {
     pub code: TempBanReason,
     pub expire: Duration,
@@ -938,23 +1151,33 @@ impl ConnectFailureReason {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ConnectFailure {
     pub reason: ConnectFailureReason,
-    pub message: String,
+    /// The server's `message` attribute on the `<failure>` stanza, when present.
+    pub message: Option<String>,
     pub raw: Option<Node>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct StreamError {
     pub code: String,
     pub raw: Option<Node>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Disconnected;
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct Disconnected {
+    /// Why the transport ended — lets consumers tell a routine server stream
+    /// recycle (`reason.is_clean_shutdown()`) from a genuine transport failure
+    /// without parsing logs.
+    pub reason: crate::net::DisconnectReason,
+}
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct OfflineSyncPreview {
     pub total: i32,
     pub app_data_changes: i32,
@@ -963,9 +1186,23 @@ pub struct OfflineSyncPreview {
     pub receipts: i32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct OfflineSyncCompleted {
     pub count: i32,
+}
+
+/// A valid `<ib><dirty>` marker received from the server.
+///
+/// The client still performs its built-in clean/resync work; this event lets
+/// consumers refresh domain-specific derived state without observing every raw
+/// stanza.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct DirtyState {
+    pub dirty_type: crate::iq::dirty::DirtyType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
@@ -976,16 +1213,47 @@ pub enum DecryptFailMode {
     Hide,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, crate::WireEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum UnavailableType {
     #[wire_default]
     #[wire = "unknown"]
     Unknown,
     #[wire = "view_once"]
     ViewOnce,
+    #[wire = "hosted"]
+    Hosted,
+    #[wire = "bot"]
+    Bot,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl UnavailableType {
+    /// Classify an `<unavailable>` fanout the way WA Web picks its
+    /// placeholderType, honouring the same precedence (bot > hosted >
+    /// view_once). Anything else is a plain fanout (`Unknown`).
+    pub fn from_fanout_flags(is_bot: bool, is_hosted: bool, is_view_once: bool) -> Self {
+        if is_bot {
+            Self::Bot
+        } else if is_hosted {
+            Self::Hosted
+        } else if is_view_once {
+            Self::ViewOnce
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Bot, hosted and view-once fanouts are the three subtypes
+    /// `WAWebNonMessageDataRequestPlaceholderMessageResendUtils` excludes from
+    /// placeholder-resend: the phone won't share that content with a companion,
+    /// so a resend to our own device only returns empty. A plain fanout
+    /// (`Unknown`) stays recoverable.
+    pub fn is_unrecoverable_fanout(&self) -> bool {
+        matches!(self, Self::ViewOnce | Self::Hosted | Self::Bot)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct UndecryptableMessage {
     pub info: Arc<MessageInfo>,
     pub is_unavailable: bool,
@@ -993,7 +1261,8 @@ pub struct UndecryptableMessage {
     pub decrypt_fail_mode: DecryptFailMode,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct Receipt {
     pub source: crate::types::message::MessageSource,
     pub message_ids: Vec<MessageId>,
@@ -1005,14 +1274,39 @@ pub struct Receipt {
     pub offline: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Payload of [`Event::ServerAck`]: the server acknowledged (or nacked) an
+/// outgoing stanza. Server acks cover every outgoing stanza class — message,
+/// receipt, notification, call — so consumers should filter on [`class`](Self::class)
+/// before correlating ids.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ServerAck {
+    /// Id of the acked stanza (for a sent message, its message id).
+    pub id: String,
+    /// Stanza class the ack refers to (`"message"`, `"receipt"`,
+    /// `"notification"`, `"call"`, …). `None` when the server omits it.
+    pub class: Option<String>,
+    /// Chat/entity the ack refers to, when present and parseable.
+    pub from: Option<Jid>,
+    /// Server timestamp from the ack's `t` attribute, when present. For a
+    /// message ack this is the authoritative send timestamp (whatsmeow reads
+    /// the same attribute into `SendResponse.Timestamp`).
+    pub timestamp: Option<DateTime<Utc>>,
+    /// Nack code (e.g. `"479"`) when the server rejected the stanza; `None`
+    /// for a plain ack.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ChatPresenceUpdate {
     pub source: crate::types::message::MessageSource,
     pub state: ChatPresence,
     pub media: ChatPresenceMedia,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PresenceUpdate {
     /// The contact whose presence changed.
     pub from: Jid,
@@ -1020,7 +1314,8 @@ pub struct PresenceUpdate {
     pub last_seen: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PictureUpdate {
     /// The JID whose picture changed (user or group).
     pub jid: Jid,
@@ -1036,7 +1331,8 @@ pub struct PictureUpdate {
     pub picture_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct UserAboutUpdate {
     /// The contact whose about text changed.
     pub jid: Jid,
@@ -1052,7 +1348,8 @@ pub struct UserAboutUpdate {
 ///
 /// Not to be confused with [`ContactUpdate`] which comes from app-state
 /// sync mutations (different source, different payload).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ContactUpdated {
     /// The contact whose profile was updated.
     pub jid: Jid,
@@ -1070,7 +1367,8 @@ pub struct ContactUpdated {
 /// sessions intact). Group participant updates arrive via separate
 /// `w:gp2` notifications, so per-group caches are not touched here.
 /// Consumers can subscribe and refresh their own caches if needed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ContactNumberChanged {
     /// Old phone number JID.
     pub old_jid: Jid,
@@ -1088,7 +1386,8 @@ pub struct ContactNumberChanged {
 /// Server requests a full contact re-sync.
 ///
 /// Emitted from `<notification type="contacts"><sync after="..."/>`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ContactSyncRequested {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<DateTime<Utc>>,
@@ -1099,25 +1398,48 @@ pub struct ContactSyncRequested {
 ///
 /// Emitted for each action in a `<notification type="w:gp2">` stanza.
 /// A single notification may produce multiple `GroupUpdate` events (one per action).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct GroupUpdate {
     /// The group this update applies to
     pub group_jid: Jid,
+    /// Identifier of the source notification stanza.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<String>,
+    /// Display name supplied with the source notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
+    /// Raw offline-delivery marker supplied with the source notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
+    /// Zero-based emitted-action index within the source notification.
+    #[builder(default)]
+    pub action_index: u32,
     /// The admin/user who triggered the change (`participant` attribute)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant: Option<Jid>,
     /// Phone number JID of the participant (for LID-addressed groups)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_pn: Option<Jid>,
+    /// Username of the participant, when supplied by the group notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_username: Option<String>,
+    /// Country code supplied for the participant by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_country_code: Option<String>,
     /// When the change occurred
     pub timestamp: DateTime<Utc>,
     /// Whether the group uses LID addressing mode
     pub is_lid_addressing_mode: bool,
+    /// Whether participant identity information was incomplete in the source stanza.
+    #[builder(default)]
+    pub has_incomplete_participant_information: bool,
     /// The specific action
     pub action: crate::stanza::groups::GroupNotificationAction,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ContactUpdate {
     /// The chat/contact this sync action applies to.
     pub jid: Jid,
@@ -1126,7 +1448,8 @@ pub struct ContactUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PushNameUpdate {
     /// The contact who changed their push name.
     pub jid: Jid,
@@ -1135,7 +1458,8 @@ pub struct PushNameUpdate {
     pub new_push_name: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PinUpdate {
     /// The chat being pinned or unpinned.
     pub jid: Jid,
@@ -1144,7 +1468,8 @@ pub struct PinUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct MuteUpdate {
     /// The chat being muted or unmuted.
     pub jid: Jid,
@@ -1153,7 +1478,8 @@ pub struct MuteUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ArchiveUpdate {
     /// The chat being archived or unarchived.
     pub jid: Jid,
@@ -1162,7 +1488,8 @@ pub struct ArchiveUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct StarUpdate {
     /// The chat containing the starred or unstarred message.
     pub chat_jid: Jid,
@@ -1176,7 +1503,8 @@ pub struct StarUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct MarkChatAsReadUpdate {
     /// The chat being marked as read or unread.
     pub jid: Jid,
@@ -1185,7 +1513,8 @@ pub struct MarkChatAsReadUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct DeleteChatUpdate {
     /// The chat being deleted.
     pub jid: Jid,
@@ -1197,7 +1526,8 @@ pub struct DeleteChatUpdate {
 }
 
 /// A chat's messages were cleared (kept) on a linked device.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ClearChatUpdate {
     /// The chat being cleared.
     pub jid: Jid,
@@ -1211,7 +1541,8 @@ pub struct ClearChatUpdate {
 }
 
 /// A contact/group/newsletter's status updates were muted/unmuted on a linked device.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct UserStatusMuteUpdate {
     /// The entity whose status was (un)muted.
     pub jid: Jid,
@@ -1222,7 +1553,8 @@ pub struct UserStatusMuteUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct DeleteMessageForMeUpdate {
     /// The chat containing the deleted message.
     pub chat_jid: Jid,
@@ -1236,7 +1568,8 @@ pub struct DeleteMessageForMeUpdate {
 
 /// A label was created, renamed/recolored, or deleted on a linked device.
 /// `action.deleted == Some(true)` means the label was removed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct LabelEditUpdate {
     /// The label identifier (the index key, not a JID).
     pub label_id: String,
@@ -1247,7 +1580,8 @@ pub struct LabelEditUpdate {
 
 /// A label was associated with or removed from a chat on a linked device.
 /// `action.labeled == Some(true)` means the label was added to the chat.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct LabelAssociationUpdate {
     /// The label identifier.
     pub label_id: String,
@@ -1259,10 +1593,72 @@ pub struct LabelAssociationUpdate {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use prost::Message;
+    use buffa::Message;
     use waproto::whatsapp as wa;
+
+    #[test]
+    fn group_update_builder_defaults_additive_scalar_fields() {
+        let update = GroupUpdate::builder()
+            .group_jid("120363000000000001@g.us".parse().unwrap())
+            .timestamp(DateTime::<Utc>::UNIX_EPOCH)
+            .is_lid_addressing_mode(false)
+            .action(crate::stanza::groups::GroupNotificationAction::Unlocked)
+            .build();
+
+        assert_eq!(update.action_index, 0);
+        assert!(!update.has_incomplete_participant_information);
+    }
+
+    #[test]
+    fn dirty_state_preserves_wire_type_and_optional_timestamp() {
+        let dirty = DirtyState::builder()
+            .dirty_type(crate::iq::dirty::DirtyType::Groups)
+            .maybe_timestamp(Some(1_725_000_000))
+            .build();
+
+        assert_eq!(
+            serde_json::to_value(&dirty).unwrap(),
+            serde_json::json!({
+                "dirty_type": "groups",
+                "timestamp": 1_725_000_000_u64,
+            })
+        );
+        assert_eq!(Event::DirtyState(dirty).kind(), EventKind::DirtyState);
+    }
+
+    #[test]
+    fn unavailable_fanout_flags_follow_wa_web_precedence() {
+        use UnavailableType::*;
+        // bot wins over hosted and view_once
+        assert_eq!(UnavailableType::from_fanout_flags(true, true, true), Bot);
+        assert_eq!(UnavailableType::from_fanout_flags(true, false, false), Bot);
+        // hosted wins over view_once
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, true, true),
+            Hosted
+        );
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, false, true),
+            ViewOnce
+        );
+        // nothing set is a plain fanout
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, false, false),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn only_plain_fanout_is_recoverable() {
+        use UnavailableType::*;
+        assert!(Bot.is_unrecoverable_fanout());
+        assert!(Hosted.is_unrecoverable_fanout());
+        assert!(ViewOnce.is_unrecoverable_fanout());
+        assert!(!Unknown.is_unrecoverable_fanout());
+    }
 
     /// Build a HistorySync proto with conversations, returning its
     /// zlib-compressed wire form plus the exact decompressed size.
@@ -1270,7 +1666,7 @@ mod tests {
         use flate2::{Compression, write::ZlibEncoder};
         use std::io::Write;
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap,
             conversations,
             ..Default::default()
         };
@@ -1348,7 +1744,7 @@ mod tests {
         // Consumer can partial-decode from the inflated bytes.
         let raw = lazy.decompress().expect("inflates");
         assert_eq!(raw.len(), lazy.decompressed_size());
-        let decoded = wa::HistorySync::decode(&raw[..]).expect("should decode");
+        let decoded = wa::HistorySync::decode_from_slice(&raw[..]).expect("should decode");
         assert_eq!(decoded.conversations[0].id, "raw@s.whatsapp.net");
 
         // No caching: a second call inflates again and matches.
@@ -1405,7 +1801,7 @@ mod tests {
         let remainder = stream.remainder().expect("remainder decodes");
         assert!(remainder.conversations.is_empty());
         assert_eq!(
-            remainder.sync_type(),
+            remainder.sync_type,
             wa::history_sync::HistorySyncType::InitialBootstrap
         );
     }
@@ -1471,13 +1867,15 @@ mod tests {
         let conv = wa::Conversation {
             id: "chat@s.whatsapp.net".to_string(),
             messages: vec![wa::HistorySyncMsg {
-                message: Some(Box::new(wa::WebMessageInfo {
+                message: wa::WebMessageInfo {
                     key: wa::MessageKey {
                         id: Some("msg-0".to_string()),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
-                })),
+                }
+                .into(),
                 msg_order_id: Some(0),
             }],
             ..Default::default()
@@ -1489,7 +1887,7 @@ mod tests {
         assert_eq!(
             hs.conversations[0].messages[0]
                 .message
-                .as_ref()
+                .as_option()
                 .unwrap()
                 .key
                 .id
@@ -1550,7 +1948,7 @@ mod tests {
         let bus = CoreEventBus::new();
         let only_msg = Arc::new(Recorder {
             kinds: Mutex::new(Vec::new()),
-            interest: EventInterest::of(&[EventKind::Message]),
+            interest: EventInterest::of(&[EventKind::Messages]),
         });
         let all = Arc::new(Recorder {
             kinds: Mutex::new(Vec::new()),
@@ -1559,7 +1957,7 @@ mod tests {
         bus.add_handler(only_msg.clone());
         bus.add_handler(all.clone());
 
-        bus.dispatch(Event::Connected(Connected));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
 
         // The narrow handler (Message-only) was skipped; the ALL handler got it.
         assert!(only_msg.kinds.lock().unwrap().is_empty());
@@ -1574,12 +1972,12 @@ mod tests {
                 CALLS.fetch_add(1, Ordering::SeqCst);
             }
             fn interest(&self) -> EventInterest {
-                EventInterest::of(&[EventKind::Message])
+                EventInterest::of(&[EventKind::Messages])
             }
         }
         let bus2 = CoreEventBus::new();
         bus2.add_handler(Arc::new(Counter));
-        bus2.dispatch(Event::Connected(Connected));
+        bus2.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(CALLS.load(Ordering::SeqCst), 0);
     }
 
@@ -1606,20 +2004,20 @@ mod tests {
 
         let bus = CoreEventBus::new();
         let h = Arc::new(Dynamic {
-            interest: Mutex::new(EventInterest::of(&[EventKind::Message])),
+            interest: Mutex::new(EventInterest::of(&[EventKind::Messages])),
             hits: AtomicUsize::new(0),
         });
         bus.add_handler(h.clone());
 
         // Not yet interested in Connected: dropped before materialization.
-        bus.dispatch(Event::Connected(Connected));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(h.hits.load(Ordering::SeqCst), 0);
         assert!(!bus.has_handler_for(EventKind::Connected));
 
         // Widen interest at runtime.
         *h.interest.lock().unwrap() = EventInterest::ALL;
         assert!(bus.has_handler_for(EventKind::Connected));
-        bus.dispatch(Event::Connected(Connected));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(
             h.hits.load(Ordering::SeqCst),
             1,
@@ -1640,17 +2038,17 @@ mod tests {
         let bus = CoreEventBus::new();
         // Empty bus: nothing is wanted and there are no handlers.
         assert!(!bus.has_handlers());
-        assert!(!bus.has_handler_for(EventKind::Message));
+        assert!(!bus.has_handler_for(EventKind::Messages));
         assert!(!bus.has_handler_for(EventKind::Receipt));
 
-        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Message]))));
+        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Messages]))));
         assert!(bus.has_handlers());
-        assert!(bus.has_handler_for(EventKind::Message));
+        assert!(bus.has_handler_for(EventKind::Messages));
         assert!(!bus.has_handler_for(EventKind::Receipt));
 
         // has_handler_for is true once any registered handler wants the kind.
         bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Receipt]))));
-        assert!(bus.has_handler_for(EventKind::Message));
+        assert!(bus.has_handler_for(EventKind::Messages));
         assert!(bus.has_handler_for(EventKind::Receipt));
         assert!(!bus.has_handler_for(EventKind::Connected));
     }
@@ -1677,7 +2075,7 @@ mod tests {
                 log: log.clone(),
             }));
         }
-        bus.dispatch(Event::Connected(Connected));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
         // Copy-on-write rebuilds must keep registration order intact.
         assert_eq!(*log.lock().unwrap(), vec![0, 1, 2, 3, 4]);
     }
@@ -1724,12 +2122,12 @@ mod tests {
 
         // First dispatch: only the original handler runs, even though it adds a
         // second handler mid-flight.
-        bus.dispatch(Event::Connected(Connected));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert_eq!(bus.snapshot().handlers.len(), 2);
 
         // Second dispatch sees both handlers (original adds nothing new now).
-        bus.dispatch(Event::Connected(Connected));
+        bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(invocations.load(Ordering::SeqCst), 3);
     }
 }

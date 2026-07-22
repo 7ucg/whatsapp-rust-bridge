@@ -12,7 +12,7 @@ pub enum HistorySyncError {
     #[error("Failed to decompress history sync data: {0}")]
     DecompressionError(#[from] std::io::Error),
     #[error("Failed to decode HistorySync protobuf: {0}")]
-    ProtobufDecodeError(#[from] prost::DecodeError),
+    ProtobufDecodeError(#[from] buffa::DecodeError),
     #[error("Malformed protobuf: {0}")]
     MalformedProtobuf(String),
     /// [`HistorySyncStream::remainder`] was called while the tail still held a
@@ -39,6 +39,10 @@ pub struct HistorySyncResult {
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
     pub msg_secret_records: Vec<HistoryMsgSecretRecord>,
+    /// PN↔LID pairs from `HistorySync.phoneNumberToLidMappings` (field 15) —
+    /// the bulk identity seed the server sends alongside the chats. Same
+    /// source whatsmeow harvests in `storeHistoricalPNLIDMappings`.
+    pub lid_mappings: Vec<HistoryLidMapping>,
     /// The original zlib-compressed input, handed back (moved, never copied or
     /// re-inflated) only when event listeners exist. Wrapped in
     /// `LazyHistorySync` for on-demand consumption.
@@ -70,11 +74,104 @@ pub fn process_history_sync(
     own_user: Option<&str>,
     retain_blob: bool,
 ) -> Result<HistorySyncResult, HistorySyncError> {
-    let mut result = process_history_sync_streaming(&compressed_data, own_user, MAX_DECOMPRESSED)?;
+    process_history_sync_bytes(Bytes::from(compressed_data), own_user, retain_blob)
+}
+
+/// [`process_history_sync`] for callers that already own a shared byte buffer.
+/// Keeping the compressed blob as `Bytes` lets an inline payload remain a view
+/// into its decrypted message until it is handed to the caller's lazy event,
+/// without changing the streaming parser or duplicating protocol logic.
+pub fn process_history_sync_bytes(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+) -> Result<HistorySyncResult, HistorySyncError> {
+    process_history_sync_bytes_filtered(compressed_data, own_user, retain_blob, |_| true)
+}
+
+/// [`process_history_sync_bytes`] with an allocation-free predicate for the
+/// message-secret subset the caller actually intends to retain.
+///
+/// The predicate receives a borrowed view before any owned record is built.
+/// This lets policy-owning callers reject obsolete records without teaching
+/// the generic wire parser about retention rules, while the default APIs keep
+/// their accept-all behaviour.
+pub fn process_history_sync_bytes_filtered<F>(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+    record_filter: F,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+{
+    let sink = FilteredRecordSink(record_filter);
+    process_history_sync_bytes_with_sink(compressed_data, own_user, retain_blob, sink)
+}
+
+fn process_history_sync_bytes_with_sink<S>(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+    sink: S,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    S: HistoryMsgSecretRecordSink,
+{
+    let mut result =
+        process_history_sync_streaming(&compressed_data, own_user, MAX_DECOMPRESSED, sink)?;
     if retain_blob {
-        result.compressed_bytes = Some(Bytes::from(compressed_data));
+        result.compressed_bytes = Some(compressed_data);
     }
     Ok(result)
+}
+
+/// [`process_history_sync_bytes`] with a borrowed visitor for every message
+/// secret candidate found while the conversation is still in the inflate
+/// window.
+///
+/// The visitor runs synchronously in wire order and the returned result does
+/// not retain [`HistoryMsgSecretRecord`] values. Consumers that immediately
+/// translate records into another owned representation can therefore avoid an
+/// otherwise redundant intermediate allocation without duplicating any wire
+/// parsing logic.
+pub fn process_history_sync_bytes_with_record_visitor<F>(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+    visitor: F,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>),
+{
+    process_history_sync_bytes_with_record_sink(
+        compressed_data,
+        own_user,
+        retain_blob,
+        VisitOnly(visitor),
+    )
+}
+
+/// Capacity-aware counterpart to
+/// [`process_history_sync_bytes_with_record_visitor`].
+///
+/// This keeps the visit-only closure API source-compatible while allowing
+/// collectors to share the streaming parser's bounded density estimator.
+pub fn process_history_sync_bytes_with_record_sink<V>(
+    compressed_data: Bytes,
+    own_user: Option<&str>,
+    retain_blob: bool,
+    visitor: V,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    V: HistoryMsgSecretRecordVisitor,
+{
+    process_history_sync_bytes_with_sink(
+        compressed_data,
+        own_user,
+        retain_blob,
+        VisitingRecordSink::new(visitor),
+    )
 }
 
 /// One top-level protobuf field, borrowed from the walker's inflate window.
@@ -113,6 +210,33 @@ impl<'a> FieldWalker<'a> {
         self.reader.total_out()
     }
 
+    /// Decompressed bytes already handed to the parser, INCLUDING the field
+    /// most recently yielded by `next_field` (its bytes stay buffered until
+    /// the next call, but the caller has already processed them). Excludes
+    /// only the tail beyond it, so a density observed over this prefix is
+    /// neither diluted by inflater read-ahead nor inflated by dropping the
+    /// very conversation whose records were just counted: on a blob whose
+    /// first conversation alone reaches the sample threshold, the old
+    /// exclusive form left a near-zero denominator and the estimate clamped.
+    fn parsed_bytes(&self) -> u64 {
+        let unparsed_tail = self.reader.available().len().saturating_sub(self.pending);
+        self.reader.total_out().saturating_sub(unparsed_tail as u64)
+    }
+
+    /// Total decompressed size extrapolated from the zlib ratio observed so
+    /// far; exact once the stream has fully inflated.
+    fn estimated_total_out(&self) -> u64 {
+        let (in_pos, in_len) = self.reader.compressed_progress();
+        if in_pos == 0 {
+            return self.reader.total_out();
+        }
+        self.reader
+            .total_out()
+            .saturating_mul(in_len as u64)
+            .checked_div(in_pos as u64)
+            .unwrap_or(0)
+    }
+
     /// Re-borrow the payload of the field most recently yielded by
     /// [`FieldWalker::next_field`] (it stays buffered until the next call).
     fn pending_payload(&self, payload_start: usize) -> &[u8] {
@@ -147,7 +271,7 @@ impl<'a> FieldWalker<'a> {
         self.reader
             .ensure(10)
             .map_err(HistorySyncError::DecompressionError)?;
-        let (tag, tlen) = read_varint(self.reader.available())?;
+        let (tag, tlen) = read_varint(self.reader.available()).ok_or_else(malformed_varint)?;
         let field_number = (tag >> 3) as u32;
         let wire_type_raw = (tag & 0x7) as u32;
 
@@ -156,7 +280,8 @@ impl<'a> FieldWalker<'a> {
                 self.reader
                     .ensure(tlen + 10)
                     .map_err(HistorySyncError::DecompressionError)?;
-                let (len, vlen) = read_varint(&self.reader.available()[tlen..])?;
+                let (len, vlen) =
+                    read_varint(&self.reader.available()[tlen..]).ok_or_else(malformed_varint)?;
                 let len = usize::try_from(len).map_err(|_| {
                     HistorySyncError::MalformedProtobuf(format!(
                         "field length overflows usize: {len}"
@@ -183,7 +308,8 @@ impl<'a> FieldWalker<'a> {
                 self.reader
                     .ensure(tlen + 10)
                     .map_err(HistorySyncError::DecompressionError)?;
-                let (_, vlen) = read_varint(&self.reader.available()[tlen..])?;
+                let (_, vlen) =
+                    read_varint(&self.reader.available()[tlen..]).ok_or_else(malformed_varint)?;
                 (tlen + vlen, tlen)
             }
             wire_type::FIXED64 => {
@@ -231,24 +357,117 @@ impl<'a> FieldWalker<'a> {
 /// secrets, tctokens, pushname and nctSalt as each top-level field is
 /// buffered, so peak memory is bounded by the largest single conversation
 /// rather than the whole blob.
-fn process_history_sync_streaming(
+trait HistoryMsgSecretRecordSink {
+    fn retain(&mut self, candidate: HistoryMsgSecretRecordRef<'_>) -> bool;
+
+    fn retained_len(&self, owned_records: &[HistoryMsgSecretRecord]) -> usize;
+
+    fn reserve(&mut self, owned_records: &mut Vec<HistoryMsgSecretRecord>, additional: usize);
+
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize>;
+}
+
+struct FilteredRecordSink<F>(F);
+
+impl<F> HistoryMsgSecretRecordSink for FilteredRecordSink<F>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>) -> bool,
+{
+    fn retain(&mut self, candidate: HistoryMsgSecretRecordRef<'_>) -> bool {
+        self.0(candidate)
+    }
+
+    fn retained_len(&self, owned_records: &[HistoryMsgSecretRecord]) -> usize {
+        owned_records.len()
+    }
+
+    fn reserve(&mut self, owned_records: &mut Vec<HistoryMsgSecretRecord>, additional: usize) {
+        owned_records.reserve(additional);
+    }
+
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(std::mem::size_of::<HistoryMsgSecretRecord>())
+    }
+}
+
+struct VisitingRecordSink<V> {
+    visitor: V,
+    retained: usize,
+}
+
+impl<V> VisitingRecordSink<V> {
+    fn new(visitor: V) -> Self {
+        Self {
+            visitor,
+            retained: 0,
+        }
+    }
+}
+
+impl<V> HistoryMsgSecretRecordSink for VisitingRecordSink<V>
+where
+    V: HistoryMsgSecretRecordVisitor,
+{
+    fn retain(&mut self, candidate: HistoryMsgSecretRecordRef<'_>) -> bool {
+        self.retained = self.retained.saturating_add(self.visitor.visit(candidate));
+        false
+    }
+
+    fn retained_len(&self, _owned_records: &[HistoryMsgSecretRecord]) -> usize {
+        self.retained
+    }
+
+    fn reserve(&mut self, _owned_records: &mut Vec<HistoryMsgSecretRecord>, additional: usize) {
+        self.visitor.reserve(additional);
+    }
+
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+        self.visitor.retained_item_size()
+    }
+}
+
+fn process_history_sync_streaming<S>(
     compressed_data: &[u8],
     own_user: Option<&str>,
     max_decompressed: u64,
-) -> Result<HistorySyncResult, HistorySyncError> {
+    mut record_sink: S,
+) -> Result<HistorySyncResult, HistorySyncError>
+where
+    S: HistoryMsgSecretRecordSink,
+{
     let mut walker = FieldWalker::new(compressed_data, max_decompressed);
     let mut result = HistorySyncResult {
         own_pushname: None,
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
-        // Grown on demand: a full pre-count pass scanned the whole blob just to
-        // size a Vec that only holds the secret-record subset (it over-allocated
-        // and cost ~2.5% of the decode); plain growth is cheaper here.
+        // Starts empty and gets a one-shot density-based reserve once the
+        // walk has seen RESERVE_SAMPLE_RECORDS (see below). A full pre-count
+        // pass was tried before: it scanned the whole blob just to size a Vec
+        // holding only the secret-record subset (over-allocating, ~2.5% of
+        // the decode).
         msg_secret_records: Vec::new(),
+        lid_mappings: Vec::new(),
         compressed_bytes: None,
         decompressed_size: 0,
     };
+
+    // One-shot capacity extrapolation for the secret-record accumulator. A
+    // full pre-count pass (see the field comment above) was measured at ~2.5%
+    // of the decode, so instead the record density observed over a prefix is
+    // scaled to the blob's extrapolated decompressed size. Costs O(1), adapts
+    // to blobs with few secrets, and an off estimate just falls back to
+    // doubling. Extrapolating from the first conversation alone overshot to
+    // the clamp on measured blobs (doubling the transient peak), so the
+    // sample must first reach RESERVE_SAMPLE_RECORDS; the doubling ladder up
+    // to that point copies only ~2x its own bytes, which is noise. Give the
+    // projection 12.5% headroom: a tiny tail-ratio underestimate must not leave
+    // capacity just below the real count and make Vec double a multi-megabyte
+    // record buffer near EOF. The clamp still bounds over-allocation to ~2 MB.
+    const RESERVE_SAMPLE_RECORDS: usize = 128;
+    const RECORD_RESERVE_BYTE_CAP: usize = 2 * 1024 * 1024;
+    const RESERVE_HEADROOM_DIVISOR: usize = 8;
+    let mut density_reserved = false;
 
     while let Some(field) = walker.next_field()? {
         if field.wire_type != wire_type::LENGTH_DELIMITED {
@@ -258,11 +477,44 @@ fn process_history_sync_streaming(
         match field.field_number {
             // conversations (repeated)
             tags::history_sync::CONVERSATIONS => {
+                let conversation_index = result.conversations_processed;
                 result.conversations_processed += 1;
-                if let Some(candidate) =
-                    extract_conversation_fields(value, &mut result.msg_secret_records)
-                {
+                if let Some(candidate) = extract_conversation_fields(
+                    value,
+                    conversation_index,
+                    &mut result.msg_secret_records,
+                    &mut record_sink,
+                ) {
                     result.tc_token_candidates.push(candidate);
+                }
+                let retained_records = record_sink.retained_len(&result.msg_secret_records);
+                if !density_reserved && retained_records >= RESERVE_SAMPLE_RECORDS {
+                    density_reserved = true;
+                    // max(1) makes the division safe; parsed_bytes is only 0
+                    // if nothing decompressed yet, impossible past a record.
+                    let parsed = walker.parsed_bytes().max(1);
+                    let records = retained_records;
+                    let projected = ((records as u64).saturating_mul(walker.estimated_total_out())
+                        / parsed) as usize;
+                    let reserve_cap = record_sink
+                        .retained_item_size()
+                        .map(|item_size| RECORD_RESERVE_BYTE_CAP / item_size.get())
+                        .unwrap_or(0);
+                    let estimated = projected
+                        .saturating_add(projected / RESERVE_HEADROOM_DIVISOR)
+                        .min(reserve_cap);
+                    let additional = estimated.saturating_sub(records);
+                    #[cfg(feature = "tracing")]
+                    let _reserve_span = tracing::trace_span!(
+                        "wa.history.reserve_secret_records",
+                        records = records as u64,
+                        projected = projected as u64,
+                        target_capacity = estimated as u64,
+                        capacity_before = result.msg_secret_records.capacity() as u64,
+                        additional = additional as u64,
+                    )
+                    .entered();
+                    record_sink.reserve(&mut result.msg_secret_records, additional);
                 }
             }
             // pushnames (repeated) — only our own is needed
@@ -276,6 +528,11 @@ fn process_history_sync_streaming(
             }
             tags::history_sync::NCT_SALT if !value.is_empty() => {
                 result.nct_salt = Some(value.to_vec());
+            }
+            tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS => {
+                if let Some(mapping) = extract_lid_mapping(value) {
+                    result.lid_mappings.push(mapping);
+                }
             }
             _ => {}
         }
@@ -348,20 +605,43 @@ impl<'a> HistorySyncStream<'a> {
     }
 
     /// Decoded variant of [`HistorySyncStream::next_conversation_bytes`].
-    /// LENIENT: a conversation that fails prost decode is skipped and counted
+    /// LENIENT: a conversation that fails to decode is skipped and counted
     /// in [`HistorySyncStream::skipped_conversations`], not fatal — one
     /// corrupt entry doesn't void the rest of the blob.
+    ///
+    /// Allocates a fresh `Conversation` per call; a loop draining thousands of
+    /// entries should prefer [`HistorySyncStream::next_conversation_into`],
+    /// which reuses one struct's allocations across iterations.
     pub fn next_conversation(&mut self) -> Result<Option<wa::Conversation>, HistorySyncError> {
+        let mut conversation = wa::Conversation::default();
+        Ok(self
+            .next_conversation_into(&mut conversation)?
+            .then_some(conversation))
+    }
+
+    /// In-place variant of [`HistorySyncStream::next_conversation`]: decodes
+    /// the next entry into `conversation`, returning `Ok(false)` at clean EOF.
+    /// Same per-entry decode leniency.
+    ///
+    /// buffa's `clear()` retains `Vec` capacity, so reusing one struct across a
+    /// drain loop skips the per-conversation message-spine reallocations. After
+    /// `Ok(false)` (or an error) the struct contents are unspecified.
+    pub fn next_conversation_into(
+        &mut self,
+        conversation: &mut wa::Conversation,
+    ) -> Result<bool, HistorySyncError> {
         loop {
             match self.next_conversation_bytes()? {
-                None => return Ok(None),
-                Some(bytes) => match <wa::Conversation as prost::Message>::decode(bytes) {
-                    Ok(conversation) => return Ok(Some(conversation)),
-                    Err(e) => {
-                        log::debug!("Skipping undecodable history-sync conversation: {e}");
-                        self.skipped_conversations += 1;
+                None => return Ok(false),
+                Some(bytes) => {
+                    match waproto::codec::conversation_merge_from_slice(conversation, bytes) {
+                        Ok(()) => return Ok(true),
+                        Err(e) => {
+                            log::debug!("Skipping undecodable history-sync conversation: {e}");
+                            self.skipped_conversations += 1;
+                        }
                     }
-                },
+                }
             }
         }
     }
@@ -394,68 +674,62 @@ impl<'a> HistorySyncStream<'a> {
     }
 }
 
-/// Compute `pos + len` with overflow and bounds checking.
+/// `Option` (Copy) for the same happy-path drop_glue reason as
+/// [`read_varint`]; `?` sites map `None` via [`field_overflow`].
+// inline(always): same hot-path/thin-LTO rationale as read_varint.
 #[inline(always)]
-fn checked_end(
-    pos: usize,
-    len: u64,
-    buf_len: usize,
-    field: &str,
-) -> Result<usize, HistorySyncError> {
-    let len = usize::try_from(len).map_err(|_| {
-        HistorySyncError::MalformedProtobuf(format!("{field} length overflows usize: {len}"))
-    })?;
-    let end = pos.checked_add(len).ok_or_else(|| {
-        HistorySyncError::MalformedProtobuf(format!(
-            "{field} field overflows: pos={pos}, len={len}"
-        ))
-    })?;
-    if end > buf_len {
-        return Err(HistorySyncError::MalformedProtobuf(format!(
-            "{field} field overflows buffer: pos={pos}, len={len}, buf={buf_len}"
-        )));
-    }
-    Ok(end)
+fn checked_end(pos: usize, len: u64, buf_len: usize) -> Option<usize> {
+    let len = usize::try_from(len).ok()?;
+    let end = pos.checked_add(len)?;
+    (end <= buf_len).then_some(end)
 }
 
-/// Read a protobuf varint from `data`, returning (value, bytes_consumed).
+/// Rich error for `?` boundaries around [`checked_end`]; failure-path only.
+#[cold]
+fn field_overflow(field: &str, pos: usize, len: u64, buf_len: usize) -> HistorySyncError {
+    HistorySyncError::MalformedProtobuf(format!(
+        "{field} field overflows buffer: pos={pos}, len={len}, buf={buf_len}"
+    ))
+}
+
+/// `None` covers truncation and 64-bit overflow alike: the walk loops call
+/// this per field and discard the failure, so the return must stay `Copy`. A
+/// `Result` carrying a heap error here put `drop_glue` on the happy path of
+/// every field visit (~2% of a full-blob decode). `?` sites map `None` via
+/// [`malformed_varint`].
 // inline(always): per-field hot path; the thin-LTO bench profile keeps plain
 // #[inline] candidates outlined and the call overhead dominates the walk.
 #[inline(always)]
-fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
+fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
     // Single-byte fast-path: most history-sync varints (tags, small lengths) fit in one byte.
-    let Some(&first) = data.first() else {
-        return Err(HistorySyncError::MalformedProtobuf(
-            "unexpected end of data in varint".into(),
-        ));
-    };
+    let &first = data.first()?;
     if first < 0x80 {
-        return Ok((first as u64, 1));
+        return Some((first as u64, 1));
     }
     let mut value = (first & 0x7F) as u64;
     let mut shift = 7u32;
     for (i, &byte) in data[1..].iter().enumerate() {
-        // The 10th byte of a 64-bit varint may only carry one bit; prost
-        // rejects the overflow instead of silently truncating it.
+        // The 10th byte of a 64-bit varint may only carry one bit.
         if shift == 63 && byte > 1 {
-            return Err(HistorySyncError::MalformedProtobuf(
-                "varint overflows 64 bits".into(),
-            ));
+            return None;
         }
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
-            return Ok((value, i + 2));
+            return Some((value, i + 2));
         }
         shift += 7;
         if shift >= 64 {
-            return Err(HistorySyncError::MalformedProtobuf(
-                "varint too long".into(),
-            ));
+            return None;
         }
     }
-    Err(HistorySyncError::MalformedProtobuf(
-        "unexpected end of data in varint".into(),
-    ))
+    None
+}
+
+/// Rich error for `?` boundaries around [`read_varint`]; built only on the
+/// (malformed-blob) failure path so the walk loops stay allocation-free.
+#[cold]
+fn malformed_varint() -> HistorySyncError {
+    HistorySyncError::MalformedProtobuf("truncated or overlong varint".into())
 }
 
 /// Skip a protobuf field based on wire type, returning the new position.
@@ -463,15 +737,18 @@ fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
 fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySyncError> {
     match wire_type {
         wire_type::VARINT => {
-            let (_, vlen) = read_varint(&buf[pos..])?;
+            let (_, vlen) = read_varint(&buf[pos..]).ok_or_else(malformed_varint)?;
             Ok(pos + vlen)
         }
-        wire_type::FIXED64 => checked_end(pos, 8, buf.len(), "fixed64"),
+        wire_type::FIXED64 => checked_end(pos, 8, buf.len())
+            .ok_or_else(|| field_overflow("fixed64", pos, 8, buf.len())),
         wire_type::LENGTH_DELIMITED => {
-            let (len, vlen) = read_varint(&buf[pos..])?;
-            checked_end(pos + vlen, len, buf.len(), "length-delimited")
+            let (len, vlen) = read_varint(&buf[pos..]).ok_or_else(malformed_varint)?;
+            checked_end(pos + vlen, len, buf.len())
+                .ok_or_else(|| field_overflow("length-delimited", pos + vlen, len, buf.len()))
         }
-        wire_type::FIXED32 => checked_end(pos, 4, buf.len(), "fixed32"),
+        wire_type::FIXED32 => checked_end(pos, 4, buf.len())
+            .ok_or_else(|| field_overflow("fixed32", pos, 4, buf.len())),
         _ => {
             log::warn!("Unknown wire type {wire_type} in history sync, cannot skip");
             Err(HistorySyncError::MalformedProtobuf(format!(
@@ -481,40 +758,37 @@ fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySy
     }
 }
 
-/// Manual pushname parser — Pushname proto has fields: id (tag 1) and pushname (tag 2).
-/// Checks id first and only allocates the pushname string if id matches `own_user`.
+// Best-effort: a malformed pushname (optional metadata) must not abort the sync.
 fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     let mut pos = 0;
     let mut id_match = false;
     let mut pushname: Option<String> = None;
 
     while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
+        let (tag, bytes_read) = read_varint(data.get(pos..)?)?;
         pos += bytes_read;
         let field_number = (tag >> 3) as u32;
         let wt = (tag & 0x7) as u32;
 
         match field_number {
-            // id (string)
             tags::pushname::ID if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
+                let (len, vlen) = read_varint(data.get(pos..)?)?;
                 pos += vlen;
                 let len = usize::try_from(len).ok()?;
                 let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                let id = std::str::from_utf8(data.get(pos..end)?).ok()?;
+                let id = smoothutf8::from_utf8(data.get(pos..end)?)?;
                 id_match = id == own_user;
                 if !id_match {
                     return None; // wrong user, skip entirely
                 }
                 pos = end;
             }
-            // pushname (string)
             tags::pushname::PUSHNAME if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
+                let (len, vlen) = read_varint(data.get(pos..)?)?;
                 pos += vlen;
                 let len = usize::try_from(len).ok()?;
                 let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                let name = std::str::from_utf8(data.get(pos..end)?).ok()?;
+                let name = smoothutf8::from_utf8(data.get(pos..end)?)?;
                 pushname = Some(name.to_string());
                 pos = end;
             }
@@ -527,177 +801,78 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     if id_match { pushname } else { None }
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct HistorySyncMsgInternalFields {
-    // Decoded one message at a time (see `extract_conversation_fields`), so this
-    // is a short-lived stack value rather than an element of a big Vec — no box
-    // needed.
-    #[prost(message, optional, tag = "1")]
-    pub message: Option<WebMessageInfoInternalFields>,
+/// One PN↔LID pair from `HistorySync.phoneNumberToLidMappings`, reduced to
+/// bare user parts (no server, no device).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryLidMapping {
+    pub phone_number: String,
+    pub lid: String,
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct WebMessageInfoInternalFields {
-    #[prost(message, optional, tag = "1")]
-    pub key: Option<MessageKeyInternalFields>,
-    #[prost(message, optional, tag = "2")]
-    pub message: Option<MessageInternalFields>,
-    /// Parent message event time (unix seconds). Drives msg-secret retention
-    /// so a horizon expires by the message's real age, not when we seeded it.
-    #[prost(uint64, optional, tag = "3")]
-    pub message_timestamp: Option<u64>,
-    #[prost(string, optional, tag = "5")]
-    pub participant: Option<String>,
-    #[prost(bytes = "vec", optional, tag = "49")]
-    pub message_secret: Option<Vec<u8>>,
+/// Read one length-delimited UTF-8 string field, advancing `pos` past it.
+fn read_str_field<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a str> {
+    let (len, vlen) = read_varint(data.get(*pos..)?)?;
+    *pos += vlen;
+    let len = usize::try_from(len).ok()?;
+    let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
+    let value = smoothutf8::from_utf8(data.get(*pos..end)?)?;
+    *pos = end;
+    Some(value)
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct MessageKeyInternalFields {
-    #[prost(bool, optional, tag = "2")]
-    pub from_me: Option<bool>,
-    #[prost(string, optional, tag = "3")]
-    pub id: Option<String>,
-    #[prost(string, optional, tag = "4")]
-    pub participant: Option<String>,
-}
+// Best-effort: a malformed mapping entry (optional metadata) must not abort
+// the sync, mirroring the pushname extractor above.
+fn extract_lid_mapping(data: &[u8]) -> Option<HistoryLidMapping> {
+    use wacore_binary::{Jid, Server};
 
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct MessageInternalFields {
-    #[prost(message, optional, tag = "3")]
-    pub image_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "4")]
-    pub contact_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "5")]
-    pub location_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "6")]
-    pub extended_text_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "7")]
-    pub document_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "8")]
-    pub audio_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "9")]
-    pub video_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "13")]
-    pub contacts_array_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "18")]
-    pub live_location_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "25")]
-    pub template_message: Option<ContextInfoTag3InternalFields>,
-    #[prost(message, optional, tag = "26")]
-    pub sticker_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "28")]
-    pub group_invite_message: Option<ContextInfoTag7InternalFields>,
-    #[prost(message, optional, tag = "29")]
-    pub template_button_reply_message: Option<ContextInfoTag3InternalFields>,
-    #[prost(message, optional, tag = "30")]
-    pub product_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "31")]
-    pub device_sent_message: Option<DeviceSentMessageInternalFields>,
-    #[prost(message, optional, tag = "35")]
-    pub message_context_info: Option<MessageContextInfoInternalFields>,
-    #[prost(message, optional, tag = "36")]
-    pub list_message: Option<ContextInfoTag8InternalFields>,
-    #[prost(message, optional, tag = "37")]
-    pub view_once_message: Option<FutureProofMessageInternalFields>,
-    #[prost(message, optional, tag = "38")]
-    pub order_message: Option<ContextInfoTag17InternalFields>,
-    #[prost(message, optional, tag = "39")]
-    pub list_response_message: Option<ContextInfoTag4InternalFields>,
-    #[prost(message, optional, tag = "40")]
-    pub ephemeral_message: Option<FutureProofMessageInternalFields>,
-    #[prost(message, optional, tag = "42")]
-    pub buttons_message: Option<ContextInfoTag8InternalFields>,
-    #[prost(message, optional, tag = "43")]
-    pub buttons_response_message: Option<ContextInfoTag3InternalFields>,
-    #[prost(message, optional, tag = "45")]
-    pub interactive_message: Option<ContextInfoTag15InternalFields>,
-    #[prost(message, optional, tag = "48")]
-    pub interactive_response_message: Option<ContextInfoTag15InternalFields>,
-    #[prost(message, optional, tag = "49")]
-    pub poll_creation_message: Option<ContextInfoTag5InternalFields>,
-    #[prost(message, optional, tag = "53")]
-    pub document_with_caption_message: Option<FutureProofMessageInternalFields>,
-    #[prost(message, optional, tag = "55")]
-    pub view_once_message_v2: Option<FutureProofMessageInternalFields>,
-    #[prost(message, optional, tag = "58")]
-    pub edited_message: Option<FutureProofMessageInternalFields>,
-    #[prost(message, optional, tag = "60")]
-    pub poll_creation_message_v2: Option<ContextInfoTag5InternalFields>,
-    #[prost(message, optional, tag = "64")]
-    pub poll_creation_message_v3: Option<ContextInfoTag5InternalFields>,
-    #[prost(message, optional, tag = "75")]
-    pub event_message: Option<ContextInfoTag1InternalFields>,
-    #[prost(message, optional, tag = "78")]
-    pub newsletter_admin_invite_message: Option<ContextInfoTag6InternalFields>,
-    #[prost(message, optional, tag = "86")]
-    pub sticker_pack_message: Option<ContextInfoTag11InternalFields>,
-}
+    let mut pn_raw: Option<&str> = None;
+    let mut lid_raw: Option<&str> = None;
+    let mut pos = 0;
 
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct MessageContextInfoInternalFields {
-    #[prost(bytes = "vec", optional, tag = "3")]
-    pub message_secret: Option<Vec<u8>>,
-    /// Raw `BotMetadata` bytes; only its presence matters (a bot invocation),
-    /// so it stays opaque to keep the partial decode cheap.
-    #[prost(bytes = "vec", optional, tag = "7")]
-    pub bot_metadata: Option<Vec<u8>>,
-}
+    while pos < data.len() {
+        let (tag, bytes_read) = read_varint(data.get(pos..)?)?;
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
 
-macro_rules! define_context_info_carrier {
-    ($name:ident, $tag:literal) => {
-        #[derive(Clone, PartialEq, prost::Message)]
-        pub(crate) struct $name {
-            #[prost(message, optional, tag = $tag)]
-            pub context_info: Option<ContextInfoInternalFields>,
-        }
-
-        impl $name {
-            fn is_forwarded(&self) -> bool {
-                self.context_info
-                    .as_ref()
-                    .and_then(|ctx| ctx.is_forwarded)
-                    .unwrap_or(false)
+        match field_number {
+            tags::phone_number_to_lid_mapping::PN_JID if wt == wire_type::LENGTH_DELIMITED => {
+                pn_raw = Some(read_str_field(data, &mut pos)?);
+            }
+            tags::phone_number_to_lid_mapping::LID_JID if wt == wire_type::LENGTH_DELIMITED => {
+                lid_raw = Some(read_str_field(data, &mut pos)?);
+            }
+            _ => {
+                pos = skip_field(wt, data, pos).ok()?;
             }
         }
-    };
+    }
+
+    let pn: Jid = pn_raw?.parse().ok()?;
+    let lid: Jid = lid_raw?.parse().ok()?;
+    // Legacy `@c.us` is the PN namespace under its old name (whatsmeow maps it
+    // to `@s.whatsapp.net` the same way); the user part is the phone either way.
+    if !(pn.is_pn() || pn.server == Server::Legacy) || !lid.is_lid() {
+        return None;
+    }
+    if pn.user_base().is_empty() || lid.user_base().is_empty() {
+        return None;
+    }
+    Some(HistoryLidMapping {
+        phone_number: pn.user_base().to_string(),
+        lid: lid.user_base().to_string(),
+    })
 }
 
-define_context_info_carrier!(ContextInfoTag1InternalFields, "1");
-define_context_info_carrier!(ContextInfoTag3InternalFields, "3");
-define_context_info_carrier!(ContextInfoTag4InternalFields, "4");
-define_context_info_carrier!(ContextInfoTag5InternalFields, "5");
-define_context_info_carrier!(ContextInfoTag6InternalFields, "6");
-define_context_info_carrier!(ContextInfoTag7InternalFields, "7");
-define_context_info_carrier!(ContextInfoTag8InternalFields, "8");
-define_context_info_carrier!(ContextInfoTag11InternalFields, "11");
-define_context_info_carrier!(ContextInfoTag15InternalFields, "15");
-define_context_info_carrier!(ContextInfoTag17InternalFields, "17");
-
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct ContextInfoInternalFields {
-    #[prost(bool, optional, tag = "22")]
-    pub is_forwarded: Option<bool>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct DeviceSentMessageInternalFields {
-    #[prost(message, optional, boxed, tag = "2")]
-    pub message: Option<Box<MessageInternalFields>>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct FutureProofMessageInternalFields {
-    #[prost(message, optional, boxed, tag = "1")]
-    pub message: Option<Box<MessageInternalFields>>,
-}
-
-// Schema pinning for every hand-written `#[prost(tag)]` literal above (prost
-// attributes only accept literals, so they cannot reference the generated
-// consts directly). If whatsapp.proto renumbers, renames or removes any of
-// these fields, compilation fails here instead of the partial decoder silently
-// reading the wrong wire field.
+// Schema pinning: assert that the tags::* constants used by fast_extract and
+// extract_conversation_fields match the generated proto field numbers. If
+// whatsapp.proto renumbers a field, compilation fails here instead of the
+// fast-path silently reading the wrong wire field.
 const _: () = {
+    assert!(tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS == 15);
+    assert!(tags::phone_number_to_lid_mapping::PN_JID == 1);
+    assert!(tags::phone_number_to_lid_mapping::LID_JID == 2);
+
     assert!(tags::history_sync_msg::MESSAGE == 1);
 
     assert!(tags::web_message_info::KEY == 1);
@@ -753,22 +928,20 @@ const _: () = {
     assert!(tags::message::device_sent_message::MESSAGE == 2);
     assert!(tags::message::future_proof_message::MESSAGE == 1);
 
-    // ContextInfoTagN carriers: pin the `contextInfo` field number of every
-    // proto message each carrier stands in for.
-    assert!(tags::message::event_message::CONTEXT_INFO == 1); // Tag1
-    assert!(tags::message::template_message::CONTEXT_INFO == 3); // Tag3
+    assert!(tags::message::event_message::CONTEXT_INFO == 1);
+    assert!(tags::message::template_message::CONTEXT_INFO == 3);
     assert!(tags::message::template_button_reply_message::CONTEXT_INFO == 3);
     assert!(tags::message::buttons_response_message::CONTEXT_INFO == 3);
-    assert!(tags::message::list_response_message::CONTEXT_INFO == 4); // Tag4
-    assert!(tags::message::poll_creation_message::CONTEXT_INFO == 5); // Tag5 (v2/v3 share the type)
-    assert!(tags::message::newsletter_admin_invite_message::CONTEXT_INFO == 6); // Tag6
-    assert!(tags::message::group_invite_message::CONTEXT_INFO == 7); // Tag7
-    assert!(tags::message::list_message::CONTEXT_INFO == 8); // Tag8
+    assert!(tags::message::list_response_message::CONTEXT_INFO == 4);
+    assert!(tags::message::poll_creation_message::CONTEXT_INFO == 5);
+    assert!(tags::message::newsletter_admin_invite_message::CONTEXT_INFO == 6);
+    assert!(tags::message::group_invite_message::CONTEXT_INFO == 7);
+    assert!(tags::message::list_message::CONTEXT_INFO == 8);
     assert!(tags::message::buttons_message::CONTEXT_INFO == 8);
-    assert!(tags::message::sticker_pack_message::CONTEXT_INFO == 11); // Tag11
-    assert!(tags::message::interactive_message::CONTEXT_INFO == 15); // Tag15
+    assert!(tags::message::sticker_pack_message::CONTEXT_INFO == 11);
+    assert!(tags::message::interactive_message::CONTEXT_INFO == 15);
     assert!(tags::message::interactive_response_message::CONTEXT_INFO == 15);
-    assert!(tags::message::image_message::CONTEXT_INFO == 17); // Tag17
+    assert!(tags::message::image_message::CONTEXT_INFO == 17);
     assert!(tags::message::contact_message::CONTEXT_INFO == 17);
     assert!(tags::message::location_message::CONTEXT_INFO == 17);
     assert!(tags::message::extended_text_message::CONTEXT_INFO == 17);
@@ -781,115 +954,6 @@ const _: () = {
     assert!(tags::message::product_message::CONTEXT_INFO == 17);
     assert!(tags::message::order_message::CONTEXT_INFO == 17);
 };
-
-impl MessageInternalFields {
-    fn base_message(&self) -> &Self {
-        let mut current = self;
-        loop {
-            let next = current
-                .device_sent_message
-                .as_ref()
-                .and_then(|m| m.message.as_deref())
-                .or_else(|| {
-                    current
-                        .ephemeral_message
-                        .as_ref()
-                        .and_then(|m| m.message.as_deref())
-                })
-                .or_else(|| {
-                    current
-                        .view_once_message
-                        .as_ref()
-                        .and_then(|m| m.message.as_deref())
-                })
-                .or_else(|| {
-                    current
-                        .view_once_message_v2
-                        .as_ref()
-                        .and_then(|m| m.message.as_deref())
-                })
-                .or_else(|| {
-                    current
-                        .document_with_caption_message
-                        .as_ref()
-                        .and_then(|m| m.message.as_deref())
-                })
-                .or_else(|| {
-                    current
-                        .edited_message
-                        .as_ref()
-                        .and_then(|m| m.message.as_deref())
-                });
-
-            match next {
-                Some(msg) => current = msg,
-                None => return current,
-            }
-        }
-    }
-
-    /// Whether the message invokes a bot, detected via `botMetadata` presence.
-    /// botMetadata sits on the top-level `MessageContextInfo` even when wrapped,
-    /// so check both the outer message and the unwrapped base. (Mentions are not
-    /// decoded in this partial path; a mention-only prompt falls back to text.)
-    fn invokes_bot(&self) -> bool {
-        let has = |m: &Self| {
-            m.message_context_info
-                .as_ref()
-                .is_some_and(|c| c.bot_metadata.is_some())
-        };
-        has(self) || has(self.base_message())
-    }
-
-    /// Whether the (unwrapped) message is a poll-creation or event message.
-    /// These carry the longer poll/event retention horizon.
-    fn is_poll_or_event(&self) -> bool {
-        let base = self.base_message();
-        base.poll_creation_message.is_some()
-            || base.poll_creation_message_v2.is_some()
-            || base.poll_creation_message_v3.is_some()
-            || base.event_message.is_some()
-    }
-
-    fn is_forwarded(&self) -> bool {
-        let base = self.base_message();
-        macro_rules! any_forwarded {
-            ($($field:ident),+ $(,)?) => {
-                false $(|| base.$field.as_ref().map(|m| m.is_forwarded()).unwrap_or(false))+
-            };
-        }
-
-        any_forwarded!(
-            extended_text_message,
-            image_message,
-            video_message,
-            audio_message,
-            document_message,
-            sticker_message,
-            location_message,
-            live_location_message,
-            contact_message,
-            contacts_array_message,
-            buttons_message,
-            buttons_response_message,
-            list_message,
-            list_response_message,
-            template_message,
-            template_button_reply_message,
-            interactive_message,
-            interactive_response_message,
-            poll_creation_message,
-            poll_creation_message_v2,
-            poll_creation_message_v3,
-            product_message,
-            order_message,
-            group_invite_message,
-            event_message,
-            sticker_pack_message,
-            newsletter_admin_invite_message,
-        )
-    }
-}
 
 /// Message secret bytes, inline up to 32 bytes (the universal size of real
 /// message secrets) so extracting a record costs no heap allocation. Larger
@@ -1003,6 +1067,7 @@ struct FastRecord<'a> {
 /// Carrier slots inspected by the forwarded check; mirrors the
 /// `is_forwarded` chain of `MessageInternalFields`.
 const N_CARRIERS: usize = 27;
+const _: () = assert!(N_CARRIERS <= u32::BITS as usize);
 
 /// Map a `Message` field tag to its forwarded-carrier slot and the
 /// `contextInfo` tag inside that carrier. A `match` so the dispatch compiles
@@ -1110,7 +1175,7 @@ impl<'a> Iterator for FieldIter<'a> {
         if self.pos >= self.data.len() {
             return None;
         }
-        let Ok((tag, br)) = read_varint(&self.data[self.pos..]) else {
+        let Some((tag, br)) = read_varint(&self.data[self.pos..]) else {
             self.pos = self.data.len();
             return Some(Err(WalkStop::Malformed));
         };
@@ -1126,12 +1191,12 @@ impl<'a> Iterator for FieldIter<'a> {
         let wt = (tag & 0x7) as u32;
         match wt {
             wire_type::LENGTH_DELIMITED => {
-                let Ok((len, vl)) = read_varint(&self.data[self.pos..]) else {
+                let Some((len, vl)) = read_varint(&self.data[self.pos..]) else {
                     self.pos = self.data.len();
                     return Some(Err(WalkStop::Malformed));
                 };
                 self.pos += vl;
-                let Ok(end) = checked_end(self.pos, len, self.data.len(), "field") else {
+                let Some(end) = checked_end(self.pos, len, self.data.len()) else {
                     self.pos = self.data.len();
                     return Some(Err(WalkStop::Malformed));
                 };
@@ -1145,7 +1210,7 @@ impl<'a> Iterator for FieldIter<'a> {
                 }))
             }
             wire_type::VARINT => {
-                let Ok((v, vl)) = read_varint(&self.data[self.pos..]) else {
+                let Some((v, vl)) = read_varint(&self.data[self.pos..]) else {
                     self.pos = self.data.len();
                     return Some(Err(WalkStop::Malformed));
                 };
@@ -1201,7 +1266,16 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
     let mut from_me = false;
     let mut msg_id: Option<&str> = None;
     let mut key_participant: Option<&str> = None;
+    // A normal WebMessageInfo contains one key. Keep that wire slice borrowed
+    // until a messageSecret is actually found, so the overwhelmingly common
+    // no-record path skips its nested walk and UTF-8 validation entirely.
+    // If malformed/merged wire data repeats the key, materialize both in order
+    // and continue merging subsequent occurrences exactly like prost.
+    let mut deferred_key: Option<&[u8]> = None;
+    let mut key_materialized = false;
+    let mut deferred_web_msg_participant: Option<&[u8]> = None;
     let mut web_msg_participant: Option<&str> = None;
+    let mut web_msg_participant_materialized = false;
     let mut timestamp: Option<u64> = None;
     let mut top_secret: Option<&[u8]> = None;
     let mut msg_slice: Option<&[u8]> = None;
@@ -1226,32 +1300,29 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
                         let Some(key) = f.value else {
                             return FastExtract::NoRecord;
                         };
-                        for item in FieldIter::new(key) {
-                            let f = match item {
-                                Ok(f) => f,
-                                Err(stop) => return stop.into(),
-                            };
-                            match f.field {
-                                tags::message_key::FROM_ME => {
-                                    if f.wt != wire_type::VARINT {
-                                        return FastExtract::NoRecord;
-                                    }
-                                    from_me = f.varint != 0;
+                        if let Some(first_key) = deferred_key.take() {
+                            for key in [first_key, key] {
+                                if let Err(stop) = merge_message_key_fields(
+                                    key,
+                                    &mut from_me,
+                                    &mut msg_id,
+                                    &mut key_participant,
+                                ) {
+                                    return stop.into();
                                 }
-                                tags::message_key::ID => {
-                                    let Some(Ok(s)) = f.value.map(std::str::from_utf8) else {
-                                        return FastExtract::NoRecord;
-                                    };
-                                    msg_id = Some(s);
-                                }
-                                tags::message_key::PARTICIPANT => {
-                                    let Some(Ok(s)) = f.value.map(std::str::from_utf8) else {
-                                        return FastExtract::NoRecord;
-                                    };
-                                    key_participant = Some(s);
-                                }
-                                _ => {}
                             }
+                            key_materialized = true;
+                        } else if key_materialized {
+                            if let Err(stop) = merge_message_key_fields(
+                                key,
+                                &mut from_me,
+                                &mut msg_id,
+                                &mut key_participant,
+                            ) {
+                                return stop.into();
+                            }
+                        } else {
+                            deferred_key = Some(key);
                         }
                     }
                     tags::web_message_info::MESSAGE => {
@@ -1272,10 +1343,26 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
                         timestamp = Some(f.varint);
                     }
                     tags::web_message_info::PARTICIPANT => {
-                        let Some(Ok(s)) = f.value.map(std::str::from_utf8) else {
+                        let Some(participant) = f.value else {
                             return FastExtract::NoRecord;
                         };
-                        web_msg_participant = Some(s);
+                        if let Some(first_participant) = deferred_web_msg_participant.take() {
+                            if smoothutf8::from_utf8(first_participant).is_none() {
+                                return FastExtract::NoRecord;
+                            }
+                            let Some(participant) = smoothutf8::from_utf8(participant) else {
+                                return FastExtract::NoRecord;
+                            };
+                            web_msg_participant = Some(participant);
+                            web_msg_participant_materialized = true;
+                        } else if web_msg_participant_materialized {
+                            let Some(participant) = smoothutf8::from_utf8(participant) else {
+                                return FastExtract::NoRecord;
+                            };
+                            web_msg_participant = Some(participant);
+                        } else {
+                            deferred_web_msg_participant = Some(participant);
+                        }
                     }
                     tags::web_message_info::MESSAGE_SECRET => {
                         let Some(secret) = f.value else {
@@ -1301,6 +1388,20 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
     let Some(secret) = top_secret.or(context_secret) else {
         return FastExtract::NoRecord;
     };
+
+    if !key_materialized
+        && let Some(key) = deferred_key
+        && let Err(stop) =
+            merge_message_key_fields(key, &mut from_me, &mut msg_id, &mut key_participant)
+    {
+        return stop.into();
+    }
+    if !web_msg_participant_materialized && let Some(participant) = deferred_web_msg_participant {
+        let Some(participant) = smoothutf8::from_utf8(participant) else {
+            return FastExtract::NoRecord;
+        };
+        web_msg_participant = Some(participant);
+    }
     let Some(msg_id) = msg_id else {
         return FastExtract::NoRecord;
     };
@@ -1314,7 +1415,7 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
             Ok(base) => base,
             Err(stop) => return stop.into(),
         };
-        if base.forwarded.contains(&Some(true)) {
+        if base.forwarded_carriers != 0 {
             return FastExtract::NoRecord;
         }
         is_poll_or_event = base.is_poll_or_event;
@@ -1333,6 +1434,44 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
     })
 }
 
+/// Merge one MessageKey occurrence into the borrowed fast-path state. Kept
+/// separate so the outer scan can defer this nested work until a secret makes
+/// the record observable, while repeated keys retain protobuf merge order.
+fn merge_message_key_fields<'a>(
+    key: &'a [u8],
+    from_me: &mut bool,
+    msg_id: &mut Option<&'a str>,
+    participant: &mut Option<&'a str>,
+) -> Result<(), WalkStop> {
+    for item in FieldIter::new(key) {
+        let f = item?;
+        match f.field {
+            tags::message_key::FROM_ME => {
+                if f.wt != wire_type::VARINT {
+                    return Err(WalkStop::Malformed);
+                }
+                *from_me = f.varint != 0;
+            }
+            tags::message_key::ID => {
+                *msg_id = Some(
+                    f.value
+                        .and_then(smoothutf8::from_utf8)
+                        .ok_or(WalkStop::Malformed)?,
+                );
+            }
+            tags::message_key::PARTICIPANT => {
+                *participant = Some(
+                    f.value
+                        .and_then(smoothutf8::from_utf8)
+                        .ok_or(WalkStop::Malformed)?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl From<WalkStop> for FastExtract<'_> {
     fn from(stop: WalkStop) -> Self {
         match stop {
@@ -1348,8 +1487,8 @@ struct MsgLevel<'a> {
     context_secret: Option<&'a [u8]>,
     has_bot_metadata: bool,
     is_poll_or_event: bool,
-    /// Final merged `context_info.is_forwarded` per carrier slot.
-    forwarded: [Option<bool>; N_CARRIERS],
+    /// Carrier slots whose final merged `context_info.is_forwarded` is true.
+    forwarded_carriers: u32,
     /// Wrapper payloads found at this level, by priority slot.
     wrappers: [Option<&'a [u8]>; N_WRAPPERS],
 }
@@ -1361,7 +1500,7 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
         context_secret: None,
         has_bot_metadata: false,
         is_poll_or_event: false,
-        forwarded: [None; N_CARRIERS],
+        forwarded_carriers: 0,
         wrappers: [None; N_WRAPPERS],
     };
 
@@ -1407,7 +1546,12 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
                             if f.wt != wire_type::VARINT {
                                 return Err(WalkStop::Malformed);
                             }
-                            level.forwarded[slot] = Some(f.varint != 0);
+                            let carrier_bit = 1_u32 << slot;
+                            if f.varint != 0 {
+                                level.forwarded_carriers |= carrier_bit;
+                            } else {
+                                level.forwarded_carriers &= !carrier_bit;
+                            }
                         }
                     }
                 }
@@ -1418,15 +1562,17 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
     Ok(level)
 }
 
+/// Max wrapper layers to unwrap before treating a message as its own base.
+/// Shared by the fast lazy walk and the full-decode fallback so they classify
+/// (poll/forwarded/bot) the same base at every depth; prost had no cap but
+/// aborted decode near its recursion limit, and real messages nest few levels.
+const MAX_MESSAGE_WRAP_DEPTH: usize = 40;
+
 /// Follow the wrapper chain (device-sent/ephemeral/view-once/...) to the base
 /// message, mirroring `MessageInternalFields::base_message`: at each level the
 /// first wrapper in priority order that has an inner message wins.
 fn unwrap_to_base(mut level: MsgLevel<'_>) -> Result<MsgLevel<'_>, WalkStop> {
-    // prost aborts decode past its recursion limit (no record); deeper chains
-    // defer to it rather than re-deriving the exact cutoff here.
-    const MAX_UNWRAPS: usize = 40;
-
-    for _ in 0..MAX_UNWRAPS {
+    for _ in 0..MAX_MESSAGE_WRAP_DEPTH {
         let mut next: Option<&[u8]> = None;
         for (&inner_tag, wrapper) in WRAPPER_INNER_TAGS.iter().zip(level.wrappers) {
             let Some(wrapper) = wrapper else {
@@ -1478,7 +1624,7 @@ fn scan_context_info(mci: &[u8]) -> Result<(Option<&[u8]>, bool), WalkStop> {
 }
 
 /// Message-secret data extracted from a conversation during streaming.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HistoryMsgSecretRecord {
     /// Conversation JID. `Arc<str>` because every record of a conversation
     /// shares the same id: one allocation per conversation, not per record.
@@ -1503,22 +1649,101 @@ pub struct HistoryMsgSecretRecord {
     pub is_bot_invocation: bool,
 }
 
+/// Borrowed message-secret candidate passed to
+/// [`process_history_sync_bytes_filtered`] before ownership is materialized.
+///
+/// All fields point into the current conversation buffer and are valid only
+/// for the duration of the predicate call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryMsgSecretRecordRef<'a> {
+    /// Zero-based top-level conversation index within this history-sync blob.
+    /// Consecutive candidates with the same index share `chat_id`, allowing
+    /// policy callbacks to cache per-conversation classification without
+    /// copying or hashing the borrowed JID.
+    pub conversation_index: usize,
+    pub chat_id: &'a str,
+    pub from_me: bool,
+    pub key_participant: Option<&'a str>,
+    pub web_msg_participant: Option<&'a str>,
+    pub msg_id: &'a str,
+    pub secret: &'a [u8],
+    pub timestamp: Option<u64>,
+    pub is_poll_or_event: bool,
+    pub is_bot_invocation: bool,
+}
+
+/// Consumer for borrowed history-sync message-secret candidates.
+///
+/// [`visit`](Self::visit) returns how many consumer-side records were retained
+/// from a candidate. Consumers that also report their retained item size can
+/// receive a one-shot, density-based [`reserve`](Self::reserve) hint. The hint
+/// uses the same bounded estimator as the built-in owned-record path, avoiding
+/// both a full pre-count pass and a separate sizing heuristic in each caller.
+pub trait HistoryMsgSecretRecordVisitor {
+    /// Visit one borrowed candidate and return the number of retained output
+    /// items it produced.
+    fn visit(&mut self, record: HistoryMsgSecretRecordRef<'_>) -> usize;
+
+    /// Reserve room for `additional` retained output items.
+    fn reserve(&mut self, _additional: usize) {}
+
+    /// Size of one retained output item. Returning `None` disables reserve
+    /// hints while preserving record visitation.
+    fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+        None
+    }
+}
+
+struct VisitOnly<F>(F);
+
+impl<F> HistoryMsgSecretRecordVisitor for VisitOnly<F>
+where
+    F: for<'a> FnMut(HistoryMsgSecretRecordRef<'a>),
+{
+    fn visit(&mut self, record: HistoryMsgSecretRecordRef<'_>) -> usize {
+        self.0(record);
+        0
+    }
+}
+
+impl HistoryMsgSecretRecordRef<'_> {
+    fn into_owned(self, chat_id_shared: &mut Option<Arc<str>>) -> HistoryMsgSecretRecord {
+        HistoryMsgSecretRecord {
+            chat_id: chat_id_shared
+                .get_or_insert_with(|| Arc::from(self.chat_id))
+                .clone(),
+            from_me: self.from_me,
+            key_participant: self.key_participant.map(str::to_owned),
+            web_msg_participant: self.web_msg_participant.map(str::to_owned),
+            msg_id: CompactString::new(self.msg_id),
+            secret: SecretBytes::from(self.secret),
+            timestamp: self.timestamp,
+            is_poll_or_event: self.is_poll_or_event,
+            is_bot_invocation: self.is_bot_invocation,
+        }
+    }
+}
+
 /// Partial reader for one conversation: walks its protobuf fields directly
 /// (id, messages[], tctoken trio) and decodes each `HistorySyncMsg` ONE AT A
 /// TIME, extracting its secret record and dropping it immediately. This avoids
-/// materializing the whole `Vec<HistorySyncMsgInternalFields>` (and a heap
-/// allocation per message) just to scan it — only one message is decoded at a
-/// time. The complex per-message flag logic stays in prost via
-/// `HistorySyncMsgInternalFields`.
+/// materializing the whole `Vec<HistorySyncMsg>` just to scan it — only one
+/// message is decoded at a time.
 ///
-/// Best-effort on malformed bytes: stops at the first bad field, keeping records
-/// already extracted (a malformed tail no longer discards a whole conversation).
-fn extract_conversation_fields(
+/// Best-effort, mirroring the pre-buffa per-message decode: a single malformed
+/// message is skipped without discarding the rest of the conversation OR its
+/// tctoken. Decoding the whole conversation as one view (all-or-nothing) would
+/// drop every record + the tctoken on any single bad message, and would also
+/// materialize the entire conversation tree at once.
+fn extract_conversation_fields<S>(
     data: &[u8],
-    secrets_out: &mut Vec<HistoryMsgSecretRecord>,
-) -> Option<TcTokenCandidate> {
-    use prost::Message;
-
+    conversation_index: usize,
+    records: &mut Vec<HistoryMsgSecretRecord>,
+    record_sink: &mut S,
+) -> Option<TcTokenCandidate>
+where
+    S: HistoryMsgSecretRecordSink,
+{
     let mut pos = 0;
     // Conversation.id precedes messages/tctoken in tag order, so it is
     // captured before any message is processed.
@@ -1531,7 +1756,7 @@ fn extract_conversation_fields(
     let mut tc_token_sender_timestamp: Option<u64> = None;
 
     while pos < data.len() {
-        let Ok((tag, br)) = read_varint(&data[pos..]) else {
+        let Some((tag, br)) = read_varint(&data[pos..]) else {
             break;
         };
         pos += br;
@@ -1539,14 +1764,14 @@ fn extract_conversation_fields(
         let wt = (tag & 0x7) as u32;
         match (field, wt) {
             (tags::conversation::ID, wire_type::LENGTH_DELIMITED) => {
-                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                let Some((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 pos += vl;
-                let Ok(end) = checked_end(pos, len, data.len(), "conv-id") else {
+                let Some(end) = checked_end(pos, len, data.len()) else {
                     break;
                 };
-                let Ok(id) = std::str::from_utf8(&data[pos..end]) else {
+                let Some(id) = smoothutf8::from_utf8(&data[pos..end]) else {
                     // A real conversation id is a JID (always UTF-8). If it
                     // isn't, the conversation is malformed; skip it rather than
                     // pushing its secrets under an empty chat id. The id
@@ -1559,11 +1784,11 @@ fn extract_conversation_fields(
                 pos = end;
             }
             (tags::conversation::MESSAGES, wire_type::LENGTH_DELIMITED) => {
-                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                let Some((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 pos += vl;
-                let Ok(end) = checked_end(pos, len, data.len(), "conv-msg") else {
+                let Some(end) = checked_end(pos, len, data.len()) else {
                     break;
                 };
                 // The id guard keeps records from a (malformed) blob that
@@ -1573,25 +1798,38 @@ fn extract_conversation_fields(
                     match fast_extract(&data[pos..end]) {
                         FastExtract::NoRecord => {}
                         FastExtract::Record(r) => {
-                            secrets_out.push(HistoryMsgSecretRecord {
-                                chat_id: chat_id_shared
-                                    .get_or_insert_with(|| Arc::from(chat_id))
-                                    .clone(),
-                                from_me: r.from_me,
-                                key_participant: r.key_participant.map(str::to_owned),
-                                web_msg_participant: r.web_msg_participant.map(str::to_owned),
-                                msg_id: CompactString::new(r.msg_id),
-                                secret: SecretBytes::from(r.secret),
-                                timestamp: r.timestamp,
-                                is_poll_or_event: r.is_poll_or_event,
-                                is_bot_invocation: r.is_bot_invocation,
-                            });
+                            push_filtered_secret_record(
+                                HistoryMsgSecretRecordRef {
+                                    conversation_index,
+                                    chat_id,
+                                    from_me: r.from_me,
+                                    key_participant: r.key_participant,
+                                    web_msg_participant: r.web_msg_participant,
+                                    msg_id: r.msg_id,
+                                    secret: r.secret,
+                                    timestamp: r.timestamp,
+                                    is_poll_or_event: r.is_poll_or_event,
+                                    is_bot_invocation: r.is_bot_invocation,
+                                },
+                                &mut chat_id_shared,
+                                records,
+                                record_sink,
+                            );
                         }
                         // Rare wire shapes (repeated message-typed fields,
-                        // pathological nesting): prost merge is the oracle.
+                        // pathological nesting): fall back to full decode.
                         FastExtract::Fallback => {
-                            if let Ok(msg) = HistorySyncMsgInternalFields::decode(&data[pos..end]) {
-                                push_secret_record(chat_id, &mut chat_id_shared, msg, secrets_out);
+                            if let Ok(msg) =
+                                waproto::codec::history_sync_msg_decode(&data[pos..end])
+                            {
+                                push_secret_record(
+                                    chat_id,
+                                    conversation_index,
+                                    &mut chat_id_shared,
+                                    msg,
+                                    records,
+                                    record_sink,
+                                );
                             }
                         }
                     }
@@ -1599,25 +1837,25 @@ fn extract_conversation_fields(
                 pos = end;
             }
             (tags::conversation::TC_TOKEN, wire_type::LENGTH_DELIMITED) => {
-                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                let Some((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 pos += vl;
-                let Ok(end) = checked_end(pos, len, data.len(), "conv-tctoken") else {
+                let Some(end) = checked_end(pos, len, data.len()) else {
                     break;
                 };
                 tc_token = &data[pos..end];
                 pos = end;
             }
             (tags::conversation::TC_TOKEN_TIMESTAMP, wire_type::VARINT) => {
-                let Ok((v, vl)) = read_varint(&data[pos..]) else {
+                let Some((v, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 tc_token_timestamp = Some(v);
                 pos += vl;
             }
             (tags::conversation::TC_TOKEN_SENDER_TIMESTAMP, wire_type::VARINT) => {
-                let Ok((v, vl)) = read_varint(&data[pos..]) else {
+                let Some((v, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 tc_token_sender_timestamp = Some(v);
@@ -1649,86 +1887,225 @@ fn extract_conversation_fields(
     })
 }
 
-/// Extract a single message's secret record (if any) into `out`. The decode +
-/// forwarded/poll/bot detection stays in prost via the typed fields/methods.
+/// Extract a single message's secret record (if any) into `out`.
 /// `chat_id_shared` memoizes the conversation id `Arc` so it is allocated only
 /// when the first record is actually pushed.
-fn push_secret_record(
+fn push_secret_record<S>(
     chat_id: &str,
+    conversation_index: usize,
     chat_id_shared: &mut Option<Arc<str>>,
-    mut history_msg: HistorySyncMsgInternalFields,
+    history_msg: wa::HistorySyncMsg,
     out: &mut Vec<HistoryMsgSecretRecord>,
-) {
-    // Takes `history_msg` by value: the message is decoded fresh per record and
-    // dropped right after, so the owned fields are moved into the record instead
-    // of cloned.
-    let Some(web_msg) = history_msg.message.as_mut() else {
+    record_sink: &mut S,
+) where
+    S: HistoryMsgSecretRecordSink,
+{
+    let Some(web_msg) = history_msg.message.as_option() else {
         return;
     };
-    let Some(key) = web_msg.key.as_ref() else {
+    let Some(key) = web_msg.key.as_option() else {
         return;
     };
-    if key.id.is_none() {
+    let Some(msg_id) = key.id.as_deref() else {
         return;
-    }
-    let from_me = key.from_me == Some(true);
-
-    if let Some(message) = web_msg.message.as_ref()
-        && message.is_forwarded()
+    };
+    if web_msg
+        .message
+        .as_option()
+        .is_some_and(message_is_forwarded)
     {
         return;
     }
-
-    // Read the Copy-flag fields by borrow before moving any owned field out.
-    let is_poll_or_event = web_msg
-        .message
-        .as_ref()
-        .map(|m| m.is_poll_or_event())
-        .unwrap_or(false);
-    let is_bot_invocation = web_msg
-        .message
-        .as_ref()
-        .map(|m| m.invokes_bot())
-        .unwrap_or(false);
-    let timestamp = web_msg.message_timestamp;
-
-    // Top-level message_secret takes priority over the context-info one (same
-    // order as the previous `or_else`); take it rather than clone.
-    let secret = if web_msg.message_secret.is_some() {
-        web_msg.message_secret.take()
-    } else {
+    let Some(secret) = web_msg.message_secret.as_deref().or_else(|| {
         web_msg
             .message
-            .as_mut()
-            .and_then(|m| m.message_context_info.as_mut())
-            .and_then(|mci| mci.message_secret.take())
-    };
-    let Some(secret) = secret else {
+            .as_option()
+            .and_then(extract_message_context_secret)
+    }) else {
         return;
     };
 
-    let key = web_msg.key.as_mut().expect("key presence checked above");
-    let msg_id = key.id.take().expect("id presence checked above");
-    let key_participant = key.participant.take();
-    let web_msg_participant = web_msg.participant.take();
+    let inner = web_msg.message.as_option();
+    let is_poll_or_event = inner.is_some_and(message_is_poll_or_event);
+    let is_bot_invocation = inner.is_some_and(message_invokes_bot);
 
-    out.push(HistoryMsgSecretRecord {
-        chat_id: chat_id_shared
-            .get_or_insert_with(|| Arc::from(chat_id))
-            .clone(),
-        from_me,
-        key_participant,
-        web_msg_participant,
-        msg_id: msg_id.into(),
-        secret: secret.into(),
-        timestamp,
-        is_poll_or_event,
-        is_bot_invocation,
-    });
+    push_filtered_secret_record(
+        HistoryMsgSecretRecordRef {
+            conversation_index,
+            chat_id,
+            from_me: key.from_me.unwrap_or(false),
+            key_participant: key.participant.as_deref(),
+            web_msg_participant: web_msg.participant.as_deref(),
+            msg_id,
+            secret,
+            timestamp: web_msg.message_timestamp,
+            is_poll_or_event,
+            is_bot_invocation,
+        },
+        chat_id_shared,
+        out,
+        record_sink,
+    );
+}
+
+#[inline]
+fn push_filtered_secret_record<S>(
+    candidate: HistoryMsgSecretRecordRef<'_>,
+    chat_id_shared: &mut Option<Arc<str>>,
+    out: &mut Vec<HistoryMsgSecretRecord>,
+    record_sink: &mut S,
+) where
+    S: HistoryMsgSecretRecordSink,
+{
+    if record_sink.retain(candidate) {
+        out.push(candidate.into_owned(chat_id_shared));
+    }
+}
+
+fn base_message_view(message: &wa::Message) -> &wa::Message {
+    let mut current = message;
+    let mut depth = 0usize;
+    while depth < MAX_MESSAGE_WRAP_DEPTH {
+        match first_wrapped_message(current) {
+            Some(inner) => {
+                current = inner;
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+    current
+}
+
+/// Whether the (unwrapped) message is a poll-creation or event message. These
+/// carry the longer poll/event retention horizon.
+fn message_is_poll_or_event(message: &wa::Message) -> bool {
+    let base = base_message_view(message);
+    base.poll_creation_message.as_option().is_some()
+        || base.poll_creation_message_v2.as_option().is_some()
+        || base.poll_creation_message_v3.as_option().is_some()
+        || base.event_message.as_option().is_some()
+}
+
+/// Whether the message invokes a bot, detected via `botMetadata` presence.
+/// botMetadata sits on the top-level `MessageContextInfo` even when wrapped,
+/// so check both the outer message and the unwrapped base.
+fn message_invokes_bot(message: &wa::Message) -> bool {
+    let has = |m: &wa::Message| {
+        m.message_context_info
+            .as_option()
+            .is_some_and(|c| c.bot_metadata.as_option().is_some())
+    };
+    has(message) || has(base_message_view(message))
+}
+
+fn extract_message_context_secret(message: &wa::Message) -> Option<&[u8]> {
+    message
+        .message_context_info
+        .as_option()?
+        .message_secret
+        .as_deref()
+}
+
+fn message_is_forwarded(message: &wa::Message) -> bool {
+    message_is_forwarded_at_depth(message, 0)
+}
+
+fn message_is_forwarded_at_depth(message: &wa::Message, depth: usize) -> bool {
+    if depth >= MAX_MESSAGE_WRAP_DEPTH {
+        return false;
+    }
+
+    if let Some(inner) = first_wrapped_message(message) {
+        return message_is_forwarded_at_depth(inner, depth + 1);
+    }
+
+    message_context_is_forwarded(message)
+}
+
+fn first_wrapped_message(message: &wa::Message) -> Option<&wa::Message> {
+    if let Some(wrapper) = message.device_sent_message.as_option()
+        && let Some(inner) = wrapper.message.as_option()
+    {
+        return Some(inner);
+    }
+
+    macro_rules! future_proof_inner {
+        ($($field:ident),* $(,)?) => {
+            $(
+                if let Some(wrapper) = message.$field.as_option()
+                    && let Some(inner) = wrapper.message.as_option()
+                {
+                    return Some(inner);
+                }
+            )*
+        };
+    }
+
+    future_proof_inner!(
+        ephemeral_message,
+        view_once_message,
+        view_once_message_v2,
+        document_with_caption_message,
+        edited_message,
+    );
+
+    None
+}
+
+fn message_context_is_forwarded(message: &wa::Message) -> bool {
+    macro_rules! has_forwarded_context {
+        ($($field:ident),* $(,)?) => {
+            $(
+                if message.$field.as_option()
+                    .and_then(|m| m.context_info.as_option())
+                    .is_some_and(context_info_is_forwarded)
+                {
+                    return true;
+                }
+            )*
+        };
+    }
+
+    has_forwarded_context!(
+        event_message,
+        template_message,
+        template_button_reply_message,
+        buttons_response_message,
+        list_response_message,
+        poll_creation_message,
+        poll_creation_message_v2,
+        poll_creation_message_v3,
+        newsletter_admin_invite_message,
+        group_invite_message,
+        list_message,
+        buttons_message,
+        sticker_pack_message,
+        interactive_message,
+        interactive_response_message,
+        image_message,
+        contact_message,
+        location_message,
+        extended_text_message,
+        document_message,
+        audio_message,
+        video_message,
+        contacts_array_message,
+        live_location_message,
+        sticker_message,
+        product_message,
+        order_message,
+    );
+
+    false
+}
+
+fn context_info_is_forwarded(context: &wa::ContextInfo) -> bool {
+    context.is_forwarded == Some(true)
 }
 
 /// Tctoken data extracted from a conversation during streaming.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TcTokenCandidate {
     pub id: String,
     pub tc_token: Vec<u8>,
@@ -1737,11 +2114,12 @@ pub struct TcTokenCandidate {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use buffa::Message;
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
-    use prost::Message;
     use std::io::Write;
     use waproto::whatsapp as wa;
 
@@ -1753,13 +2131,74 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    /// `phoneNumberToLidMappings` (field 15) is the bulk PN-LID identity seed;
+    /// valid pairs (including legacy `@c.us` phones and device-suffixed users)
+    /// are extracted, wrong namespaces and incomplete entries are skipped
+    /// without aborting the sync.
+    #[test]
+    fn test_lid_mappings_extracted_and_invalid_skipped() {
+        let mapping = |pn: &str, lid: &str| wa::PhoneNumberToLIDMapping {
+            pn_jid: Some(pn.to_string()),
+            lid_jid: Some(lid.to_string()),
+        };
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            phone_number_to_lid_mappings: vec![
+                mapping("5511777776666@s.whatsapp.net", "111222333444555@lid"),
+                // Legacy PN namespace, still a phone.
+                mapping("15550001111@c.us", "222333444555666@lid"),
+                // Device suffix reduces to the bare user.
+                mapping("5511222223333:2@s.whatsapp.net", "333444555666777@lid"),
+                // Wrong namespaces: skipped.
+                mapping("999888777666555@lid", "111222333444555@lid"),
+                mapping(
+                    "5511777776666@s.whatsapp.net",
+                    "5511777776666@s.whatsapp.net",
+                ),
+                // Incomplete: skipped.
+                wa::PhoneNumberToLIDMapping {
+                    pn_jid: Some("5511000000000@s.whatsapp.net".to_string()),
+                    lid_jid: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(
+            result.lid_mappings,
+            vec![
+                HistoryLidMapping {
+                    phone_number: "5511777776666".to_string(),
+                    lid: "111222333444555".to_string(),
+                },
+                HistoryLidMapping {
+                    phone_number: "15550001111".to_string(),
+                    lid: "222333444555666".to_string(),
+                },
+                HistoryLidMapping {
+                    phone_number: "5511222223333".to_string(),
+                    lid: "333444555666777".to_string(),
+                },
+            ]
+        );
+    }
+
     /// Prost-only oracle: what the pre-fast-path pipeline produced for one
     /// raw `HistorySyncMsg`. The fast path must match this exactly.
     fn oracle_records(raw_msg: &[u8]) -> Vec<HistoryMsgSecretRecord> {
         let mut out = Vec::new();
         let mut shared = None;
-        if let Ok(msg) = HistorySyncMsgInternalFields::decode(raw_msg) {
-            push_secret_record("5511777776666@s.whatsapp.net", &mut shared, msg, &mut out);
+        let mut accept_all = FilteredRecordSink(|_: HistoryMsgSecretRecordRef<'_>| true);
+        if let Ok(msg) = wa::HistorySyncMsg::decode_from_slice(raw_msg) {
+            push_secret_record(
+                "5511777776666@s.whatsapp.net",
+                0,
+                &mut shared,
+                msg,
+                &mut out,
+                &mut accept_all,
+            );
         }
         out
     }
@@ -1784,7 +2223,7 @@ mod tests {
 
     fn wrap_in_history_msg(web_msg: &wa::WebMessageInfo) -> Vec<u8> {
         wa::HistorySyncMsg {
-            message: Some(Box::new(web_msg.clone())),
+            message: buffa::MessageField::some(web_msg.clone()),
             ..Default::default()
         }
         .encode_to_vec()
@@ -1799,28 +2238,28 @@ mod tests {
 
     fn keyed(id: &str, from_me: bool, message: Option<wa::Message>) -> wa::WebMessageInfo {
         wa::WebMessageInfo {
-            key: wa::MessageKey {
+            key: buffa::MessageField::some(wa::MessageKey {
                 from_me: Some(from_me),
                 id: Some(id.to_string()),
                 ..Default::default()
-            },
-            message: message.map(Box::new),
+            }),
+            message: message.map(buffa::MessageField::some).unwrap_or_default(),
             message_timestamp: Some(1_700_000_777),
             ..Default::default()
         }
     }
 
-    fn fp(inner: wa::Message) -> Box<wa::message::FutureProofMessage> {
-        Box::new(wa::message::FutureProofMessage {
-            message: Some(Box::new(inner)),
-        })
+    fn fp(inner: wa::Message) -> wa::message::FutureProofMessage {
+        wa::message::FutureProofMessage {
+            message: buffa::MessageField::some(inner),
+        }
     }
 
-    /// Differential corpus: every structurally interesting shape, prost-built
+    /// Differential corpus: every structurally interesting shape, buffa-built
     /// and hand-crafted, must extract identically through the fast path and
-    /// the prost oracle.
+    /// the full-decode oracle.
     #[test]
-    fn differential_fast_path_matches_prost_oracle() {
+    fn differential_fast_path_matches_full_decode_oracle() {
         let emit = emit_len_field;
         let secret = vec![0x5Au8; 32];
         let mut corpus: Vec<(String, Vec<u8>)> = Vec::new();
@@ -1847,7 +2286,7 @@ mod tests {
                 "A3",
                 false,
                 Some(wa::Message {
-                    message_context_info: Some(Box::new(secret_ctx(&secret))),
+                    message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
                     ..Default::default()
                 }),
             )),
@@ -1856,7 +2295,7 @@ mod tests {
             "A4",
             false,
             Some(wa::Message {
-                message_context_info: Some(Box::new(secret_ctx(&[0xBB; 32]))),
+                message_context_info: buffa::MessageField::some(secret_ctx(&[0xBB; 32])),
                 ..Default::default()
             }),
         );
@@ -1869,15 +2308,17 @@ mod tests {
                     "A5",
                     false,
                     Some(wa::Message {
-                        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
-                            text: Some("x".into()),
-                            context_info: Some(Box::new(wa::ContextInfo {
-                                is_forwarded: Some(fwd),
+                        extended_text_message: buffa::MessageField::some(
+                            wa::message::ExtendedTextMessage {
+                                text: Some("x".into()),
+                                context_info: buffa::MessageField::some(wa::ContextInfo {
+                                    is_forwarded: Some(fwd),
+                                    ..Default::default()
+                                }),
                                 ..Default::default()
-                            })),
-                            ..Default::default()
-                        })),
-                        message_context_info: Some(Box::new(secret_ctx(&secret))),
+                            },
+                        ),
+                        message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
                         ..Default::default()
                     }),
                 )),
@@ -1888,14 +2329,14 @@ mod tests {
                 "A6",
                 false,
                 Some(wa::Message {
-                    ephemeral_message: Some(fp(wa::Message {
-                        image_message: Some(Box::new(wa::message::ImageMessage {
-                            context_info: Some(Box::new(wa::ContextInfo {
+                    ephemeral_message: buffa::MessageField::some(fp(wa::Message {
+                        image_message: buffa::MessageField::some(wa::message::ImageMessage {
+                            context_info: buffa::MessageField::some(wa::ContextInfo {
                                 is_forwarded: Some(true),
                                 ..Default::default()
-                            })),
+                            }),
                             ..Default::default()
-                        })),
+                        }),
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -1910,14 +2351,16 @@ mod tests {
                 "A7",
                 false,
                 Some(wa::Message {
-                    view_once_message_v2: Some(fp(wa::Message {
-                        poll_creation_message: Some(Box::new(wa::message::PollCreationMessage {
-                            name: Some("poll".into()),
-                            ..Default::default()
-                        })),
+                    view_once_message_v2: buffa::MessageField::some(fp(wa::Message {
+                        poll_creation_message: buffa::MessageField::some(
+                            wa::message::PollCreationMessage {
+                                name: Some("poll".into()),
+                                ..Default::default()
+                            },
+                        ),
                         ..Default::default()
                     })),
-                    message_context_info: Some(Box::new(secret_ctx(&secret))),
+                    message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
                     ..Default::default()
                 }),
             )),
@@ -1927,20 +2370,24 @@ mod tests {
                 "A8",
                 true,
                 Some(wa::Message {
-                    device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
-                        destination_jid: Some("5511777776666@s.whatsapp.net".into()),
-                        message: Some(Box::new(wa::Message {
-                            ephemeral_message: Some(fp(wa::Message {
-                                event_message: Some(Box::new(wa::message::EventMessage {
-                                    name: Some("ev".into()),
+                    device_sent_message: buffa::MessageField::some(
+                        wa::message::DeviceSentMessage {
+                            destination_jid: Some("5511777776666@s.whatsapp.net".into()),
+                            message: buffa::MessageField::some(wa::Message {
+                                ephemeral_message: buffa::MessageField::some(fp(wa::Message {
+                                    event_message: buffa::MessageField::some(
+                                        wa::message::EventMessage {
+                                            name: Some("ev".into()),
+                                            ..Default::default()
+                                        },
+                                    ),
                                     ..Default::default()
                                 })),
                                 ..Default::default()
-                            })),
-                            ..Default::default()
-                        })),
-                        phash: None,
-                    })),
+                            }),
+                            phash: None,
+                        },
+                    ),
                     ..Default::default()
                 }),
             );
@@ -1953,11 +2400,11 @@ mod tests {
                 "A9",
                 false,
                 Some(wa::Message {
-                    message_context_info: Some(Box::new(wa::MessageContextInfo {
+                    message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                         message_secret: Some(secret.clone()),
-                        bot_metadata: Some(wa::BotMetadata::default()),
+                        bot_metadata: buffa::MessageField::some(wa::BotMetadata::default()),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 }),
             )),
@@ -1967,11 +2414,11 @@ mod tests {
                 "A10",
                 false,
                 Some(wa::Message {
-                    ephemeral_message: Some(fp(wa::Message {
-                        message_context_info: Some(Box::new(wa::MessageContextInfo {
-                            bot_metadata: Some(wa::BotMetadata::default()),
+                    ephemeral_message: buffa::MessageField::some(fp(wa::Message {
+                        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                            bot_metadata: buffa::MessageField::some(wa::BotMetadata::default()),
                             ..Default::default()
-                        })),
+                        }),
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -1986,26 +2433,26 @@ mod tests {
                 "A11",
                 false,
                 Some(wa::Message {
-                    edited_message: Some(fp(wa::Message {
-                        poll_creation_message_v3: Some(Box::new(
+                    edited_message: buffa::MessageField::some(fp(wa::Message {
+                        poll_creation_message_v3: buffa::MessageField::some(
                             wa::message::PollCreationMessage::default(),
-                        )),
+                        ),
                         ..Default::default()
                     })),
-                    message_context_info: Some(Box::new(secret_ctx(&secret))),
+                    message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
                     ..Default::default()
                 }),
             )),
         );
         add("missing key id, top secret", {
-            let mut wm = wa::WebMessageInfo {
-                key: wa::MessageKey {
+            let wm = wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
                     from_me: Some(false),
                     ..Default::default()
-                },
+                }),
+                message_secret: Some(secret.clone()),
                 ..Default::default()
             };
-            wm.message_secret = Some(secret.clone());
             wrap_in_history_msg(&wm)
         });
         add("no key at all, top secret", {
@@ -2016,10 +2463,18 @@ mod tests {
             wrap_in_history_msg(&wm)
         });
         add("participants on key and web msg", {
-            let mut wm = keyed("A12", false, None);
-            wm.key.participant = Some("5511888889999@s.whatsapp.net".into());
-            wm.participant = Some("5511888887777@s.whatsapp.net".into());
-            wm.message_secret = Some(secret.clone());
+            let wm = wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
+                    from_me: Some(false),
+                    id: Some("A12".to_string()),
+                    participant: Some("5511888889999@s.whatsapp.net".into()),
+                    ..Default::default()
+                }),
+                participant: Some("5511888887777@s.whatsapp.net".into()),
+                message_secret: Some(secret.clone()),
+                message_timestamp: Some(1_700_000_777),
+                ..Default::default()
+            };
             wrap_in_history_msg(&wm)
         });
         add("empty top-level secret", {
@@ -2046,7 +2501,7 @@ mod tests {
         }
         .encode_to_vec();
         let msg_secret = wa::Message {
-            message_context_info: Some(Box::new(secret_ctx(&secret))),
+            message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
             ..Default::default()
         }
         .encode_to_vec();
@@ -2104,6 +2559,19 @@ mod tests {
 
         let mut web = Vec::new();
         emit(&mut web, tags::web_message_info::KEY, &key_a12);
+        emit(&mut web, tags::web_message_info::PARTICIPANT, &[0xFF, 0xFE]);
+        emit(
+            &mut web,
+            tags::web_message_info::PARTICIPANT,
+            b"5511888887777@s.whatsapp.net",
+        );
+        emit(&mut web, tags::web_message_info::MESSAGE_SECRET, &secret);
+        let mut raw = Vec::new();
+        emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
+        add("invalid UTF-8 in overwritten web participant", raw);
+
+        let mut web = Vec::new();
+        emit(&mut web, tags::web_message_info::KEY, &key_a12);
         emit(&mut web, tags::web_message_info::MESSAGE_SECRET, &secret);
         let tag = (tags::web_message_info::MESSAGE_TIMESTAMP << 3) | wire_type::LENGTH_DELIMITED;
         web.push(tag as u8);
@@ -2132,10 +2600,10 @@ mod tests {
         // Repeated occurrences of the same carrier: prost merges their
         // contextInfo fields; the eager overwrite-when-present walk must agree.
         let etm_fwd = wa::message::ExtendedTextMessage {
-            context_info: Some(Box::new(wa::ContextInfo {
+            context_info: buffa::MessageField::some(wa::ContextInfo {
                 is_forwarded: Some(true),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         }
         .encode_to_vec();
@@ -2176,15 +2644,17 @@ mod tests {
 
         // Repeated ephemeral wrapper occurrences: inner messages merge.
         let eph_poll = wa::Message {
-            ephemeral_message: Some(fp(wa::Message {
-                poll_creation_message: Some(Box::new(wa::message::PollCreationMessage::default())),
+            ephemeral_message: buffa::MessageField::some(fp(wa::Message {
+                poll_creation_message: buffa::MessageField::some(
+                    wa::message::PollCreationMessage::default(),
+                ),
                 ..Default::default()
             })),
             ..Default::default()
         }
         .encode_to_vec();
         let eph_text = wa::Message {
-            ephemeral_message: Some(fp(wa::Message {
+            ephemeral_message: buffa::MessageField::some(fp(wa::Message {
                 conversation: Some("t".into()),
                 ..Default::default()
             })),
@@ -2239,7 +2709,9 @@ mod tests {
         // proto recurses per level and overflows the test stack.
         for depth in [50usize, 120] {
             let mut msg = wa::Message {
-                poll_creation_message: Some(Box::new(wa::message::PollCreationMessage::default())),
+                poll_creation_message: buffa::MessageField::some(
+                    wa::message::PollCreationMessage::default(),
+                ),
                 ..Default::default()
             }
             .encode_to_vec();
@@ -2293,6 +2765,65 @@ mod tests {
             .msg_secret_records
     }
 
+    /// The density reserve must not clamp when a SINGLE conversation reaches
+    /// the sample threshold: parsed_bytes includes the pending (just yielded)
+    /// field, so the denominator covers the conversation whose records were
+    /// counted. With the exclusive form the denominator was ~0 and the
+    /// estimate hit RECORD_RESERVE_CAP, over-reserving ~2 MB.
+    #[test]
+    fn test_reserve_single_big_conversation_does_not_clamp() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let mut conv = Vec::new();
+        emit_len_field(&mut conv, tags::conversation::ID, chat.as_bytes());
+        let total_msgs = 200usize;
+        for i in 0..total_msgs {
+            let wm = wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
+                    from_me: Some(false),
+                    id: Some(format!("MSG{i:04}")),
+                    ..Default::default()
+                }),
+                // Varied payload so zlib does not flatten the blob to nothing.
+                message_secret: Some(vec![(i % 251) as u8; 32]),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let mut history_msg = Vec::new();
+            emit_len_field(&mut history_msg, tags::history_sync_msg::MESSAGE, &wm);
+            emit_len_field(&mut conv, tags::conversation::MESSAGES, &history_msg);
+        }
+        let mut hs = Vec::new();
+        emit_len_field(&mut hs, tags::history_sync::CONVERSATIONS, &conv);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let records = process_history_sync(compressed, None, false)
+            .unwrap()
+            .msg_secret_records;
+        assert_eq!(records.len(), total_msgs);
+        assert!(
+            records.capacity() < 2048,
+            "estimate should track the real count (~{total_msgs}), got capacity {}",
+            records.capacity()
+        );
+    }
+
+    /// The zlib-ratio extrapolation is exact once the stream fully inflates.
+    #[test]
+    fn test_estimated_total_out_exact_after_drain() {
+        let mut hs = Vec::new();
+        emit_len_field(&mut hs, tags::history_sync::PUSHNAMES, b"\x0a\x03abc");
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut walker = FieldWalker::new(&compressed, MAX_DECOMPRESSED);
+        while walker.next_field().unwrap().is_some() {}
+        assert_eq!(walker.estimated_total_out(), walker.total_out());
+        assert_eq!(walker.total_out(), hs.len() as u64);
+    }
+
     /// A (malformed) conversation that carries messages BEFORE its id must not
     /// emit records under an empty chat id.
     #[test]
@@ -2304,11 +2835,11 @@ mod tests {
         };
 
         let web_msg = wa::WebMessageInfo {
-            key: wa::MessageKey {
+            key: buffa::MessageField::some(wa::MessageKey {
                 from_me: Some(false),
                 id: Some("EARLY_MSG".into()),
                 ..Default::default()
-            },
+            }),
             message_secret: Some(vec![0x22u8; 32]),
             ..Default::default()
         }
@@ -2367,10 +2898,10 @@ mod tests {
         }
         .encode_to_vec();
         let msg_with_secret = wa::Message {
-            message_context_info: Some(Box::new(wa::MessageContextInfo {
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                 message_secret: Some(vec![0x11u8; 32]),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         }
         .encode_to_vec();
@@ -2445,20 +2976,20 @@ mod tests {
     fn test_empty_secret_still_yields_record() {
         let chat = "5511777776666@s.whatsapp.net";
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(Box::new(wa::WebMessageInfo {
-                        key: wa::MessageKey {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some("EMPTY_SECRET".to_string()),
                             ..Default::default()
-                        },
+                        }),
                         message_secret: Some(Vec::new()),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2476,7 +3007,7 @@ mod tests {
     fn test_nct_salt_extracted_from_history_sync() {
         let salt = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             nct_salt: Some(salt.clone()),
             ..Default::default()
         };
@@ -2490,7 +3021,7 @@ mod tests {
     #[test]
     fn test_nct_salt_none_when_absent() {
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             ..Default::default()
         };
 
@@ -2504,7 +3035,7 @@ mod tests {
     fn test_nct_salt_and_pushname_coexist() {
         let salt = vec![0x01, 0x02, 0x03];
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             nct_salt: Some(salt.clone()),
             pushnames: vec![wa::Pushname {
                 id: Some("0000000000".into()),
@@ -2521,46 +3052,58 @@ mod tests {
     }
 
     #[test]
+    fn read_varint_rejects_overflowing_tenth_byte() {
+        let overflowing = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+
+        assert!(
+            read_varint(&overflowing).is_none(),
+            "10th byte above 0x01 must fail"
+        );
+    }
+
+    #[test]
     fn test_message_secrets_extracted_from_history_sync() {
         let chat = "5511777776666@s.whatsapp.net";
         let participant = "5511888889999@s.whatsapp.net";
         let top_level_secret = vec![0x44u8; 32];
         let context_secret = vec![0x55u8; 32];
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![
                     wa::HistorySyncMsg {
-                        message: Some(Box::new(wa::WebMessageInfo {
-                            key: wa::MessageKey {
+                        message: buffa::MessageField::some(wa::WebMessageInfo {
+                            key: buffa::MessageField::some(wa::MessageKey {
                                 remote_jid: Some(chat.to_string()),
                                 from_me: Some(false),
                                 id: Some("HIST_TOP_LEVEL".to_string()),
                                 participant: Some(participant.to_string()),
-                            },
+                            }),
                             message_secret: Some(top_level_secret.clone()),
                             ..Default::default()
-                        })),
+                        }),
                         ..Default::default()
                     },
                     wa::HistorySyncMsg {
-                        message: Some(Box::new(wa::WebMessageInfo {
-                            key: wa::MessageKey {
+                        message: buffa::MessageField::some(wa::WebMessageInfo {
+                            key: buffa::MessageField::some(wa::MessageKey {
                                 remote_jid: Some(chat.to_string()),
                                 from_me: Some(true),
                                 id: Some("HIST_CONTEXT".to_string()),
                                 participant: None,
-                            },
-                            message: Some(Box::new(wa::Message {
-                                message_context_info: Some(Box::new(wa::MessageContextInfo {
-                                    message_secret: Some(context_secret.clone()),
-                                    ..Default::default()
-                                })),
+                            }),
+                            message: buffa::MessageField::some(wa::Message {
+                                message_context_info: buffa::MessageField::some(
+                                    wa::MessageContextInfo {
+                                        message_secret: Some(context_secret.clone()),
+                                        ..Default::default()
+                                    },
+                                ),
                                 ..Default::default()
-                            })),
+                            }),
                             ..Default::default()
-                        })),
+                        }),
                         ..Default::default()
                     },
                 ],
@@ -2592,35 +3135,66 @@ mod tests {
     }
 
     #[test]
-    fn test_top_level_message_secret_takes_priority_over_context() {
-        // A message carrying BOTH the top-level WebMessageInfo.message_secret and a
-        // nested message_context_info.message_secret must extract the top-level one
-        // (the move-based push_secret_record must `.take()` the right source).
+    fn borrowed_record_filter_runs_before_owned_records_are_collected() {
         let chat = "5511777776666@s.whatsapp.net";
-        let top_level_secret = vec![0xAAu8; 32];
-        let context_secret = vec![0xBBu8; 32];
+        let mut dropped = keyed("DROP", false, None);
+        dropped.message_secret = Some(vec![0x11; 32]);
+        let mut kept = keyed("KEEP", true, None);
+        kept.message_secret = Some(vec![0x22; 32]);
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: buffa::MessageField::some(dropped),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: buffa::MessageField::some(kept),
+                        ..Default::default()
+                    },
+                ],
+                tc_token: Some(vec![0x33; 8]),
+                tc_token_timestamp: Some(123),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut visited = Vec::new();
+        let result = process_history_sync_bytes_filtered(
+            Bytes::from(encode_and_compress(&hs)),
+            None,
+            false,
+            |record| {
+                assert_eq!(record.conversation_index, 0);
+                assert_eq!(record.chat_id, chat);
+                assert_eq!(record.secret.len(), 32);
+                visited.push(record.msg_id.to_string());
+                record.msg_id == "KEEP"
+            },
+        )
+        .unwrap();
+
+        assert_eq!(visited, ["DROP", "KEEP"]);
+        assert_eq!(result.conversations_processed, 1);
+        assert_eq!(result.tc_token_candidates.len(), 1);
+        assert_eq!(result.msg_secret_records.len(), 1);
+        assert_eq!(result.msg_secret_records[0].msg_id, "KEEP");
+        assert!(result.msg_secret_records[0].from_me);
+    }
+
+    #[test]
+    fn borrowed_record_visitor_avoids_owned_record_collection() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let mut message = keyed("VISIT", false, None);
+        message.message_secret = Some(vec![0x44; 32]);
+        let hs = wa::HistorySync {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(Box::new(wa::WebMessageInfo {
-                        key: wa::MessageKey {
-                            remote_jid: Some(chat.to_string()),
-                            from_me: Some(false),
-                            id: Some("HIST_BOTH".to_string()),
-                            participant: Some("5511888889999@s.whatsapp.net".to_string()),
-                        },
-                        message_secret: Some(top_level_secret.clone()),
-                        message: Some(Box::new(wa::Message {
-                            message_context_info: Some(Box::new(wa::MessageContextInfo {
-                                message_secret: Some(context_secret.clone()),
-                                ..Default::default()
-                            })),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    })),
+                    message: buffa::MessageField::some(message),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2628,56 +3202,227 @@ mod tests {
             ..Default::default()
         };
 
-        let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, None, false).unwrap();
+        let mut visited = Vec::new();
+        let result = process_history_sync_bytes_with_record_visitor(
+            Bytes::from(encode_and_compress(&hs)),
+            None,
+            false,
+            |record| visited.push((record.chat_id.to_owned(), record.msg_id.to_owned())),
+        )
+        .unwrap();
 
-        assert_eq!(result.msg_secret_records.len(), 1);
-        assert_eq!(result.msg_secret_records[0].msg_id, "HIST_BOTH");
-        assert_eq!(
-            result.msg_secret_records[0].secret.as_slice(),
-            top_level_secret,
-            "top-level message_secret must win over the context-info one"
-        );
-        assert_eq!(
-            result.msg_secret_records[0].key_participant.as_deref(),
-            Some("5511888889999@s.whatsapp.net")
-        );
+        assert_eq!(visited, [(chat.to_owned(), "VISIT".to_owned())]);
+        assert!(result.msg_secret_records.is_empty());
+    }
+
+    #[test]
+    fn borrowed_record_visitor_receives_bounded_capacity_hint() {
+        const RECORD_COUNT: usize = 256;
+
+        struct ReservingVisitor {
+            visits: std::rc::Rc<std::cell::Cell<usize>>,
+            largest_reserve: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl HistoryMsgSecretRecordVisitor for ReservingVisitor {
+            fn visit(&mut self, _record: HistoryMsgSecretRecordRef<'_>) -> usize {
+                self.visits.set(self.visits.get() + 1);
+                1
+            }
+
+            fn reserve(&mut self, additional: usize) {
+                self.largest_reserve
+                    .set(self.largest_reserve.get().max(additional));
+            }
+
+            fn retained_item_size(&self) -> Option<std::num::NonZeroUsize> {
+                std::num::NonZeroUsize::new(std::mem::size_of::<u64>())
+            }
+        }
+
+        let messages = (0..RECORD_COUNT)
+            .map(|index| {
+                let mut message = keyed(&format!("VISIT_{index}"), false, None);
+                message.message_secret = Some(vec![0x44; 32]);
+                wa::HistorySyncMsg {
+                    message: buffa::MessageField::some(message),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let hs = wa::HistorySync {
+            conversations: vec![wa::Conversation {
+                id: "5511777776666@s.whatsapp.net".to_string(),
+                messages,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let visits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let largest_reserve = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        let result = process_history_sync_bytes_with_record_sink(
+            Bytes::from(encode_and_compress(&hs)),
+            None,
+            false,
+            ReservingVisitor {
+                visits: std::rc::Rc::clone(&visits),
+                largest_reserve: std::rc::Rc::clone(&largest_reserve),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(visits.get(), RECORD_COUNT);
+        assert!(largest_reserve.get() > 0);
+        assert!(result.msg_secret_records.is_empty());
+    }
+
+    /// Regression: a single malformed message inside a conversation must NOT
+    /// discard the conversation's other message secrets or its tctoken. The
+    /// pre-fix code decoded the whole conversation as one view (all-or-nothing),
+    /// so one bad message dropped everything.
+    #[test]
+    fn malformed_message_does_not_drop_conversation_secrets_or_tctoken() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let secret = vec![0x44u8; 32];
+        let tc_token = vec![0x99u8; 16];
+
+        // Hand-build the conversation bytes: id (1), a valid message (2), a
+        // CORRUPT message (2) with a length-delimited subfield whose declared
+        // length runs past its own bytes, then tctoken (21) + ts (22).
+        fn write_tag(buf: &mut Vec<u8>, field: u32, wt: u32) {
+            let tag = (field << 3) | wt;
+            let mut v = tag as u64;
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v != 0 {
+                    buf.push(b | 0x80);
+                } else {
+                    buf.push(b);
+                    break;
+                }
+            }
+        }
+        fn write_len(buf: &mut Vec<u8>, mut n: u64) {
+            loop {
+                let b = (n & 0x7f) as u8;
+                n >>= 7;
+                if n != 0 {
+                    buf.push(b | 0x80);
+                } else {
+                    buf.push(b);
+                    break;
+                }
+            }
+        }
+        fn write_ld(buf: &mut Vec<u8>, field: u32, payload: &[u8]) {
+            write_tag(buf, field, 2);
+            write_len(buf, payload.len() as u64);
+            buf.extend_from_slice(payload);
+        }
+
+        let valid_msg = wa::HistorySyncMsg {
+            message: buffa::MessageField::some(wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some(chat.to_string()),
+                    from_me: Some(false),
+                    id: Some("GOOD_MSG".to_string()),
+                    participant: None,
+                }),
+                message_secret: Some(secret.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        // Corrupt message: field 1 (LEN) claims 50 bytes but only 1 follows.
+        let corrupt_msg = {
+            let mut m = Vec::new();
+            write_tag(&mut m, 1, 2);
+            write_len(&mut m, 50);
+            m.push(0x00);
+            m
+        };
+
+        let mut conv = Vec::new();
+        write_ld(&mut conv, 1, chat.as_bytes()); // id
+        write_ld(&mut conv, 2, &corrupt_msg); // bad message FIRST (worst case)
+        write_ld(&mut conv, 2, &valid_msg); // good message after the bad one
+        write_ld(&mut conv, 21, &tc_token); // tctoken
+        write_tag(&mut conv, 22, 0); // tctoken timestamp (varint)
+        write_len(&mut conv, 1_700_000_000);
+
+        // Wrap conv as HistorySync.conversations[0] (field 2).
+        let mut hs_bytes = Vec::new();
+        write_tag(&mut hs_bytes, 1, 0); // sync_type (varint)
+        // INITIAL_BOOTSTRAP = 0 on the wire
+        write_len(&mut hs_bytes, 0u64);
+        write_ld(&mut hs_bytes, 2, &conv);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs_bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Both paths (full retain + streaming) must keep the good secret + tctoken.
+        for retain in [true, false] {
+            let result = process_history_sync(compressed.clone(), None, retain).unwrap();
+            assert_eq!(
+                result.msg_secret_records.len(),
+                1,
+                "good message secret must survive a malformed sibling (retain={retain})"
+            );
+            assert_eq!(result.msg_secret_records[0].msg_id, "GOOD_MSG");
+            assert_eq!(
+                result.msg_secret_records[0].secret.as_slice(),
+                secret.as_slice()
+            );
+            assert_eq!(
+                result.tc_token_candidates.len(),
+                1,
+                "tctoken must survive a malformed message (retain={retain})"
+            );
+            assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
+        }
     }
 
     #[test]
     fn test_forwarded_message_secrets_skipped_from_history_sync() {
         let chat = "5511000000001@s.whatsapp.net";
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(Box::new(wa::WebMessageInfo {
-                        key: wa::MessageKey {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some("HIST_FORWARDED".to_string()),
                             ..Default::default()
-                        },
-                        message: Some(Box::new(wa::Message {
-                            extended_text_message: Some(Box::new(
+                        }),
+                        message: buffa::MessageField::some(wa::Message {
+                            extended_text_message: buffa::MessageField::some(
                                 wa::message::ExtendedTextMessage {
                                     text: Some("forwarded".into()),
-                                    context_info: Some(Box::new(wa::ContextInfo {
+                                    context_info: buffa::MessageField::some(wa::ContextInfo {
                                         is_forwarded: Some(true),
                                         ..Default::default()
-                                    })),
+                                    }),
                                     ..Default::default()
                                 },
-                            )),
-                            message_context_info: Some(Box::new(wa::MessageContextInfo {
-                                message_secret: Some(vec![0x66u8; 32]),
-                                ..Default::default()
-                            })),
+                            ),
+                            message_context_info: buffa::MessageField::some(
+                                wa::MessageContextInfo {
+                                    message_secret: Some(vec![0x66u8; 32]),
+                                    ..Default::default()
+                                },
+                            ),
                             ..Default::default()
-                        })),
+                        }),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2695,50 +3440,58 @@ mod tests {
     fn test_nested_forwarded_message_secrets_skipped_from_history_sync() {
         let chat = "5511000000002@s.whatsapp.net";
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(Box::new(wa::WebMessageInfo {
-                        key: wa::MessageKey {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some("HIST_NESTED_FORWARDED".to_string()),
                             ..Default::default()
-                        },
-                        message: Some(Box::new(wa::Message {
-                            view_once_message: Some(Box::new(wa::message::FutureProofMessage {
-                                message: Some(Box::new(wa::Message {
-                                    ephemeral_message: Some(Box::new(
-                                        wa::message::FutureProofMessage {
-                                            message: Some(Box::new(wa::Message {
-                                                extended_text_message: Some(Box::new(
-                                                    wa::message::ExtendedTextMessage {
-                                                        text: Some("nested".into()),
-                                                        context_info: Some(Box::new(
-                                                            wa::ContextInfo {
-                                                                is_forwarded: Some(true),
+                        }),
+                        message: buffa::MessageField::some(wa::Message {
+                            view_once_message: buffa::MessageField::some(
+                                wa::message::FutureProofMessage {
+                                    message: buffa::MessageField::some(wa::Message {
+                                        ephemeral_message: buffa::MessageField::some(
+                                            wa::message::FutureProofMessage {
+                                                message: buffa::MessageField::some(wa::Message {
+                                                    extended_text_message:
+                                                        buffa::MessageField::some(
+                                                            wa::message::ExtendedTextMessage {
+                                                                text: Some("nested".into()),
+                                                                context_info:
+                                                                    buffa::MessageField::some(
+                                                                        wa::ContextInfo {
+                                                                            is_forwarded: Some(
+                                                                                true,
+                                                                            ),
+                                                                            ..Default::default()
+                                                                        },
+                                                                    ),
                                                                 ..Default::default()
                                                             },
-                                                        )),
-                                                        ..Default::default()
-                                                    },
-                                                )),
-                                                ..Default::default()
-                                            })),
-                                        },
-                                    )),
+                                                        ),
+                                                    ..Default::default()
+                                                }),
+                                            },
+                                        ),
+                                        ..Default::default()
+                                    }),
+                                },
+                            ),
+                            message_context_info: buffa::MessageField::some(
+                                wa::MessageContextInfo {
+                                    message_secret: Some(vec![0x77u8; 32]),
                                     ..Default::default()
-                                })),
-                            })),
-                            message_context_info: Some(Box::new(wa::MessageContextInfo {
-                                message_secret: Some(vec![0x77u8; 32]),
-                                ..Default::default()
-                            })),
+                                },
+                            ),
                             ..Default::default()
-                        })),
+                        }),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2757,12 +3510,14 @@ mod tests {
     /// independent implementation instead of a second production path.
     fn reference_full_walk(decompressed: &[u8], own_user: Option<&str>) -> HistorySyncResult {
         let mut pos = 0;
+        let mut accept_all = FilteredRecordSink(|_: HistoryMsgSecretRecordRef<'_>| true);
         let mut result = HistorySyncResult {
             own_pushname: None,
             nct_salt: None,
             conversations_processed: 0,
             tc_token_candidates: Vec::new(),
             msg_secret_records: Vec::new(),
+            lid_mappings: Vec::new(),
             compressed_bytes: None,
             decompressed_size: decompressed.len(),
         };
@@ -2776,11 +3531,14 @@ mod tests {
                 tags::history_sync::CONVERSATIONS if wt == wire_type::LENGTH_DELIMITED => {
                     let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
                     pos += vlen;
-                    let end = checked_end(pos, len, decompressed.len(), "conversation").unwrap();
+                    let end = checked_end(pos, len, decompressed.len()).unwrap();
+                    let conversation_index = result.conversations_processed;
                     result.conversations_processed += 1;
                     if let Some(candidate) = extract_conversation_fields(
                         &decompressed[pos..end],
+                        conversation_index,
                         &mut result.msg_secret_records,
+                        &mut accept_all,
                     ) {
                         result.tc_token_candidates.push(candidate);
                     }
@@ -2793,7 +3551,7 @@ mod tests {
                 {
                     let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
                     pos += vlen;
-                    let end = checked_end(pos, len, decompressed.len(), "pushname").unwrap();
+                    let end = checked_end(pos, len, decompressed.len()).unwrap();
                     if let Some(own) = own_user
                         && let Some(name) = extract_own_pushname(&decompressed[pos..end], own)
                     {
@@ -2804,10 +3562,21 @@ mod tests {
                 tags::history_sync::NCT_SALT if wt == wire_type::LENGTH_DELIMITED => {
                     let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
                     pos += vlen;
-                    let end = checked_end(pos, len, decompressed.len(), "nctSalt").unwrap();
+                    let end = checked_end(pos, len, decompressed.len()).unwrap();
                     let salt = decompressed[pos..end].to_vec();
                     if !salt.is_empty() {
                         result.nct_salt = Some(salt);
+                    }
+                    pos = end;
+                }
+                tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS
+                    if wt == wire_type::LENGTH_DELIMITED =>
+                {
+                    let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
+                    pos += vlen;
+                    let end = checked_end(pos, len, decompressed.len()).unwrap();
+                    if let Some(mapping) = extract_lid_mapping(&decompressed[pos..end]) {
+                        result.lid_mappings.push(mapping);
                     }
                     pos = end;
                 }
@@ -2822,7 +3591,6 @@ mod tests {
     /// Multi-conversation fixture: a >64 KB DM (spans decompress chunks, has a
     /// tctoken), a group (tctoken must be ignored), pushname and nctSalt.
     fn parity_fixture(own: &str) -> wa::HistorySync {
-        use wa::history_sync::HistorySyncType;
         let dm = "5511777776666@s.whatsapp.net";
         let group = "123456789-987654321@g.us";
         let participant = "5511888889999@s.whatsapp.net";
@@ -2830,17 +3598,17 @@ mod tests {
         let mut big_msgs = Vec::new();
         for i in 0..1500u32 {
             big_msgs.push(wa::HistorySyncMsg {
-                message: Some(Box::new(wa::WebMessageInfo {
-                    key: wa::MessageKey {
+                message: buffa::MessageField::some(wa::WebMessageInfo {
+                    key: buffa::MessageField::some(wa::MessageKey {
                         remote_jid: Some(dm.to_string()),
                         from_me: Some(i % 2 == 0),
                         id: Some(format!("BIG-{i}")),
                         participant: Some(participant.to_string()),
-                    },
+                    }),
                     message_timestamp: Some(1_700_000_000 + i as u64),
                     message_secret: Some(vec![(i % 251) as u8; 32]),
                     ..Default::default()
-                })),
+                }),
                 msg_order_id: Some(i as u64 + 1),
             });
         }
@@ -2852,19 +3620,20 @@ mod tests {
             ..Default::default()
         };
 
+        // Group conversation: a secret message, but its tctoken must be ignored.
         let group_conv = wa::Conversation {
             id: group.to_string(),
             messages: vec![wa::HistorySyncMsg {
-                message: Some(Box::new(wa::WebMessageInfo {
-                    key: wa::MessageKey {
+                message: buffa::MessageField::some(wa::WebMessageInfo {
+                    key: buffa::MessageField::some(wa::MessageKey {
                         remote_jid: Some(group.to_string()),
                         from_me: Some(false),
                         id: Some("GRP-1".to_string()),
                         participant: Some(participant.to_string()),
-                    },
+                    }),
                     message_secret: Some(vec![0x33u8; 32]),
                     ..Default::default()
-                })),
+                }),
                 msg_order_id: Some(1),
             }],
             tc_token: Some(vec![0xCDu8; 16]),
@@ -2873,13 +3642,24 @@ mod tests {
         };
 
         wa::HistorySync {
-            sync_type: HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![big_conv, group_conv],
             pushnames: vec![wa::Pushname {
                 id: Some(own.to_string()),
                 pushname: Some("Me".into()),
             }],
             nct_salt: Some(vec![0x01, 0x02, 0x03, 0x04]),
+            phone_number_to_lid_mappings: vec![
+                wa::PhoneNumberToLIDMapping {
+                    pn_jid: Some("5511777776666@s.whatsapp.net".to_string()),
+                    lid_jid: Some("111222333444555@lid".to_string()),
+                },
+                // Wrong namespace: both walks must skip it identically.
+                wa::PhoneNumberToLIDMapping {
+                    pn_jid: Some("999888777666555@lid".to_string()),
+                    lid_jid: Some("111222333444555@lid".to_string()),
+                },
+            ],
             ..Default::default()
         }
     }
@@ -2926,13 +3706,22 @@ mod tests {
             );
             assert_eq!(result.msg_secret_records, reference.msg_secret_records);
             assert_eq!(result.msg_secret_records.len(), 1500 + 1);
+            assert_eq!(result.lid_mappings, reference.lid_mappings);
+            assert_eq!(
+                result.lid_mappings,
+                vec![HistoryLidMapping {
+                    phone_number: "5511777776666".to_string(),
+                    lid: "111222333444555".to_string(),
+                }],
+                "valid mapping extracted, wrong-namespace entry skipped"
+            );
         }
     }
 
     /// Collecting `next_conversation()` + `remainder()` and stitching them back
-    /// together must equal one full prost decode of the decompressed blob.
+    /// together must equal one full decode of the decompressed blob.
     #[test]
-    fn stream_parity_with_full_prost_decode() {
+    fn stream_parity_with_full_decode() {
         let own = "5511000000000";
         let hs = parity_fixture(own);
         let compressed = encode_and_compress(&hs);
@@ -3016,7 +3805,7 @@ mod tests {
     fn stream_conversationless_blobs() {
         let cases: Vec<wa::HistorySync> = vec![
             wa::HistorySync {
-                sync_type: wa::history_sync::HistorySyncType::PushName as i32,
+                sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
                 pushnames: vec![wa::Pushname {
                     id: Some("5511000000000".into()),
                     pushname: Some("Me".into()),
@@ -3024,7 +3813,7 @@ mod tests {
                 ..Default::default()
             },
             wa::HistorySync {
-                sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+                sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
                 nct_salt: Some(vec![1, 2, 3]),
                 ..Default::default()
             },
@@ -3168,17 +3957,17 @@ mod tests {
         let big = wa::Conversation {
             id: "5511111111111@s.whatsapp.net".into(),
             messages: vec![wa::HistorySyncMsg {
-                message: Some(Box::new(wa::WebMessageInfo {
-                    key: wa::MessageKey {
+                message: buffa::MessageField::some(wa::WebMessageInfo {
+                    key: buffa::MessageField::some(wa::MessageKey {
                         id: Some("BIG".into()),
                         ..Default::default()
-                    },
-                    message: Some(Box::new(wa::Message {
+                    }),
+                    message: buffa::MessageField::some(wa::Message {
                         conversation: Some("x".repeat(1_000_000)),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             }],
             ..Default::default()
@@ -3204,17 +3993,17 @@ mod tests {
             conversations.push(wa::Conversation {
                 id: format!("55119{i:08}@s.whatsapp.net"),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(Box::new(wa::WebMessageInfo {
-                        key: wa::MessageKey {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             id: Some(format!("M{i}")),
                             ..Default::default()
-                        },
-                        message: Some(Box::new(wa::Message {
+                        }),
+                        message: buffa::MessageField::some(wa::Message {
                             conversation: Some(format!("{i}").repeat(4_000)),
                             ..Default::default()
-                        })),
+                        }),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -3241,13 +4030,13 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: "5511111111111@s.whatsapp.net".into(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(Box::new(wa::WebMessageInfo {
-                        message: Some(Box::new(wa::Message {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        message: buffa::MessageField::some(wa::Message {
                             conversation: Some("y".repeat(64 * 1024)),
                             ..Default::default()
-                        })),
+                        }),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 }],
                 ..Default::default()

@@ -1,6 +1,8 @@
 extern crate self as wacore;
 
 pub use wacore_appstate as appstate;
+// time::* returns chrono types; re-exported so consumers do not pin their own.
+pub use chrono;
 pub use wacore_noise as noise;
 
 // Re-export derive macros
@@ -12,6 +14,7 @@ pub mod bot_message;
 pub mod client;
 pub mod client_profile;
 pub mod companion_reg;
+pub mod crypto;
 pub mod download;
 pub mod iq;
 pub mod protocol;
@@ -39,8 +42,11 @@ pub mod request;
 pub mod runtime;
 pub mod secret_enc_addon;
 pub mod send;
+mod serde_helpers;
 pub mod session;
+pub mod shortcake;
 pub mod stanza;
+pub mod stats;
 pub mod sticker_pack;
 
 pub mod store;

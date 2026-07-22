@@ -2,59 +2,85 @@
 name = "wacore"
 version = "0.6.0"
 edition = "2024"
-authors = ["Baron"]
+authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
-repository = "https://github.com/7ucg/whatsapp-rust-bridge"
+repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Core WhatsApp protocol implementation without runtime dependencies"
+# Only the explicit [[bench]] targets below are built; never auto-discover benches/*.rs, so a stray
+# untracked file on a reused CI runner can't get compiled as a phantom bench.
 
-[lib]
-crate-type = ["rlib"]
+# `getrandom` is pulled only to forward the `js` feature (wasm getrandom backend);
+# there is no direct `use`, so static analysers flag it as unused.
+[package.metadata.cargo-machete]
+ignored = ["getrandom"]
 
 [features]
 default = ["simd"]
 simd = ["wacore-appstate/simd"]
-debug-diagnostics = []
 debug-snapshots = []
+# Expose the InMemoryBackend fault-injection / call-count hooks used by the e2e
+# suite. Off by default so normal builds carry no extra fields or per-call
+# bookkeeping. Enabled only from test crates.
+test-util = []
+# Optional observability: emit tracing spans/events. Off by default (no dep).
+tracing = ["dep:tracing"]
+# Optional metrics via the `metrics` facade. Off by default (no dep).
+metrics = ["dep:metrics"]
 # Render raw phone numbers in tracing fields instead of redacted tokens (debug only).
 tracing-pii = ["wacore-binary/tracing-pii"]
 # Disables XEdDSA verification of the server's Noise cert chain. Required
 # for the e2e mock server (self-signed certs). NEVER enable in prod.
 danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
-# VoIP/calls media crypto + MLow codec (SRTP, SFrame, WAHKDF). Pure, no-Tokio.
-# Off by default: the media plane is opt-in and pulls aes-gcm into the build.
-voip = ["dep:aes-gcm"]
+# Enable JS-based random number generation for wasm32 targets.
+# Activates getrandom's wasm_js backend so rand works in the browser.
+js = ["getrandom/wasm_js"]
+# VoIP/calls media crypto (SRTP, SFrame, WAHKDF). Pure, no-Tokio. Off by default.
+voip = ["dep:aes-gcm", "dep:zerocopy"]
+# Built-in PCM/MLOW adapter. Encoded audio transport needs only `voip`.
+voip-mlow = ["voip"]
+# Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
+# Dev/profiling only; off by default and not pulled into normal builds.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 aes = { workspace = true }
 aes-gcm = { workspace = true, optional = true }
+zerocopy = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bon = { workspace = true }
+buffa = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["now", "serde"] }
 compact_str = { workspace = true }
 ctr = { workspace = true }
+dhat = { version = "0.3", optional = true }
 event-listener = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true, features = ["std"] }
+getrandom = { workspace = true, optional = true }
+hashbrown = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
 md5 = "0.8.0"
+metrics = { workspace = true, optional = true }
 portable-atomic = { workspace = true }
-prost = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde-big-array = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+smoothutf8 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true, optional = true }
 typed-builder = "0.23"
 wacore-appstate = { workspace = true }
 wacore-binary = { workspace = true, features = ["serde"] }
@@ -63,13 +89,12 @@ wacore-libsignal = { workspace = true }
 wacore-noise = { workspace = true }
 waproto = { workspace = true }
 
-# NOTE: the upstream wacore test suite + benches are intentionally NOT vendored
-# here — they target upstream's proto version and don't compile against this
-# bridge's newer proto. Run them in the source repo (whatsapp-rust-main), where
-# the proto matches; the voip/src here is byte-identical to that source.
+[build-dependencies]
+buffa-build = { workspace = true }
+sha2 = { workspace = true }
 
-# rand's getrandom backend needs the wasm_js feature on wasm32 (browser/Node).
-# On native targets getrandom uses the OS backend, so it is wasm-only here —
-# mirrors the other vendored subcrates.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.4", default-features = false, features = ["wasm_js"] }
+[dev-dependencies]
+divan = { workspace = true }
+futures = { workspace = true, features = ["executor", "thread-pool"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+

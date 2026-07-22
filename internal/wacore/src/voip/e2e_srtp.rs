@@ -1,6 +1,7 @@
 //! E2E 1:1 SRTP, the primary working path. Keys derive from `callKey` (32B) +
 //! participant LID via HKDF-SHA256, then an AES-CM PRF; payloads use AES-128-CTR
-//! with a 4-byte WARP MESSAGE-INTEGRITY tag (HMAC-SHA1, not verified on recv).
+//! with a 4-byte WARP MESSAGE-INTEGRITY tag (HMAC-SHA1), verified on recv before
+//! the rollover counter is advanced (see `session::unprotect_audio`).
 //!
 //! wacrg spec: srtp-e2e (CRY-05), srtp-master-key (CRY-02), call-key (CRY-01).
 
@@ -9,7 +10,9 @@ use ctr::Ctr128BE;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 
 use crate::voip::hkdf_sha256;
-pub use crate::voip::warp::{WARP_MI_TAG_LEN, append_warp_mi_tag, compute_warp_mi_tag};
+pub use crate::voip::warp::{
+    WARP_MI_TAG_LEN, append_warp_mi_tag, compute_warp_mi_tag, verify_warp_mi_tag,
+};
 
 type AesCtr = Ctr128BE<Aes128>;
 
@@ -107,6 +110,103 @@ pub fn crypt_payload(keys: &E2eSrtpKeys, ssrc: u32, seq: u16, roc: u32, payload:
     out
 }
 
+/// SRTCP auth-tag length (HMAC-SHA1-80). With the 4-byte E-flag+index word this is the 14-byte
+/// SRTCP trailer.
+pub const SRTCP_AUTH_TAG_LEN: usize = 10;
+/// First 8 bytes of an RTCP packet (V/P/RC, PT, length, sender SSRC) are left in the clear; only the
+/// body is encrypted (RFC 3711 §3.4).
+const RTCP_HEADER_LEN: usize = 8;
+
+fn hmac_sha1_20(key: &[u8], data: &[u8]) -> [u8; 20] {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha1::Sha1;
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    let mut tag = [0u8; 20];
+    tag.copy_from_slice(&mac.finalize().into_bytes());
+    tag
+}
+
+/// SRTCP session keys derived with the RFC 3711 labels used by the native client.
+#[doc(hidden)]
+pub fn derive_srtcp_keys(call_key: &[u8], participant_lid: &str) -> Option<E2eSrtpKeys> {
+    if call_key.len() < 32 {
+        return None;
+    }
+    let master = hkdf_sha256(&[0u8; 32], &call_key[..32], participant_lid.as_bytes(), 46);
+    let master_key = &master[0..16];
+    let master_salt = &master[16..30];
+    let mut keys = E2eSrtpKeys {
+        cipher_key: [0u8; 16],
+        salt: [0u8; 14],
+        auth_key: [0u8; 20],
+    };
+    keys.cipher_key
+        .copy_from_slice(&aes_cm_kdf(master_key, master_salt, 0x03, 16));
+    keys.auth_key
+        .copy_from_slice(&aes_cm_kdf(master_key, master_salt, 0x04, 20));
+    keys.salt
+        .copy_from_slice(&aes_cm_kdf(master_key, master_salt, 0x05, 14));
+    Some(keys)
+}
+
+/// Protect one RTCP packet as SRTCP (RFC 3711 §3.4): AES-CTR the body, append the 4-byte
+/// E-flag+index word, then an HMAC-SHA1-80 tag over the whole thing. `sender_ssrc` is the SR's
+/// own SSRC (bytes 4..8) and `index` the per-SSRC SRTCP counter.
+pub fn protect_srtcp(keys: &E2eSrtpKeys, sender_ssrc: u32, index: u32, rtcp: &[u8]) -> Vec<u8> {
+    let split = rtcp.len().min(RTCP_HEADER_LEN);
+    let iv = build_e2e_rtp_iv(
+        &keys.salt,
+        sender_ssrc,
+        index >> 16,
+        (index & 0xffff) as u16,
+    );
+    let mut out = Vec::with_capacity(rtcp.len() + 4 + SRTCP_AUTH_TAG_LEN);
+    out.extend_from_slice(&rtcp[..split]);
+    let mut body = rtcp[split..].to_vec();
+    let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
+    cipher.apply_keystream(&mut body);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&(0x8000_0000u32 | (index & 0x7fff_ffff)).to_be_bytes());
+    let tag = hmac_sha1_20(&keys.auth_key, &out);
+    out.extend_from_slice(&tag[..SRTCP_AUTH_TAG_LEN]);
+    out
+}
+
+/// Inverse of [`protect_srtcp`]: verify the tag, then decrypt the body and return its authenticated
+/// 31-bit index. `None` on a bad tag or a too-short packet.
+pub fn unprotect_srtcp(
+    keys: &E2eSrtpKeys,
+    sender_ssrc: u32,
+    packet: &[u8],
+) -> Option<(Vec<u8>, u32)> {
+    if packet.len() < RTCP_HEADER_LEN + 4 + SRTCP_AUTH_TAG_LEN {
+        return None;
+    }
+    let tag_start = packet.len() - SRTCP_AUTH_TAG_LEN;
+    let expected = hmac_sha1_20(&keys.auth_key, &packet[..tag_start]);
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        &packet[tag_start..],
+        &expected[..SRTCP_AUTH_TAG_LEN],
+    )) {
+        return None;
+    }
+    let idx_start = tag_start - 4;
+    let index = u32::from_be_bytes(packet[idx_start..tag_start].try_into().ok()?) & 0x7fff_ffff;
+    let iv = build_e2e_rtp_iv(
+        &keys.salt,
+        sender_ssrc,
+        index >> 16,
+        (index & 0xffff) as u16,
+    );
+    let mut out = packet[..RTCP_HEADER_LEN].to_vec();
+    let mut body = packet[RTCP_HEADER_LEN..idx_start].to_vec();
+    let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
+    cipher.apply_keystream(&mut body);
+    out.extend_from_slice(&body);
+    Some((out, index))
+}
+
 /// Send-side ROC tracker for monotonic 16-bit sequence numbers.
 #[derive(Default)]
 pub(crate) struct RocTracker {
@@ -142,16 +242,16 @@ pub(crate) struct RecvRocTracker {
 }
 
 impl RecvRocTracker {
-    /// Guess the ROC for `seq` and fold it into the state. Seeds from the first packet (roc=0).
-    pub fn guess_roc(&mut self, seq: u16) -> u32 {
+    /// Estimate the ROC for `seq` WITHOUT mutating state (RFC 3711 guess-index).
+    /// Use this to build the IV / verify a packet; only [`Self::commit_roc`] after
+    /// the packet authenticates, so an unauthenticated packet can't desync state.
+    pub fn estimate_roc(&self, seq: u16) -> u32 {
         if !self.initialized {
-            self.s_l = seq;
-            self.initialized = true;
             return self.roc;
         }
         // Pick v in {roc-1, roc, roc+1} so 2^16*v+seq is closest to 2^16*roc+s_l. The signed 16-bit
         // gap (not a modular wrapping_sub) is what distinguishes "next-but-reordered" from "wrapped".
-        let v = if self.s_l < 0x8000 {
+        if self.s_l < 0x8000 {
             if (seq as i32 - self.s_l as i32) > 0x8000 {
                 self.roc.wrapping_sub(1) // old packet from before the origin (roc-1)
             } else {
@@ -161,7 +261,18 @@ impl RecvRocTracker {
             self.roc.wrapping_add(1) // forward wrap into roc+1
         } else {
             self.roc
-        };
+        }
+    }
+
+    /// Fold an AUTHENTICATED packet's `(v, seq)` into the state; `v` must come from
+    /// a prior [`Self::estimate_roc`] whose MI tag verified. Seeds from the first
+    /// packet (roc stays 0).
+    pub fn commit_roc(&mut self, v: u32, seq: u16) {
+        if !self.initialized {
+            self.s_l = seq;
+            self.initialized = true;
+            return;
+        }
         if v == self.roc {
             if seq > self.s_l {
                 self.s_l = seq;
@@ -170,7 +281,16 @@ impl RecvRocTracker {
             self.roc = v;
             self.s_l = seq;
         }
-        // v == roc-1 (reordered late packet): return the lower ROC, leave state untouched.
+        // v == roc-1 (reordered late packet): leave state untouched.
+    }
+
+    /// Estimate + commit in one step. Test-only: production authenticates the WARP
+    /// MI tag against `estimate_roc` first and only `commit_roc` on success, so an
+    /// unauthenticated packet can't fold state. Kept for the wrap-tracking tests.
+    #[cfg(test)]
+    pub fn guess_roc(&mut self, seq: u16) -> u32 {
+        let v = self.estimate_roc(seq);
+        self.commit_roc(v, seq);
         v
     }
 }
@@ -193,6 +313,55 @@ mod tests {
         keys.auth_key
             .copy_from_slice(&hexd(k, &["e2e_srtp", &format!("{who}_authKey")]));
         keys
+    }
+
+    #[test]
+    fn srtcp_round_trips_and_authenticates() {
+        // SRTCP keys must be distinct from the SRTP keys (different KDF labels).
+        let call_key: Vec<u8> = (0u8..40).collect();
+        let lid = "12345:0@lid";
+        let srtp = derive_e2e_keys(&call_key, lid).unwrap();
+        let srtcp = derive_srtcp_keys(&call_key, lid).unwrap();
+        assert_ne!(
+            srtp.cipher_key, srtcp.cipher_key,
+            "SRTCP must use its own key"
+        );
+        assert_ne!(srtp.salt, srtcp.salt);
+
+        // A 28-byte Sender Report (header 8 + body 20).
+        let ssrc: u32 = 0x0a0b_0c0d;
+        let mut sr = vec![0x80, 200, 0x00, 0x06];
+        sr.extend_from_slice(&ssrc.to_be_bytes());
+        sr.extend_from_slice(&[0x11; 20]);
+
+        let protected = protect_srtcp(&srtcp, ssrc, 0, &sr);
+        // header stays clear, body is encrypted, +4 index +10 tag.
+        assert_eq!(protected.len(), sr.len() + 4 + SRTCP_AUTH_TAG_LEN);
+        assert_eq!(&protected[..8], &sr[..8], "header/SSRC left in the clear");
+        assert_ne!(&protected[8..28], &sr[8..28], "body must be encrypted");
+        // E-flag set on the index word.
+        assert_eq!(
+            protected[protected.len() - SRTCP_AUTH_TAG_LEN - 4] & 0x80,
+            0x80
+        );
+
+        let (plain, index) = unprotect_srtcp(&srtcp, ssrc, &protected).unwrap();
+        assert_eq!(plain, sr);
+        assert_eq!(index, 0);
+        // A flipped tag byte must fail authentication.
+        let mut forged = protected.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        assert_eq!(unprotect_srtcp(&srtcp, ssrc, &forged), None);
+        // The index increments per packet, changing the keystream.
+        let p1 = protect_srtcp(&srtcp, ssrc, 1, &sr);
+        assert_ne!(
+            protected[8..28],
+            p1[8..28],
+            "a new index must change the ciphertext"
+        );
+        let (plain, index) = unprotect_srtcp(&srtcp, ssrc, &p1).unwrap();
+        assert_eq!(plain, sr);
+        assert_eq!(index, 1);
     }
 
     #[test]
@@ -272,6 +441,37 @@ mod tests {
             rx.guess_roc(0x0001),
             2,
             "state not corrupted by the late packet"
+        );
+    }
+
+    /// The exact rollover-desync the auth fix prevents. `unprotect_audio` only
+    /// `commit_roc`s after the MI tag verifies, so a rejected (unauthenticated)
+    /// packet stays on the pure `estimate_roc` path and can't fold state — while the
+    /// attacker's 2-packet staircase, if committed, advances the ROC by one.
+    #[test]
+    fn unauthenticated_staircase_cannot_advance_roc_without_commit() {
+        let mut rx = RecvRocTracker::default();
+        rx.guess_roc(0x7FFE); // seed s_l into the high half (the exploit's start)
+        assert_eq!(rx.roc, 0);
+
+        // A rejected packet only reaches estimate_roc (never commit_roc): the
+        // attacker's staircase seqs leave the state untouched.
+        let _ = rx.estimate_roc(0xFFFE);
+        let _ = rx.estimate_roc(0x7FFD);
+        assert_eq!(rx.roc, 0, "estimate alone must not advance the ROC");
+        assert_eq!(
+            rx.estimate_roc(0x7FFF),
+            0,
+            "a legit in-window seq still maps to roc=0"
+        );
+
+        // Contrast: committing that same staircase (the pre-fix path) advances the
+        // ROC by one — the desync authentication now blocks.
+        rx.commit_roc(rx.estimate_roc(0xFFFE), 0xFFFE);
+        rx.commit_roc(rx.estimate_roc(0x7FFD), 0x7FFD);
+        assert_eq!(
+            rx.roc, 1,
+            "committing the staircase advances the ROC (the pre-fix desync)"
         );
     }
 

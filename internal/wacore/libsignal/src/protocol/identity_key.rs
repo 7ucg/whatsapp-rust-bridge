@@ -7,11 +7,11 @@
 
 #![warn(missing_docs)]
 
-use prost::Message;
+use buffa::Message;
 use rand::{CryptoRng, Rng};
 
 use crate::protocol::{
-    stores::IdentityKeyPairStructure, KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError,
+    KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, stores::IdentityKeyPairStructure,
 };
 
 // Used for domain separation between alternate-identity signatures and other key-to-key signatures.
@@ -134,6 +134,8 @@ impl IdentityKeyPair {
     }
 
     /// Return a byte slice which can later be deserialized with [`Self::try_from`].
+    // IdentityKeyPairStructure round-trips only here; no codec pin needed.
+    #[allow(clippy::disallowed_methods)]
     pub fn serialize(&self) -> Box<[u8]> {
         let structure = IdentityKeyPairStructure {
             public_key: Some(self.identity_key.serialize().to_vec()),
@@ -164,8 +166,9 @@ impl IdentityKeyPair {
 impl TryFrom<&[u8]> for IdentityKeyPair {
     type Error = SignalProtocolError;
 
+    #[allow(clippy::disallowed_methods)]
     fn try_from(value: &[u8]) -> Result<Self> {
-        let structure = IdentityKeyPairStructure::decode(value)
+        let structure = IdentityKeyPairStructure::decode_from_slice(value)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
         Ok(Self {
             identity_key: IdentityKey::try_from(

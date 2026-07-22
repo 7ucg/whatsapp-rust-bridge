@@ -1,6 +1,7 @@
 //! Per-device Signal encryption fanout and the bounded spawn helper.
 
 use super::*;
+use anyhow::Context;
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across the surrounding SKDM creation + this encrypt, so a concurrent send
@@ -19,62 +20,14 @@ where
     S: SenderKeyStore + ?Sized,
     R: Rng + CryptoRng,
 {
-    log::debug!(
-        "Attempting to load sender key for group {} sender {}",
-        sender_key_name.group_id(),
-        sender_key_name.sender_id()
-    );
-
-    let mut record = sender_key_store
-        .load_sender_key(sender_key_name)
-        .await?
-        .ok_or_else(|| {
-            SignalProtocolError::NoSenderKeyState(format!(
-                "no sender key record for group {} sender {}",
-                sender_key_name.group_id(),
-                sender_key_name.sender_id()
-            ))
-        })?;
-
-    let sender_key_state = record
-        .sender_key_state_mut()
-        .map_err(|e| anyhow!("Invalid SenderKey session: {:?}", e))?;
-
-    let sender_chain_key = sender_key_state
-        .sender_chain_key()
-        .ok_or_else(|| anyhow!("Invalid SenderKey session: missing chain key"))?;
-
-    let message_keys = sender_chain_key.sender_message_key();
-
-    let mut ciphertext = Vec::new();
-    aes_256_cbc_encrypt_into(
-        plaintext,
-        message_keys.cipher_key(),
-        message_keys.iv(),
-        &mut ciphertext,
-    )
-    .map_err(|_| anyhow!("AES encryption failed"))?;
-
-    let signing_key = sender_key_state
-        .signing_key_private()
-        .map_err(|e| anyhow!("Invalid SenderKey session: missing signing key: {:?}", e))?;
-
-    let skm = SenderKeyMessage::new(
-        SENDERKEY_MESSAGE_CURRENT_VERSION,
-        sender_key_state.chain_id(),
-        message_keys.iteration(),
-        ciphertext.into_boxed_slice(),
-        csprng,
-        &signing_key,
-    )?;
-
-    sender_key_state.set_sender_chain_key(sender_chain_key.next()?);
-
-    sender_key_store
-        .store_sender_key(sender_key_name, record)
-        .await?;
-
-    Ok(skm)
+    // Delegate to the libsignal primitive so the sender-key advance, the wire
+    // gate, and the iteration lease live in exactly one place. `.context` keeps
+    // the concrete SignalProtocolError as the source, so callers can still
+    // downcast NoSenderKeyState to clear stale tracking and retry with SKDM
+    // redistribution.
+    crate::libsignal::protocol::group_encrypt(sender_key_store, sender_key_name, plaintext, csprng)
+        .await
+        .context("group encrypt failed")
 }
 
 /// Object-safe `SessionStore` that can clone itself into an owned box. The
@@ -164,14 +117,14 @@ pub struct EncryptForDevicesRaw {
 /// - `!includes_prekey` -> `Ok(None)`
 pub fn needs_device_identity(
     includes_prekey: bool,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
 ) -> Result<Option<Vec<u8>>> {
     if !includes_prekey {
         return Ok(None);
     }
     let acc = account
         .ok_or_else(|| anyhow!("pkmsg requires <device-identity> but no ADV account is present"))?;
-    Ok(Some(acc.encode_to_vec()))
+    Ok(Some(waproto::codec::adv_signed_device_identity_to_vec(acc)))
 }
 
 /// Maximum number of concurrent per-device crypto tasks during group send
@@ -604,7 +557,13 @@ pub async fn ensure_sessions_for_devices(
                 // identity; notify the client so it can react off-path.
                 Ok(Ok(Some(changed_jid))) => resolver.on_local_identity_change(&changed_jid),
                 Ok(Ok(None)) => {}
-                Ok(Err(e)) => return Err(e),
+                // Isolate the failure to this device so one participant can't abort
+                // the cohort's SKDM (matching WA Web GroupKeyDistributionMsg's
+                // per-device try/catch). The sessionless device is dropped by the
+                // fan-out below.
+                Ok(Err(e)) => {
+                    log::warn!("Group session setup failed for a device, skipping it: {e}");
+                }
                 Err(SpawnCanceled) => {
                     log::warn!(
                         "Session-establishment task did not deliver a result; skipping device."
@@ -718,56 +677,70 @@ pub async fn encrypt_for_devices_with_sessions_raw(
         .await;
         push_raw_result(res, &mut encrypted, &mut includes_prekey_message);
     } else {
-        // Parallel encrypt fan-out across tokio tasks bounded by
-        // ENCRYPT_FANOUT_CONCURRENCY; collected in completion order so the
-        // fastest encrypts ship first.
+        // One task per chunk, not per device: the per-device fan-out allocated a
+        // task + oneshot + two store clones for every recipient. Same parallelism,
+        // spawns bounded by ENCRYPT_FANOUT_CONCURRENCY. Wire order is irrelevant
+        // (phash sorts before hashing on both ends).
         let plaintext_arc: std::sync::Arc<[u8]> = std::sync::Arc::from(plaintext_to_encrypt);
 
         let total = devices.len();
-        let mut next_spawn = 0usize;
+        let num_chunks = ENCRYPT_FANOUT_CONCURRENCY.min(total);
 
-        let make_encrypt_task = |idx: usize| {
-            let device_jid = devices[idx].clone();
-            // The encryption JID is only needed to build the Signal address, so
-            // derive it here from a borrow rather than cloning the whole Jid into
-            // the task (device_jid is still cloned because it's returned).
-            let addr = encryption_overrides
-                .get(idx)
-                .and_then(|o| o.as_ref())
-                .unwrap_or(&devices[idx])
-                .to_protocol_address();
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        // Index partitioning gives exactly num_chunks slices (keeps the configured
+        // parallelism) and no-ops on an empty device set instead of dividing by zero.
+        for chunk_idx in 0..num_chunks {
+            let chunk_start = chunk_idx * total / num_chunks;
+            let chunk_end = (chunk_idx + 1) * total / num_chunks;
+            // The 'static task can't borrow devices/encryption_overrides.
+            let jobs: Vec<(ProtocolAddress, Jid)> = (chunk_start..chunk_end)
+                .map(|idx| {
+                    let addr = encryption_overrides
+                        .get(idx)
+                        .and_then(|o| o.as_ref())
+                        .unwrap_or(&devices[idx])
+                        .to_protocol_address();
+                    (addr, devices[idx].clone())
+                })
+                .collect();
             let plaintext = plaintext_arc.clone();
+            // clone_box shares the Arc-backed backend, so the sequential ratchet
+            // advances persist despite one clone serving the whole chunk.
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();
 
-            spawn_oneshot(runtime, async move {
-                encrypt_one_device(
-                    &plaintext,
-                    &addr,
-                    &mut *session_store,
-                    &mut *identity_store,
-                    device_jid,
-                )
-                .await
-            })
-        };
-
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-        while next_spawn < total && in_flight.len() < ENCRYPT_FANOUT_CONCURRENCY {
-            in_flight.push(make_encrypt_task(next_spawn));
-            next_spawn += 1;
+            in_flight.push(spawn_oneshot(runtime, async move {
+                let mut out = Vec::with_capacity(jobs.len());
+                for (addr, device_jid) in jobs {
+                    out.push(
+                        encrypt_one_device(
+                            &plaintext,
+                            &addr,
+                            &mut *session_store,
+                            &mut *identity_store,
+                            device_jid,
+                        )
+                        .await,
+                    );
+                }
+                out
+            }));
         }
         while let Some(spawn_result) = in_flight.next().await {
             match spawn_result {
-                Ok(res) => push_raw_result(res, &mut encrypted, &mut includes_prekey_message),
-                Err(SpawnCanceled) => {
-                    log::warn!("Encrypt task did not deliver a result; skipping device.");
+                Ok(results) => {
+                    for res in results {
+                        push_raw_result(res, &mut encrypted, &mut includes_prekey_message);
+                    }
                 }
-            }
-
-            if next_spawn < total {
-                in_flight.push(make_encrypt_task(next_spawn));
-                next_spawn += 1;
+                Err(SpawnCanceled) => {
+                    // A whole chunk drops (not one device); its members stay
+                    // un-warm and are re-targeted next send.
+                    log::warn!(
+                        "Encrypt chunk did not deliver a result; up to ~{} device(s) skipped this send.",
+                        total.div_ceil(num_chunks)
+                    );
+                }
             }
         }
     }

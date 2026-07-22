@@ -22,10 +22,11 @@ mod crypto;
 pub mod error;
 mod group_cipher;
 mod identity_key;
-pub mod pqxdh;
+mod local_field;
 #[allow(clippy::module_inception)]
 mod protocol;
 mod ratchet;
+mod record_components;
 mod sender_keys;
 pub mod session;
 mod session_cipher;
@@ -52,22 +53,30 @@ pub use protocol::{
     PreKeySignalMessage, SenderKeyDistributionMessage, SenderKeyMessage, SignalMessage,
 };
 pub use ratchet::{
-    derive_keys, initialize_alice_session_record, initialize_bob_session,
-    initialize_bob_session_record, AliceSignalProtocolParameters, BobSignalProtocolParameters,
-    ChainKey, MessageKeyGenerator, RootKey, UsePQRatchet,
+    AliceSignalProtocolParameters, BobSignalProtocolParameters, ChainKey, MessageKeyGenerator,
+    RootKey, UsePQRatchet, derive_keys, initialize_alice_session_record, initialize_bob_session,
+    initialize_bob_session_record,
+};
+pub use record_components::{
+    PendingKeyExchangeComponents, PendingPreKeyComponents, SenderChainKeyComponents,
+    SenderKeyRecordComponents, SenderKeyStateComponents, SenderMessageKeyComponents,
+    SenderSigningKeyComponents, SessionChainComponents, SessionChainKeyComponents,
+    SessionComponents, SessionMessageKeyComponents, SessionMessageKeyMaterial,
+    SessionRecordComponents,
 };
 pub use sender_keys::{SenderKeyRecord, SenderKeyState};
 pub use session::{process_prekey, process_prekey_bundle};
 pub use session_cipher::{
-    message_decrypt, message_decrypt_prekey, message_decrypt_signal, message_encrypt,
-    DecryptionResult,
+    DecryptionResult, OwnedCiphertextMessage, message_decrypt, message_decrypt_owned,
+    message_decrypt_prekey, message_decrypt_signal, message_encrypt,
 };
 pub use state::{
-    GenericSignedPreKey, KyberPreKeyId, KyberPreKeyRecord, PreKeyBundle, PreKeyBundleContent,
-    PreKeyId, PreKeyRecord, SessionRecord, SessionState, SignedPreKeyId, SignedPreKeyRecord,
+    GenericSignedPreKey, PreKeyBundle, PreKeyBundleContent, PreKeyId, PreKeyRecord, SessionRecord,
+    SessionState, SignedPreKeyId, SignedPreKeyRecord,
 };
 pub use storage::{
-    Direction, IdentityChange, IdentityKeyStore, KyberPreKeyStore, PreKeyStore, ProtocolStore,
-    SenderKeyStore, SessionStore, SignedPreKeyStore,
+    Direction, IdentityChange, IdentityKeyStore, PreKeyStore, ProtocolStore, SenderKeyStore,
+    SessionCheckout, SessionCheckoutKey, SessionCheckoutStoreResult, SessionStore,
+    SignedPreKeyStore,
 };
 pub use timestamp::Timestamp;

@@ -1,27 +1,26 @@
 use crate::client_profile::ClientProfile;
 use crate::libsignal::protocol::{IdentityKeyPair, KeyPair};
-use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use std::sync::{Arc, LazyLock};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
-/// Protobuf-bytes serde for `AdvSignedDeviceIdentity` (prost types lack `Deserialize`).
+/// Protobuf-bytes serde for `ADVSignedDeviceIdentity` (the generated types lack `Deserialize`).
 pub mod account_serde {
-    use prost::Message;
+
     use waproto::whatsapp as wa;
 
-    pub fn to_bytes(account: &wa::AdvSignedDeviceIdentity) -> Vec<u8> {
-        account.encode_to_vec()
+    pub fn to_bytes(account: &wa::ADVSignedDeviceIdentity) -> Vec<u8> {
+        waproto::codec::adv_signed_device_identity_to_vec(account)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<wa::AdvSignedDeviceIdentity, prost::DecodeError> {
-        wa::AdvSignedDeviceIdentity::decode(bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<wa::ADVSignedDeviceIdentity, buffa::DecodeError> {
+        waproto::codec::adv_signed_device_identity_decode(bytes)
     }
 
     pub fn serialize<S: serde::Serializer>(
-        val: &Option<std::sync::Arc<wa::AdvSignedDeviceIdentity>>,
+        val: &Option<std::sync::Arc<wa::ADVSignedDeviceIdentity>>,
         s: S,
     ) -> Result<S::Ok, S::Error> {
         match val {
@@ -32,7 +31,7 @@ pub mod account_serde {
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         d: D,
-    ) -> Result<Option<std::sync::Arc<wa::AdvSignedDeviceIdentity>>, D::Error> {
+    ) -> Result<Option<std::sync::Arc<wa::ADVSignedDeviceIdentity>>, D::Error> {
         let bytes: Option<Vec<u8>> = serde::Deserialize::deserialize(d)?;
         match bytes {
             Some(b) => from_bytes(&b)
@@ -88,10 +87,10 @@ fn build_base_client_payload(
     // audit auto-generated a UUID per build, which the server flagged as a
     // rotating device fingerprint and silently invalidated the session.
     wa::ClientPayload {
-        user_agent: Some(wa::client_payload::UserAgent {
-            platform: Some(profile.user_agent_platform as i32),
-            release_channel: Some(wa::client_payload::user_agent::ReleaseChannel::Release as i32),
-            app_version: Some(app_version),
+        user_agent: buffa::MessageField::some(wa::client_payload::UserAgent {
+            platform: Some(profile.user_agent_platform),
+            release_channel: Some(wa::client_payload::user_agent::ReleaseChannel::RELEASE),
+            app_version: buffa::MessageField::some(app_version),
             mcc: Some("000".to_string()),
             mnc: Some("000".to_string()),
             os_version: Some(profile.os_version.clone()),
@@ -103,16 +102,16 @@ fn build_base_client_payload(
             phone_id: profile.phone_id.clone(),
             ..Default::default()
         }),
-        web_info: profile
-            .include_web_info
-            .then(|| wa::client_payload::WebInfo {
-                web_sub_platform: Some(
-                    wa::client_payload::web_info::WebSubPlatform::WebBrowser as i32,
-                ),
+        web_info: if profile.include_web_info {
+            buffa::MessageField::some(wa::client_payload::WebInfo {
+                web_sub_platform: Some(wa::client_payload::web_info::WebSubPlatform::WEB_BROWSER),
                 ..Default::default()
-            }),
-        connect_type: Some(wa::client_payload::ConnectType::WifiUnknown as i32),
-        connect_reason: Some(wa::client_payload::ConnectReason::UserActivated as i32),
+            })
+        } else {
+            buffa::MessageField::default()
+        },
+        connect_type: Some(wa::client_payload::ConnectType::WIFI_UNKNOWN),
+        connect_reason: Some(wa::client_payload::ConnectReason::USER_ACTIVATED),
         ..Default::default()
     }
 }
@@ -198,15 +197,15 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
 
 pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::DeviceProps {
     os: Some("rust".to_string()),
-    version: Some(wa::device_props::AppVersion {
+    version: buffa::MessageField::some(wa::device_props::AppVersion {
         primary: Some(0),
         secondary: Some(1),
         tertiary: Some(0),
         ..Default::default()
     }),
-    platform_type: Some(wa::device_props::PlatformType::Unknown as i32),
+    platform_type: Some(wa::device_props::PlatformType::UNKNOWN),
     require_full_sync: Some(true),
-    history_sync_config: Some(default_history_sync_config()),
+    history_sync_config: buffa::MessageField::some(default_history_sync_config()),
 });
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -227,7 +226,7 @@ pub struct Device {
     // Arc: immutable after pairing, so per-snapshot clones bump a refcount
     // instead of deep-copying its four Vec<u8> fields.
     #[serde(with = "account_serde", default)]
-    pub account: Option<Arc<wa::AdvSignedDeviceIdentity>>,
+    pub account: Option<Arc<wa::ADVSignedDeviceIdentity>>,
     pub push_name: String,
     pub app_version_primary: u32,
     pub app_version_secondary: u32,
@@ -283,6 +282,26 @@ pub struct Device {
     /// signal. Persisted so it survives restarts.
     #[serde(default)]
     pub login_counter: i32,
+    /// WA Web's `WAIsAccountLidFieldMigrated` pref: whether the account is
+    /// 1:1-LID-migrated. Set from `ClientPairingProps.isChatDbLidMigrated` at
+    /// pair time or when the primary pushes migration mappings. Gates outbound
+    /// DM wire addressing (LID vs PN); the Signal session layer stays LID-first
+    /// regardless, mirroring WAWebSignalAddress. Once set it never reverts,
+    /// like the WA Web pref.
+    #[serde(default)]
+    pub lid_migrated: bool,
+    /// Wall-clock ms of the last signed-pre-key rotation, driving WA Web's
+    /// `RotateKeyJob` cadence. Fresh devices baseline off creation; devices
+    /// persisted before this field existed deserialize to `0`, which the
+    /// rotation path treats as "seed the baseline, don't rotate yet".
+    #[serde(default)]
+    pub last_signed_pre_key_rotation_ms: i64,
+    /// true means the account's `readreceipts` privacy is `none`, so DM
+    /// read/played receipts go out as `*-self` (which don't notify the sender).
+    /// Persisted so the value is known on reconnect before the privacy fetch
+    /// completes; `false` (WA default `all`) sends plain `read`/`played`.
+    #[serde(default)]
+    pub read_receipts_disabled: bool,
 }
 
 /// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
@@ -366,7 +385,7 @@ impl Device {
             push_name: String::new(),
             app_version_primary: 2,
             app_version_secondary: 3000,
-            app_version_tertiary: 1040878135,
+            app_version_tertiary: 1042742319,
             app_version_last_fetched_ms: 0,
             device_props: Arc::new(DEVICE_PROPS.clone()),
             client_profile: ClientProfile::web(),
@@ -379,6 +398,9 @@ impl Device {
             nct_salt_sync_seen: false,
             server_cert_chain: None,
             login_counter: 0,
+            lid_migrated: false,
+            last_signed_pre_key_rotation_ms: crate::time::now_millis(),
+            read_receipts_disabled: false,
         }
     }
 
@@ -413,13 +435,13 @@ impl Device {
             props.os = Some(os);
         }
         if let Some(version) = o.version {
-            props.version = Some(version);
+            props.version = buffa::MessageField::some(version);
         }
         if let Some(platform_type) = o.platform_type {
-            props.platform_type = Some(platform_type as i32);
+            props.platform_type = Some(platform_type);
         }
         if let Some(history_sync_config) = o.history_sync_config {
-            props.history_sync_config = Some(history_sync_config);
+            props.history_sync_config = buffa::MessageField::some(history_sync_config);
         }
     }
 
@@ -464,22 +486,16 @@ impl Device {
         };
         let mut payload = build_base_client_payload(app_version, &self.client_profile);
 
-        let device_props_bytes = self.device_props.encode_to_vec();
+        let device_props_bytes = waproto::codec::device_props_to_vec(&self.device_props);
 
-        let version = payload
-            .user_agent
-            .as_ref()
-            .expect("payload should have user_agent")
-            .app_version
-            .as_ref()
-            .expect("user_agent should have app_version");
+        let version = &payload.user_agent.app_version;
         let version_str = format!(
             "{}.{}.{}",
-            version.primary(),
-            version.secondary(),
-            version.tertiary()
+            version.primary.unwrap_or(0),
+            version.secondary.unwrap_or(0),
+            version.tertiary.unwrap_or(0)
         );
-        let build_hash: [u8; 16] = md5::compute(version_str.as_bytes()).into();
+        let build_hash = crate::crypto::md5_digest(version_str.as_bytes());
 
         let reg_data = wa::client_payload::DevicePairingRegistrationData {
             e_regid: Some(self.registration_id.to_be_bytes().to_vec()),
@@ -492,7 +508,7 @@ impl Device {
             device_props: Some(device_props_bytes),
         };
 
-        payload.device_pairing_data = Some(reg_data);
+        payload.device_pairing_data = buffa::MessageField::some(reg_data);
         payload.passive = Some(false);
         payload.pull = Some(false);
 
@@ -506,8 +522,10 @@ impl Device {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use buffa::Message;
 
     #[test]
     fn test_registration_id_range() {
@@ -579,7 +597,7 @@ mod tests {
     #[test]
     fn test_device_serde_preserves_account() {
         let mut device = Device::new();
-        device.account = Some(Arc::new(wa::AdvSignedDeviceIdentity {
+        device.account = Some(Arc::new(wa::ADVSignedDeviceIdentity {
             details: Some(b"test-details".to_vec()),
             account_signature_key: Some(vec![1; 32]),
             account_signature: Some(vec![2; 64]),
@@ -613,21 +631,28 @@ mod tests {
         device.set_device_props(
             DevicePropsOverride::new()
                 .with_os("Android 14")
-                .with_platform_type(wa::device_props::PlatformType::AndroidPhone),
+                .with_platform_type(wa::device_props::PlatformType::ANDROID_PHONE),
         );
 
         let payload = device.get_client_payload();
-        let reg = payload.device_pairing_data.expect("device_pairing_data");
+        let reg = payload
+            .device_pairing_data
+            .into_option()
+            .expect("device_pairing_data");
         let bytes = reg.device_props.expect("device_props bytes");
-        let props = wa::DeviceProps::decode(bytes.as_slice()).expect("decode DeviceProps");
+        let props =
+            wa::DeviceProps::decode_from_slice(bytes.as_slice()).expect("decode DeviceProps");
 
         assert_eq!(props.os.as_deref(), Some("Android 14"));
         assert_eq!(
             props.platform_type,
-            Some(wa::device_props::PlatformType::AndroidPhone as i32)
+            Some(wa::device_props::PlatformType::ANDROID_PHONE)
         );
         // None preserves the default version.
-        assert_eq!(props.version, Some(Device::default_device_props_version()));
+        assert_eq!(
+            props.version.as_option(),
+            Some(&Device::default_device_props_version())
+        );
     }
 
     /// `HistorySyncConfig` override is delivered whole — users patch by
@@ -646,11 +671,16 @@ mod tests {
         let payload = device.get_client_payload();
         let bytes = payload
             .device_pairing_data
+            .into_option()
             .expect("device_pairing_data")
             .device_props
             .expect("device_props bytes");
-        let props = wa::DeviceProps::decode(bytes.as_slice()).expect("decode DeviceProps");
-        let hsc = props.history_sync_config.expect("history_sync_config");
+        let props =
+            wa::DeviceProps::decode_from_slice(bytes.as_slice()).expect("decode DeviceProps");
+        let hsc = props
+            .history_sync_config
+            .into_option()
+            .expect("history_sync_config");
 
         assert_eq!(hsc.full_sync_days_limit, Some(365));
         assert_eq!(hsc.support_group_history, Some(true));
@@ -667,12 +697,12 @@ mod tests {
         device.pn = Some("12345@s.whatsapp.net".parse().unwrap());
         device.set_device_props(
             DevicePropsOverride::new()
-                .with_platform_type(wa::device_props::PlatformType::AndroidPhone),
+                .with_platform_type(wa::device_props::PlatformType::ANDROID_PHONE),
         );
 
         let payload = device.get_client_payload();
         assert!(
-            payload.device_pairing_data.is_none(),
+            payload.device_pairing_data.is_unset(),
             "login payload must not carry device_pairing_data"
         );
     }
@@ -681,16 +711,22 @@ mod tests {
     fn default_profile_emits_legacy_web_payload() {
         let device = Device::new();
         let payload = device.get_client_payload();
-        let ua = payload.user_agent.expect("user_agent");
-        assert_eq!(ua.platform(), wa::client_payload::user_agent::Platform::Web);
+        let ua = payload.user_agent.as_option().expect("user_agent");
+        assert_eq!(
+            ua.platform,
+            Some(wa::client_payload::user_agent::Platform::WEB)
+        );
         assert_eq!(ua.device.as_deref(), Some("Desktop"));
         assert_eq!(ua.os_version.as_deref(), Some("0.1.0"));
         assert_eq!(ua.os_build_number.as_deref(), Some("0.1.0"));
         assert_eq!(ua.manufacturer.as_deref(), Some(""));
-        let web_info = payload.web_info.expect("web profile must include web_info");
+        let web_info = payload
+            .web_info
+            .as_option()
+            .expect("web profile must include web_info");
         assert_eq!(
-            web_info.web_sub_platform(),
-            wa::client_payload::web_info::WebSubPlatform::WebBrowser
+            web_info.web_sub_platform,
+            Some(wa::client_payload::web_info::WebSubPlatform::WEB_BROWSER)
         );
     }
 
@@ -700,16 +736,16 @@ mod tests {
         device.set_client_profile(ClientProfile::android("13"));
 
         let payload = device.get_client_payload();
-        let ua = payload.user_agent.expect("user_agent");
+        let ua = payload.user_agent.as_option().expect("user_agent");
         assert_eq!(
-            ua.platform(),
-            wa::client_payload::user_agent::Platform::Android
+            ua.platform,
+            Some(wa::client_payload::user_agent::Platform::ANDROID)
         );
         assert_eq!(ua.device.as_deref(), Some("Smartphone"));
         assert_eq!(ua.os_version.as_deref(), Some("13"));
         assert_eq!(ua.os_build_number.as_deref(), Some("13"));
         assert!(
-            payload.web_info.is_none(),
+            payload.web_info.is_unset(),
             "android profile must omit web_info"
         );
     }
@@ -721,14 +757,14 @@ mod tests {
         device.pn = Some("12345@s.whatsapp.net".parse().unwrap());
 
         let payload = device.get_client_payload();
-        let ua = payload.user_agent.expect("user_agent");
+        let ua = payload.user_agent.as_option().expect("user_agent");
         assert_eq!(
-            ua.platform(),
-            wa::client_payload::user_agent::Platform::Android
+            ua.platform,
+            Some(wa::client_payload::user_agent::Platform::ANDROID)
         );
-        assert!(payload.web_info.is_none());
+        assert!(payload.web_info.is_unset());
         assert!(
-            payload.device_pairing_data.is_none(),
+            payload.device_pairing_data.is_unset(),
             "login payload still must not carry device_pairing_data"
         );
     }
@@ -738,13 +774,16 @@ mod tests {
         let mut device = Device::new();
         device.set_device_props(
             DevicePropsOverride::new()
-                .with_platform_type(wa::device_props::PlatformType::AndroidPhone),
+                .with_platform_type(wa::device_props::PlatformType::ANDROID_PHONE),
         );
 
         let payload = device.get_client_payload();
-        let ua = payload.user_agent.expect("user_agent");
-        assert_eq!(ua.platform(), wa::client_payload::user_agent::Platform::Web);
-        assert!(payload.web_info.is_some());
+        let ua = payload.user_agent.as_option().expect("user_agent");
+        assert_eq!(
+            ua.platform,
+            Some(wa::client_payload::user_agent::Platform::WEB)
+        );
+        assert!(payload.web_info.is_set());
     }
 
     #[test]
@@ -761,10 +800,10 @@ mod tests {
             device.set_client_profile(profile);
 
             let payload = device.get_client_payload();
-            let ua = payload.user_agent.expect("user_agent");
-            assert_eq!(ua.platform(), platform);
+            let ua = payload.user_agent.as_option().expect("user_agent");
+            assert_eq!(ua.platform, Some(platform));
             assert!(
-                payload.web_info.is_none(),
+                payload.web_info.is_unset(),
                 "{platform:?} must omit web_info"
             );
         }
@@ -777,8 +816,8 @@ mod tests {
         let device = Device::new();
         let payload_a = device.get_client_payload();
         let payload_b = device.get_client_payload();
-        let ua_a = payload_a.user_agent.as_ref().expect("user_agent");
-        let ua_b = payload_b.user_agent.as_ref().expect("user_agent");
+        let ua_a = payload_a.user_agent.as_option().expect("user_agent");
+        let ua_b = payload_b.user_agent.as_option().expect("user_agent");
         assert!(
             ua_a.phone_id.is_none(),
             "default ClientProfile must leave UserAgent.phoneId unset (got {:?})",
@@ -805,7 +844,7 @@ mod tests {
         device.set_client_profile(profile);
 
         let payload = device.get_client_payload();
-        let ua = payload.user_agent.expect("user_agent");
+        let ua = payload.user_agent.as_option().expect("user_agent");
         assert_eq!(ua.phone_id.as_deref(), Some("fixed-test-id"));
     }
 
@@ -814,7 +853,7 @@ mod tests {
         let mut device = Device::new();
         device.pn = Some("12345:0@s.whatsapp.net".parse().unwrap());
         let payload = device.get_client_payload();
-        let ua = payload.user_agent.expect("user_agent");
+        let ua = payload.user_agent.as_option().expect("user_agent");
         assert!(
             ua.phone_id.is_none(),
             "login payload phoneId must be omitted (WA Web compliance)"

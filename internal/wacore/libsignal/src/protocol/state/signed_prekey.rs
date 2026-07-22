@@ -6,11 +6,9 @@
 use std::convert::AsRef;
 use std::fmt;
 
-use prost::Message;
-
 use crate::protocol::{
-    stores::SignedPreKeyRecordStructure, KeyPair, PrivateKey, PublicKey, Result,
-    SignalProtocolError, Timestamp,
+    KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, Timestamp,
+    stores::SignedPreKeyRecordStructure,
 };
 
 /// A unique identifier selecting among this client's known signed pre-keys.
@@ -81,7 +79,9 @@ pub trait GenericSignedPreKey {
     }
 
     fn serialize(&self) -> Result<Vec<u8>> {
-        Ok(self.get_storage().encode_to_vec())
+        Ok(waproto::codec::signed_pre_key_record_to_vec(
+            self.get_storage(),
+        ))
     }
 
     fn deserialize(data: &[u8]) -> Result<Self>
@@ -89,7 +89,7 @@ pub trait GenericSignedPreKey {
         Self: Sized,
     {
         Ok(Self::from_storage(
-            SignedPreKeyRecordStructure::decode(data)
+            waproto::codec::signed_pre_key_record_decode(data)
                 .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?,
         ))
     }

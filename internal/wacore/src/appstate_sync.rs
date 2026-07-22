@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use async_lock::Mutex;
 use async_trait::async_trait;
-use prost::Message;
 use thiserror::Error;
 
 use crate::appstate::hash::HashState;
@@ -14,7 +13,7 @@ use crate::appstate::patch_decode::{
     parse_patch_lists, parse_patch_lists_ref,
 };
 use crate::appstate::{
-    collect_key_ids_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
+    collect_key_id_refs_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
 };
 use crate::store::traits::Backend;
 use wacore_binary::{Node, NodeRef};
@@ -25,58 +24,54 @@ pub use crate::appstate::Mutation;
 
 /// Index MAC carried by a mutation's record, if present.
 fn mutation_index_mac(m: &wa::SyncdMutation) -> Option<&[u8]> {
-    m.record.as_ref()?.index.as_ref()?.blob.as_deref()
+    m.record.as_option()?.index.as_option()?.blob.as_deref()
 }
 
-/// Unique index MACs of a patch's mutations, in first-seen order, feeding the
-/// batched previous-value-MAC backend lookup.
+/// A mutation's index MAC as the fixed-size HMAC-SHA256 array; `None` for a
+/// missing OR malformed (non-32-byte) blob. A malformed MAC could never match a
+/// stored row, so dropping it from the batch lookup is equivalent to the miss
+/// the lookup would return anyway.
+fn mutation_index_mac_array(m: &wa::SyncdMutation) -> Option<IndexMac> {
+    mutation_index_mac(m).and_then(|b| b.try_into().ok())
+}
+
+/// An appstate mutation index MAC: a full HMAC-SHA256 output, so always 32
+/// bytes. Inline (`Copy`) so batch lookups sort/hash flat arrays with zero
+/// per-MAC heap allocations.
+pub type IndexMac = [u8; 32];
+
+/// Distinct index MACs of a patch's mutations, feeding the batched
+/// previous-value-MAC backend lookup. Both callers pass the result straight to a
+/// `get_mutation_macs` HashMap fetch, so the order is unspecified.
 ///
-/// Small patches use a cache-friendly linear scan (a HashSet measured 6-120%
-/// slower at small N here). Patches carry up to ~1000 mutations, where the
-/// scan's O(n²) compares dominate, so above [`MAC_DEDUP_SCAN_LIMIT`] dedup runs
-/// through a sort of position indices — O(n log n) with only a `Vec<u32>` of
-/// scratch, far cheaper than a `HashSet` of 32-byte MACs — then re-emits in
-/// first-seen order.
-pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
+/// Small patches dedup with a linear scan; larger patches sort + dedup the
+/// inline arrays in place. Either way the only allocation is the returned `Vec`
+/// itself: the comparator touches contiguous 32-byte elements (never re-walking
+/// the boxed record/index/blob `MessageField` chain, the part buffa makes
+/// pricier than prost's `Option` derefs).
+pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMac> {
     if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
+        let mut out: Vec<IndexMac> = Vec::with_capacity(mutations.len());
         for m in mutations {
-            if let Some(mac) = mutation_index_mac(m)
-                && !out.iter().any(|v| v.as_slice() == mac)
+            if let Some(mac) = mutation_index_mac_array(m)
+                && !out.contains(&mac)
             {
-                out.push(mac.to_vec());
+                out.push(mac);
             }
         }
         return out;
     }
 
-    // Indices in `order` always carry a MAC, so the default branch is dead; it
-    // only keeps the lookup `unwrap`-free.
-    let mac_at = |i: u32| mutation_index_mac(&mutations[i as usize]).unwrap_or_default();
-
-    // Positions of mutations carrying a MAC, in first-seen order. Pre-sized to
-    // one allocation (the only scratch this path adds over the returned Vec).
-    let mut order: Vec<u32> = Vec::with_capacity(mutations.len());
-    order.extend(
-        mutations
-            .iter()
-            .enumerate()
-            .filter_map(|(i, m)| mutation_index_mac(m).map(|_| i as u32)),
-    );
-
-    // Group equal MACs (ties broken by position so each run's first occurrence
-    // leads it), drop all but each run's leader, then restore first-seen order.
-    order.sort_unstable_by(|&a, &b| mac_at(a).cmp(mac_at(b)).then(a.cmp(&b)));
-    order.dedup_by(|&mut a, &mut b| mac_at(a) == mac_at(b));
-    order.sort_unstable();
-
-    order.into_iter().map(|i| mac_at(i).to_vec()).collect()
+    let mut macs: Vec<IndexMac> = Vec::with_capacity(mutations.len());
+    macs.extend(mutations.iter().filter_map(mutation_index_mac_array));
+    macs.sort_unstable();
+    macs.dedup();
+    macs
 }
 
-/// Mutation count above which [`collect_unique_index_macs`] switches from the
-/// cache-friendly O(n²) linear scan to the O(n log n) index sort. Chosen well
-/// below the ~1000-mutation patch ceiling and above the small-N range where the
-/// scan beats sorting.
+/// Mutation count at or below which [`collect_unique_index_macs`] dedups with a
+/// linear scan instead of a sort; above it the sort wins despite allocating
+/// every MAC before deduping.
 const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 fn lookup_app_state_key(
@@ -102,33 +97,39 @@ fn lookup_app_state_key(
 /// external fetch and lets the collection error out, rather than applying an empty
 /// patch and advancing the version. Swallowing it here would silently drop the
 /// blob's mutations and still persist the new version, losing that data permanently.
-fn download_external_blobs<FDownload>(pl: &mut PatchList, download: &FDownload) -> Result<()>
-where
-    FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>>,
-{
+fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) -> Result<()> {
     let name = pl.name;
     if pl.snapshot.is_none()
         && let Some(ext) = &pl.snapshot_ref
     {
         let data =
             download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
-        let snapshot = wa::SyncdSnapshot::decode(data.as_slice())
+        let snapshot = waproto::codec::syncd_snapshot_decode(data.as_slice())
             .with_context(|| format!("decode external snapshot for {name:?}"))?;
         pl.snapshot = Some(snapshot);
     }
 
     for patch in &mut pl.patches {
-        if let Some(ext) = &patch.external_mutations {
-            let v = patch.version.as_ref().and_then(|x| x.version).unwrap_or(0);
+        if let Some(ext) = patch.external_mutations.as_option() {
+            let v = patch
+                .version
+                .as_option()
+                .and_then(|x| x.version)
+                .unwrap_or(0);
             let data = download(ext)
                 .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
-            let ext_mutations = wa::SyncdMutations::decode(data.as_slice())
+            let ext_mutations = waproto::codec::syncd_mutations_decode(data.as_slice())
                 .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
             patch.mutations = ext_mutations.mutations;
         }
     }
     Ok(())
 }
+
+/// External-blob resolver as a trait object, so the large download/decode/apply
+/// bodies below instantiate once instead of per closure type.
+pub type BlobDownloadFn<'a> =
+    dyn Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync + 'a;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -182,23 +183,20 @@ impl AppStateProcessor {
 
     /// Pre-fetch and cache all keys needed for a patch list.
     async fn prefetch_keys(&self, pl: &PatchList) -> Result<()> {
-        let key_ids = collect_key_ids_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
+        let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         for key_id in key_ids {
             // This will fetch and cache if not already cached
-            let _ = self.get_app_state_key(&key_id).await;
+            let _ = self.get_app_state_key(key_id).await;
         }
         Ok(())
     }
 
-    pub async fn decode_patch_list_ref<FDownload>(
+    pub async fn decode_patch_list_ref(
         &self,
         stanza_root: &NodeRef<'_>,
-        download: FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         let pl = parse_patch_list_ref(stanza_root)?;
         self.process_parsed_patch_list(pl, download, validate_macs)
             .await
@@ -208,42 +206,33 @@ impl AppStateProcessor {
     /// `download`, then decode + apply. Lets a caller that parsed the response for
     /// pre-download avoid re-parsing it. See [`decode_patch_list_ref`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
-    pub async fn process_parsed_patch_list<FDownload>(
+    pub async fn process_parsed_patch_list(
         &self,
         mut pl: PatchList,
-        download: FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
-        download_external_blobs(&mut pl, &download)?;
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        download_external_blobs(&mut pl, download)?;
         self.process_patch_list(pl, validate_macs).await
     }
 
-    pub async fn decode_patch_list<FDownload>(
+    pub async fn decode_patch_list(
         &self,
         stanza_root: &Node,
-        download: FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         let pl = parse_patch_list(stanza_root)?;
         self.process_parsed_patch_list(pl, download, validate_macs)
             .await
     }
 
-    pub async fn decode_multi_patch_list_ref<FDownload>(
+    pub async fn decode_multi_patch_list_ref(
         &self,
         stanza_root: &NodeRef<'_>,
-        download: &FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
         let patch_lists = parse_patch_lists_ref(stanza_root)?;
         self.process_patch_lists(patch_lists, download, validate_macs)
             .await
@@ -251,15 +240,12 @@ impl AppStateProcessor {
 
     /// Decode a multi-collection IQ response into per-collection results.
     /// Each collection is parsed and processed independently.
-    pub async fn decode_multi_patch_list<FDownload>(
+    pub async fn decode_multi_patch_list(
         &self,
         stanza_root: &Node,
-        download: &FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
         let patch_lists = parse_patch_lists(stanza_root)?;
         self.process_patch_lists(patch_lists, download, validate_macs)
             .await
@@ -269,15 +255,12 @@ impl AppStateProcessor {
     /// `download`. Lets callers that already parsed the IQ response (e.g. to
     /// pre-download blobs) avoid re-parsing it. See [`decode_multi_patch_list_ref`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_lists", level = "debug", skip_all, fields(count = patch_lists.len()), err(Debug)))]
-    pub async fn process_patch_lists<FDownload>(
+    pub async fn process_patch_lists(
         &self,
         patch_lists: Vec<PatchList>,
-        download: &FDownload,
+        download: &BlobDownloadFn<'_>,
         validate_macs: bool,
-    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
-    {
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>> {
         let mut results = Vec::with_capacity(patch_lists.len());
 
         for mut pl in patch_lists {
@@ -329,7 +312,7 @@ impl AppStateProcessor {
         // roll the collection backward. No-op on the benign first-sync path, where snapshots
         // are requested only at version 0.
         let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
-            let snapshot_version = snapshot.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+            let snapshot_version = snapshot.version.as_option().and_then(|v| v.version).unwrap_or(0);
             if snapshot_is_stale(state.version, snapshot_version) {
                 log::warn!(
                     target: "AppState",
@@ -408,7 +391,7 @@ impl AppStateProcessor {
             let first_version = pl
                 .patches
                 .first()
-                .and_then(|p| p.version.as_ref())
+                .and_then(|p| p.version.as_option())
                 .and_then(|v| v.version)
                 .unwrap_or(0);
             if !pl.patches.is_empty() && first_version != 1 {
@@ -449,7 +432,7 @@ impl AppStateProcessor {
 
             // Fetch previous value MACs in one backend round-trip instead of a
             // spawn_blocking + query per mutation (N+1).
-            let db_prev: HashMap<Vec<u8>, Vec<u8>> = self
+            let db_prev: HashMap<IndexMac, Vec<u8>> = self
                 .backend
                 .get_mutation_macs(collection_name, &need_db_lookup)
                 .await?;
@@ -460,10 +443,13 @@ impl AppStateProcessor {
 
             // Offload CPU-intensive patch processing to a blocking thread
             let (result, patch) = crate::runtime::blocking(&*self.runtime, move || {
-                let get_prev_value_mac = |index_mac: &[u8]| -> Result<
-                    Option<Vec<u8>>,
-                    crate::appstate::AppStateError,
-                > { Ok(db_prev.get(index_mac).cloned()) };
+                let get_prev_value_mac =
+                    |index_mac: &[u8]| -> Result<Option<Vec<u8>>, crate::appstate::AppStateError> {
+                        Ok(<&IndexMac>::try_from(index_mac)
+                            .ok()
+                            .and_then(|k| db_prev.get(k))
+                            .cloned())
+                    };
 
                 let mut state = state_clone;
                 let result = process_patch(
@@ -548,14 +534,17 @@ impl AppStateProcessor {
         // the inbound patch path: one batched query instead of a
         // spawn_blocking + single-row SELECT per mutation.
         let need_db_lookup = collect_unique_index_macs(&mutations);
-        let db_prev: std::collections::HashMap<Vec<u8>, Vec<u8>> = self
+        let db_prev: std::collections::HashMap<IndexMac, Vec<u8>> = self
             .backend
             .get_mutation_macs(collection_name, &need_db_lookup)
             .await?;
 
         // Update hash state
         let (_, hash_result) = state.update_hash(&mutations, |index_mac, _| {
-            Ok(db_prev.get(index_mac).cloned())
+            Ok(<&IndexMac>::try_from(index_mac)
+                .ok()
+                .and_then(|k| db_prev.get(k))
+                .cloned())
         });
         hash_result?;
 
@@ -567,7 +556,7 @@ impl AppStateProcessor {
         // Build the patch — matching whatsmeow: no Version or DeviceIndex fields
         let mut patch = wa::SyncdPatch {
             snapshot_mac: Some(snapshot_mac),
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             mutations,
@@ -579,17 +568,17 @@ impl AppStateProcessor {
         patch.patch_mac = Some(patch_mac);
 
         // Encode to protobuf
-        let patch_bytes = patch.encode_to_vec();
+        let patch_bytes = waproto::codec::syncd_patch_to_vec(&patch);
 
         Ok((patch_bytes, base_version))
     }
 
     pub async fn get_missing_key_ids(&self, pl: &PatchList) -> Result<Vec<Vec<u8>>> {
-        let key_ids = collect_key_ids_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
+        let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         let mut missing = Vec::with_capacity(key_ids.len());
         for id in key_ids {
-            if self.backend.get_sync_key(&id).await?.is_none() {
-                missing.push(id);
+            if self.backend.get_sync_key(id).await?.is_none() {
+                missing.push(id.to_vec());
             }
         }
         Ok(missing)
@@ -602,29 +591,25 @@ impl AppStateProcessor {
     /// with `KeyNotFound`. Used by the sync paths to request missing keys up front.
     /// Idempotent: `download_external_blobs` no-ops once the blobs are inlined, and the
     /// supplied `download` closure should read from the already-prefetched cache.
-    pub async fn missing_key_ids_after_inline<FDownload>(
+    pub async fn missing_key_ids_after_inline(
         &self,
         pl: &mut PatchList,
-        download: &FDownload,
-    ) -> Result<Vec<Vec<u8>>>
-    where
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>>,
-    {
+        download: &BlobDownloadFn<'_>,
+    ) -> Result<Vec<Vec<u8>>> {
         download_external_blobs(pl, download)?;
         self.get_missing_key_ids(pl).await
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_collection", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    pub async fn sync_collection<D, FDownload>(
+    pub async fn sync_collection<D>(
         &self,
         driver: &D,
         name: WAPatchName,
         validate_macs: bool,
-        download: FDownload,
+        download: &BlobDownloadFn<'_>,
     ) -> Result<Vec<Mutation>>
     where
         D: AppStateSyncDriver + Sync,
-        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
     {
         let mut all = Vec::new();
         // Bound re-fetches so a server that keeps returning a retryable collection
@@ -635,7 +620,7 @@ impl AppStateProcessor {
             let state = self.backend.get_version(name.as_str()).await?;
             let node = driver.fetch_collection(name, state.version).await?;
             let (mut muts, _new_state, list) = self
-                .decode_patch_list(&node, &download, validate_macs)
+                .decode_patch_list(&node, download, validate_macs)
                 .await?;
             all.append(&mut muts);
             // A retryable error (or conflict-with-more) left the version unadvanced;
@@ -749,7 +734,7 @@ mod external_blob_tests {
             name: WAPatchName::Regular,
             has_more_patches: false,
             patches: vec![wa::SyncdPatch {
-                external_mutations: Some(wa::ExternalBlobReference {
+                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
                     direct_path: Some("/mutations".into()),
                     ..Default::default()
                 }),
@@ -779,8 +764,8 @@ mod dedup_tests {
 
     fn mutation(index_mac: &[u8]) -> wa::SyncdMutation {
         wa::SyncdMutation {
-            record: Some(wa::SyncdRecord {
-                index: Some(wa::SyncdIndex {
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac.to_vec()),
                 }),
                 ..Default::default()
@@ -790,7 +775,7 @@ mod dedup_tests {
     }
 
     /// Builds `n` mutations whose index MACs repeat every `distinct` values, so
-    /// the expected output is the first `distinct` MACs in first-seen order.
+    /// the distinct set is the first `distinct` MACs.
     fn build(n: usize, distinct: usize) -> Vec<wa::SyncdMutation> {
         (0..n)
             .map(|i| {
@@ -801,48 +786,29 @@ mod dedup_tests {
             .collect()
     }
 
-    fn mac_bytes(i: usize) -> Vec<u8> {
-        let mut mac = vec![0u8; 32];
+    fn mac_bytes(i: usize) -> IndexMac {
+        let mut mac = [0u8; 32];
         mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
         mac
     }
 
-    fn expected(distinct: usize) -> Vec<Vec<u8>> {
+    fn expected(distinct: usize) -> Vec<IndexMac> {
         (0..distinct).map(mac_bytes).collect()
     }
 
-    /// Both dedup paths must yield identical first-seen-order unique results;
-    /// the index-sort path (large N) and scan path (small N) cannot diverge.
+    /// Dedups to the distinct index MACs across small and large N, dropping
+    /// repeats. Order is unspecified (callers feed a HashMap lookup), so compare
+    /// as sorted sets.
     #[test]
-    fn scan_and_sort_paths_agree() {
-        // Small N exercises the linear scan; large N (> limit) the index sort.
-        for &n in &[8usize, MAC_DEDUP_SCAN_LIMIT, MAC_DEDUP_SCAN_LIMIT + 1, 1000] {
+    fn dedups_to_distinct_macs() {
+        for &n in &[8usize, 64, 65, 1000] {
             let distinct = (n / 2).max(1);
-            assert_eq!(
-                collect_unique_index_macs(&build(n, distinct)),
-                expected(distinct),
-                "n = {n}"
-            );
+            let mut got = collect_unique_index_macs(&build(n, distinct));
+            got.sort_unstable();
+            let mut want = expected(distinct);
+            want.sort_unstable();
+            assert_eq!(got, want, "n = {n}");
         }
-    }
-
-    /// The index-sort path must re-emit in first-seen order, not byte-sort order.
-    /// Force that path (> limit MACs) with first appearances running opposite to
-    /// byte order, plus trailing duplicates that must be dropped — so a bug in
-    /// the order-restoration step can't pass by coinciding with the sort order.
-    #[test]
-    fn sort_path_restores_first_seen_order() {
-        let distinct = MAC_DEDUP_SCAN_LIMIT + 20;
-        // First-seen order is descending i; byte order is ascending (i < 256).
-        let mut mutations: Vec<wa::SyncdMutation> = (0..distinct)
-            .rev()
-            .map(|i| mutation(&mac_bytes(i)))
-            .collect();
-        for i in [distinct - 1, distinct / 2, 0] {
-            mutations.push(mutation(&mac_bytes(i)));
-        }
-        let want: Vec<Vec<u8>> = (0..distinct).rev().map(mac_bytes).collect();
-        assert_eq!(collect_unique_index_macs(&mutations), want);
     }
 
     #[test]
@@ -853,12 +819,13 @@ mod dedup_tests {
             mutation(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             mutation(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         ];
-        let macs = collect_unique_index_macs(&mutations);
+        let mut macs = collect_unique_index_macs(&mutations);
+        macs.sort_unstable();
         assert_eq!(
             macs,
             vec![
-                b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(),
-                b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec()
+                *b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                *b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ]
         );
     }

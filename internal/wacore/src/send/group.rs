@@ -16,7 +16,7 @@ pub async fn prepare_group_retry_stanza<S, I>(
     message: &wa::Message,
     message_id: String,
     retry_count: u8,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
     addressing_mode: crate::types::message::AddressingMode,
     edit: Option<crate::types::message::EditAttribute>,
 ) -> Result<Node>
@@ -88,12 +88,13 @@ where
 /// tracking without re-resolving devices.
 pub struct PreparedGroupStanza {
     pub node: Node,
-    /// Full SKDM distribution target set, marked `has_key=true` after the
-    /// server ACK. Mirrors WA Web `markHasSenderKey(x, M)` which marks the
-    /// whole target set `M`, not only the devices that encrypted successfully:
-    /// devices that failed (406 / no bundle) are marked too so they are not
-    /// re-targeted on every send (the retry-receipt path repairs any that are
-    /// actually alive and keyless via `mark_forget_sender_key`).
+    /// Full SKDM distribution target set. After the server ACK the persist step
+    /// (`update_sender_key_devices`) marks `has_key=true`, mirroring WA Web
+    /// `markHasSenderKey(x, M)`: the whole target `M`, not only the devices that
+    /// encrypted successfully, so a failed external device (406 / no bundle) isn't
+    /// re-targeted every send (the retry-receipt path repairs any alive-but-keyless
+    /// one). Own devices are filtered out at persist time (WA Web `!isMeDevice`), so
+    /// own companions are never memoized and get a fresh SKDM every send.
     pub skdm_devices: Vec<Jid>,
     /// Users whose device registry should be invalidated because their
     /// devices returned 406 (unregistered) during SKDM prekey fetch.
@@ -120,7 +121,7 @@ pub async fn prepare_group_stanza(
     group_info: &GroupInfo,
     own_jid: &Jid,
     own_lid: &Jid,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
     to_jid: Jid,
     message: &wa::Message,
     request_id: String,
@@ -133,24 +134,27 @@ pub async fn prepare_group_stanza(
     all_devices_for_phash: Option<std::sync::Arc<super::ResolvedGroupDevices>>,
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
+    // Avoids a second full encode when the caller already serialized the message;
+    // ignored on the mci-hoist path (see `shared_content`).
+    pre_encoded: Option<std::sync::Arc<Vec<u8>>>,
 ) -> Result<PreparedGroupStanza> {
     let (own_sending_jid, _) = match group_info.addressing_mode {
         crate::types::message::AddressingMode::Lid => (own_lid.clone(), "lid"),
         crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
     };
 
-    // Encode the message once and thread those bytes through both the reporting token
-    // (whitelisted-field extraction) and the skmsg wire plaintext below, instead of
-    // encoding it twice per send. The rare mci-hoist path (message carries a top-level
-    // message_context_info) can't share: its plaintext folds the reporting secret into the
-    // existing mci, diverging from the bytes the token is computed over, so it re-encodes.
-    let shared_content = message
-        .message_context_info
-        .is_none()
-        .then(|| waproto::codec::message_to_vec(message));
+    // Encode the message at most once (reusing the caller's `pre_encoded` bytes when
+    // provided) and thread those bytes through both the reporting token
+    // (whitelisted-field extraction) and the skmsg wire plaintext below. The rare
+    // mci-hoist path (message carries a top-level message_context_info) can't share:
+    // its plaintext folds the reporting secret into the existing mci, diverging from
+    // the bytes the token is computed over, so it re-encodes.
+    let shared_content = message.message_context_info.is_unset().then(|| {
+        pre_encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)))
+    });
 
     // Generate reporting token if the message type supports it.
-    // For groups, both sender_jid and remote_jid are the group JID (to_jid) per Baileys implementation.
+    // For groups, both sender_jid and remote_jid are the destination group JID.
     // Reuse the message's own secret when the caller set one (e.g. polls) instead of minting a fresh
     // one that would overwrite it, matching WA Web (the reporting token derives from messageSecret).
     let existing_secret = crate::reporting_token::extract_message_secret(message);
@@ -338,6 +342,16 @@ pub async fn prepare_group_stanza(
 
     let sender_key_name = make_sender_key_name(&to_jid, &own_sending_jid.to_protocol_address());
 
+    // Hold the per-device session locks the DM path uses across BOTH the X3DH setup
+    // and the SKDM fan-out below, so a concurrent DM or group send sharing a device
+    // can't race that device's pairwise session (create or ratchet-advance). The DM
+    // path holds the same locks across all of prepare_dm_stanza; sender_key_lock only
+    // serializes the sender-key chain. Acquired before sender_key_lock so the whole
+    // send path takes session -> sender-key order (no other path takes the reverse).
+    let session_guard = resolver
+        .lock_device_sessions(distribution_list.as_deref().unwrap_or(&[]))
+        .await;
+
     // Establish missing pairwise sessions (prekey fetch + X3DH) for the SKDM
     // targets before taking the chain lock, so the chain critical section
     // below never spans a network RTT — concurrent sends to the same group
@@ -371,20 +385,29 @@ pub async fn prepare_group_stanza(
         None => None,
     };
 
-    // Hold the chain lock across SKDM creation + the skmsg encrypt, so
-    // concurrent same-(group, sender) sends can't split the key between the
-    // SKDM and the skmsg (nor reuse a chain iteration). The lock covers only
-    // chain-touching steps; session setup and device resolution stay outside.
+    // Padding is chain-independent; compute it before the lock so the
+    // per-(group,sender) serialization point covers only the ratchet steps.
+    let plaintext = match &shared_content {
+        Some(content) => {
+            MessageUtils::pad_with_context_from_encoded(content, reporting_context.as_ref())
+        }
+        None => MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref()),
+    };
+
+    // The lock spans SKDM creation, the pairwise SKDM fan-out, and the skmsg
+    // encrypt. Creating the SKDM snapshots the sender key and the skmsg uses it,
+    // so those must be atomic. Per-device pairwise sessions are guarded separately
+    // by `session_guard` above. Dropped after the encrypt so only the stanza build
+    // runs off the serialization point.
     let chain_lock = stores
         .sender_key_store
         .sender_key_lock(&sender_key_name)
         .await;
-    let _chain_guard = chain_lock.lock().await;
+    let chain_guard = chain_lock.lock().await;
 
     if let Some(ref distribution_list) = distribution_list {
         // Created even when session setup failed (plan None): the sender-key
-        // record must exist so the skmsg below still encrypts, preserving the
-        // continue-without-distribution semantics.
+        // record must exist so the skmsg below still encrypts.
         let axolotl_skdm_bytes = create_sender_key_distribution_message_for_group(
             stores.sender_key_store,
             &sender_key_name,
@@ -393,10 +416,12 @@ pub async fn prepare_group_stanza(
 
         if let Some(plan) = session_plan {
             let skdm_wrapper_msg = wa::Message {
-                sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
-                    group_id: Some(to_jid.to_string()),
-                    axolotl_sender_key_distribution_message: Some(axolotl_skdm_bytes),
-                }),
+                sender_key_distribution_message: buffa::MessageField::some(
+                    wa::message::SenderKeyDistributionMessage {
+                        group_id: Some(to_jid.to_string()),
+                        axolotl_sender_key_distribution_message: Some(axolotl_skdm_bytes),
+                    },
+                ),
                 ..Default::default()
             };
             let skdm_plaintext_to_encrypt = MessageUtils::encode_and_pad(&skdm_wrapper_msg);
@@ -460,14 +485,11 @@ pub async fn prepare_group_stanza(
         }
     }
 
-    // Reuse the shared encode (also fed to the reporting token) for the skmsg plaintext
-    // instead of encoding the message a second time; the mci-hoist path re-encodes.
-    let plaintext = match &shared_content {
-        Some(content) => {
-            MessageUtils::pad_with_context_from_encoded(content, reporting_context.as_ref())
-        }
-        None => MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref()),
-    };
+    // The skmsg encrypt only advances the sender-key chain, not any pairwise
+    // session, so release the per-device locks now instead of holding them across
+    // it (avoids head-of-line blocking a concurrent DM to a shared device).
+    drop(session_guard);
+
     let skmsg = encrypt_group_message(
         stores.sender_key_store,
         &sender_key_name,
@@ -475,6 +497,9 @@ pub async fn prepare_group_stanza(
         &mut rand::make_rng::<rand::rngs::StdRng>(),
     )
     .await?;
+
+    // Release before the chain-independent stanza build.
+    drop(chain_guard);
 
     let skmsg_ciphertext = skmsg.into_serialized();
 
@@ -494,13 +519,18 @@ pub async fn prepare_group_stanza(
     let content_node = enc_builder.build();
 
     let stanza_type = stanza_type_from_message(message);
+    // status@broadcast is sent as a bare <message> (not <status>) with no addressing_mode,
+    // matching WA Web; the server NACKs a <status> tag (400) or an addressing_mode (479).
+    let is_status_broadcast = to_jid.is_status_broadcast();
     let mut stanza_builder = NodeBuilder::new("message")
         .attr("to", to_jid)
         .attr("id", request_id)
         .attr("type", stanza_type);
 
-    // WA Web always sets addressing_mode for groups (MsgCreateDeviceStanza.js:131-135)
-    stanza_builder = stanza_builder.attr("addressing_mode", group_info.addressing_mode.as_str());
+    if !is_status_broadcast {
+        stanza_builder =
+            stanza_builder.attr("addressing_mode", group_info.addressing_mode.as_str());
+    }
 
     if let Some(edit_attr) = &edit
         && *edit_attr != crate::types::message::EditAttribute::Empty
@@ -628,14 +658,14 @@ pub async fn create_sender_key_distribution_message_for_group(
 /// `ts_secs` is unix seconds, matching WA Web's `unixTime()`.
 pub fn build_member_label_message(label: String, ts_secs: i64) -> wa::Message {
     wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            r#type: Some(wa::message::protocol_message::Type::GroupMemberLabelChange as i32),
-            member_label: Some(wa::MemberLabel {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::GroupMemberLabelChange),
+            member_label: buffa::MessageField::some(wa::MemberLabel {
                 label: Some(label),
                 label_timestamp: Some(ts_secs),
             }),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }

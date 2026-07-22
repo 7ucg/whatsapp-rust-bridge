@@ -14,6 +14,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use waproto::whatsapp as wa;
 
+/// Resolve a mutation's operation to the closed Rust enum. Absent defaults
+/// to SET (proto2 enum default); an unknown wire value is a typed error so
+/// standalone callers stay safe even without process_patch's up-front guard.
+fn known_op(
+    op: Option<buffa::EnumValue<wa::syncd_mutation::SyncdOperation>>,
+) -> Result<wa::syncd_mutation::SyncdOperation, AppStateError> {
+    match op {
+        None => Ok(wa::syncd_mutation::SyncdOperation::SET),
+        Some(v) => v
+            .as_known()
+            .ok_or(AppStateError::UnsupportedSyncdOperation(v.to_i32())),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateMutationMAC {
     pub index_mac: Vec<u8>,
@@ -68,11 +82,7 @@ pub fn process_snapshot<F>(
 where
     F: FnMut(&[u8]) -> Result<Arc<ExpandedAppStateKeys>, AppStateError>,
 {
-    let version = snapshot
-        .version
-        .as_ref()
-        .and_then(|v| v.version)
-        .unwrap_or(0);
+    let version = snapshot.version.version.unwrap_or(0);
     initial_state.version = version;
 
     // Update hash state directly from records (no cloning needed)
@@ -94,7 +104,7 @@ where
     if validate_macs {
         let (Some(mac_expected), Some(key_id)) = (
             snapshot.mac.as_ref(),
-            snapshot.key_id.as_ref().and_then(|k| k.id.as_ref()),
+            snapshot.key_id.as_option().and_then(|k| k.id.as_deref()),
         ) else {
             return Err(AppStateError::SnapshotMACMismatch);
         };
@@ -118,15 +128,11 @@ where
     let mut mutation_macs = Vec::with_capacity(snapshot.records.len());
 
     for rec in &snapshot.records {
-        let key_id = rec
-            .key_id
-            .as_ref()
-            .and_then(|k| k.id.as_ref())
-            .ok_or(AppStateError::MissingKeyId)?;
+        let key_id = rec.key_id.id.as_ref().ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
         let (mutation, macs) = decode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             rec,
             &keys,
             key_id,
@@ -183,7 +189,7 @@ where
     let original_hash_is_empty = state.hash == [0u8; 128];
     let had_no_prior_state = original_version == 0 && original_hash_is_empty;
 
-    let patch_version = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+    let patch_version = patch.version.version.unwrap_or(0);
 
     // WA Web: validatePatchVersion — strict monotonic version check.
     // Patch version must be exactly local_version + 1.  If not, WA Web throws
@@ -196,6 +202,14 @@ where
             expected: expected_version,
             got: patch_version,
         });
+    }
+
+    // SyncdOperation is an open enum: reject unknown operations up front,
+    // before any state is mutated — the LTHash math below can only add
+    // (SET) or subtract (REMOVE), so guessing at an unknown op corrupts the
+    // hash in a way that only surfaces later as MismatchingLTHash.
+    for m in &patch.mutations {
+        known_op(m.operation)?;
     }
 
     state.version = patch_version;
@@ -211,16 +225,17 @@ where
         // the loop; the in-patch overlay only models SET-overwrite collapse and must
         // never feed a REMOVE (a REMOVE preceded by a SET on the same index would
         // otherwise subtract the in-patch value instead of the store's).
-        let is_remove = patch.mutations[idx].operation.unwrap_or_default()
-            == wa::syncd_mutation::SyncdOperation::Remove as i32;
+        let is_remove = patch.mutations[idx]
+            .operation
+            .is_some_and(|op| op == wa::syncd_mutation::SyncdOperation::REMOVE);
         let prev = if !is_remove && let Some(value_mac) = in_patch.get(index_mac) {
             Some(value_mac.to_vec())
         } else {
             get_prev_value_mac(index_mac).map_err(|e| anyhow::anyhow!(e))?
         };
-        if let Some(rec) = &patch.mutations[idx].record
-            && let Some(index) = rec.index.as_ref().and_then(|i| i.blob.as_deref())
-            && let Some(value) = rec.value.as_ref().and_then(|v| v.blob.as_deref())
+        if let Some(rec) = patch.mutations[idx].record.as_option()
+            && let Some(index) = rec.index.as_option().and_then(|i| i.blob.as_deref())
+            && let Some(value) = rec.value.as_option().and_then(|v| v.blob.as_deref())
             && value.len() >= 32
         {
             in_patch.insert(index, &value[value.len() - 32..]);
@@ -240,7 +255,7 @@ where
     );
 
     // Validate MACs if requested
-    if validate_macs && let Some(key_id) = patch.key_id.as_ref().and_then(|k| k.id.as_ref()) {
+    if validate_macs && let Some(key_id) = patch.key_id.id.as_ref() {
         let keys = get_keys(key_id)?;
         validate_patch_macs(
             patch,
@@ -266,27 +281,27 @@ where
     let mut removed_index_macs = Vec::with_capacity(patch.mutations.len());
 
     for m in &patch.mutations {
-        if let Some(rec) = &m.record {
-            let op = wa::syncd_mutation::SyncdOperation::try_from(m.operation.unwrap_or(0))
-                .unwrap_or(wa::syncd_mutation::SyncdOperation::Set);
+        if m.record.is_set() {
+            let op = known_op(m.operation)?;
 
-            let key_id = rec
+            let key_id = m
+                .record
                 .key_id
+                .id
                 .as_ref()
-                .and_then(|k| k.id.as_ref())
                 .ok_or(AppStateError::MissingKeyId)?;
             let keys = get_keys(key_id)?;
 
-            let (mutation, macs) = decode_record(op, rec, &keys, key_id, validate_macs)?;
+            let (mutation, macs) = decode_record(op, &m.record, &keys, key_id, validate_macs)?;
 
             match op {
-                wa::syncd_mutation::SyncdOperation::Set => {
+                wa::syncd_mutation::SyncdOperation::SET => {
                     added_macs.push(AppStateMutationMAC {
                         index_mac: macs.index_mac,
                         value_mac: macs.value_mac,
                     });
                 }
-                wa::syncd_mutation::SyncdOperation::Remove => {
+                wa::syncd_mutation::SyncdOperation::REMOVE => {
                     removed_index_macs.push(macs.index_mac);
                 }
             }
@@ -319,15 +334,16 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
     let mut seen_set: Vec<&[u8]> = Vec::new();
     let mut seen_remove: Vec<&[u8]> = Vec::new();
     for m in mutations {
-        let Some(rec) = &m.record else { continue };
-        let Some(index_mac) = rec.index.as_ref().and_then(|i| i.blob.as_deref()) else {
+        let Some(rec) = m.record.as_option() else {
             continue;
         };
-        let op = wa::syncd_mutation::SyncdOperation::try_from(m.operation.unwrap_or(0))
-            .unwrap_or(wa::syncd_mutation::SyncdOperation::Set);
+        let Some(index_mac) = rec.index.as_option().and_then(|i| i.blob.as_deref()) else {
+            continue;
+        };
+        let op = known_op(m.operation)?;
         let seen = match op {
-            wa::syncd_mutation::SyncdOperation::Set => &mut seen_set,
-            wa::syncd_mutation::SyncdOperation::Remove => &mut seen_remove,
+            wa::syncd_mutation::SyncdOperation::SET => &mut seen_set,
+            wa::syncd_mutation::SyncdOperation::REMOVE => &mut seen_remove,
         };
         if seen.contains(&index_mac) {
             return Err(AppStateError::DuplicateIndexInPatch);
@@ -346,11 +362,12 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
 /// * `state` - The hash state AFTER applying the patch mutations
 /// * `keys` - The expanded app state keys for MAC computation
 /// * `collection_name` - The collection name
-/// * `had_no_prior_state` - If true, skip ALL MAC validation. On an empty collection
-///   this is only reached for the genesis patch (version 1), which has no prior baseline
-///   to validate against. The empty + non-genesis case (a patch without a snapshot that
-///   can't anchor the ltHash) is rejected upstream in `process_patch_list`, which marks
-///   the collection retryable so it re-syncs via snapshot, matching WhatsApp Web.
+/// * `had_no_prior_state` - True for the genesis patch (version 1) seeding an empty
+///   collection. Its ltHash is the known empty baseline, so the aggregate MACs are
+///   still computable and MUST be validated (WA Web's `computeLtHashAndValidatePatch`
+///   validates them unconditionally). A genesis patch that omits either aggregate MAC
+///   is treated as tampering. The empty + non-genesis case (a patch that can't anchor
+///   the ltHash) is rejected upstream in `process_patch_list` as a retryable resync.
 /// * `has_missing_remove` - If true, a REMOVE mutation was missing its previous value.
 ///   WhatsApp Web reports this as MAC-failure telemetry, but it does not make
 ///   aggregate MAC mismatches acceptable.
@@ -362,14 +379,10 @@ pub fn validate_patch_macs(
     had_no_prior_state: bool,
     has_missing_remove: bool,
 ) -> Result<(), AppStateError> {
-    // Skip ALL MAC validation only for the genesis patch (version 1) seeding an
-    // empty baseline: there is no prior snapshotMac/patchMac baseline to validate
-    // against. The empty + non-genesis case (a patch without a snapshot that can't
-    // anchor the ltHash) is rejected upstream in `process_patch_list` as a retryable
-    // resync, so it never reaches here.
-    if had_no_prior_state {
-        return Ok(());
-    }
+    // The aggregate MACs are keyed by the app-state key (which the server lacks), so
+    // validating them even for the genesis patch closes the hole where a malicious
+    // server seeds a curated baseline — dropping a delete/block/mute — that the client
+    // would otherwise accept unauthenticated. WA Web validates them on every patch.
 
     if let Some(snap_mac) = patch.snapshot_mac.as_ref() {
         let computed_snap = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
@@ -394,19 +407,34 @@ pub fn validate_patch_macs(
         }
     }
 
-    if let Some(patch_mac) = patch.patch_mac.as_ref() {
-        let version = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
-        let computed_patch = generate_patch_mac(patch, collection_name, &keys.patch_mac, version);
-        if computed_patch != *patch_mac {
-            debug!(
-                target: "AppState",
-                "Patch {} v{} patchMAC MISMATCH, hasMissingRemove={}",
-                collection_name,
-                state.version,
-                has_missing_remove
-            );
-            return Err(AppStateError::PatchMACMismatch);
+    match patch.patch_mac.as_ref() {
+        Some(patch_mac) => {
+            let version = patch.version.version.unwrap_or(0);
+            let computed_patch =
+                generate_patch_mac(patch, collection_name, &keys.patch_mac, version);
+            if computed_patch != *patch_mac {
+                debug!(
+                    target: "AppState",
+                    "Patch {} v{} patchMAC MISMATCH, hasMissingRemove={}",
+                    collection_name,
+                    state.version,
+                    has_missing_remove
+                );
+                return Err(AppStateError::PatchMACMismatch);
+            }
         }
+        // WA Web treats a missing patchMac as a failed comparison (fatal). A genesis
+        // patch that omits it is exactly the curated-baseline case, so reject rather
+        // than accept an unauthenticated record set. Non-genesis patches keep the
+        // prior lenient behavior (patchMac only enforced when present).
+        None if had_no_prior_state => return Err(AppStateError::PatchMACMismatch),
+        None => {}
+    }
+
+    // WA Web validates both aggregate MACs unconditionally, so a genesis patch
+    // that supplies patchMac but strips snapshotMac is rejected all the same.
+    if had_no_prior_state && patch.snapshot_mac.is_none() {
+        return Err(AppStateError::PatchSnapshotMACMismatch);
     }
 
     Ok(())
@@ -434,13 +462,36 @@ pub fn validate_snapshot_mac(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::hash::{generate_content_mac, generate_index_mac};
     use crate::keys::expand_app_state_keys;
     use crate::lthash::WAPATCH_INTEGRITY;
-    use prost::Message;
+    use buffa::Message;
     use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
+
+    /// Sign a genesis (v1) patch's aggregate MACs the way a legitimate server does,
+    /// so it passes the validation `validate_patch_macs` now enforces for genesis.
+    /// A validate-off probe run reproduces the resulting ltHash to MAC over.
+    fn sign_genesis_patch(
+        patch: &mut wa::SyncdPatch,
+        keys: &ExpandedAppStateKeys,
+        collection: &str,
+    ) {
+        let mut probe = HashState::default();
+        let gk = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let gp = |_: &[u8]| Ok(None);
+        process_patch(patch, &mut probe, gk, gp, false, collection).expect("probe apply");
+        patch.snapshot_mac = Some(probe.generate_snapshot_mac(collection, &keys.snapshot_mac));
+        let version = patch.version.version.unwrap_or(0);
+        patch.patch_mac = Some(generate_patch_mac(
+            patch,
+            collection,
+            &keys.patch_mac,
+            version,
+        ));
+    }
 
     fn create_encrypted_record(
         op: wa::syncd_mutation::SyncdOperation,
@@ -453,7 +504,7 @@ mod tests {
         // their HMAC, so the record stays valid under unconditional index-MAC checks.
         let action_data = wa::SyncActionData {
             index: Some(index_mac.to_vec()),
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(timestamp),
                 ..Default::default()
             }),
@@ -473,13 +524,13 @@ mod tests {
         value_blob.extend_from_slice(&value_mac);
 
         wa::SyncdRecord {
-            index: Some(wa::SyncdIndex {
+            index: buffa::MessageField::some(wa::SyncdIndex {
                 blob: Some(generate_index_mac(index_mac, &keys.index)),
             }),
-            value: Some(wa::SyncdValue {
+            value: buffa::MessageField::some(wa::SyncdValue {
                 blob: Some(value_blob),
             }),
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.to_vec()),
             }),
         }
@@ -493,7 +544,7 @@ mod tests {
         let index_mac = vec![1; 32];
 
         let record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -501,9 +552,9 @@ mod tests {
         );
 
         let snapshot = wa::SyncdSnapshot {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             records: vec![record],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -543,7 +594,7 @@ mod tests {
         let keys = expand_app_state_keys(&master_key);
         let key_id = b"test_key_id".to_vec();
         let record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &[1u8; 32],
             &keys,
             &key_id,
@@ -551,9 +602,9 @@ mod tests {
         );
         // Snapshot WITHOUT a `mac` field — must fail validation, not be accepted.
         let snapshot = wa::SyncdSnapshot {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             records: vec![record],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -571,7 +622,7 @@ mod tests {
         let keys = expand_app_state_keys(&master_key);
         let key_id = b"test_key_id".to_vec();
         let record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &[1u8; 32],
             &keys,
             &key_id,
@@ -579,16 +630,87 @@ mod tests {
         );
         // mac present but top-level key_id absent — the other branch of the gate.
         let snapshot = wa::SyncdSnapshot {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             records: vec![record],
             mac: Some(vec![9u8; 32]),
-            key_id: None,
+            key_id: buffa::MessageField::none(),
         };
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot key_id must fail when validating");
         assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+    }
+
+    /// Deterministic reproduction of the fresh-pairing race that PR #972 works
+    /// around. The critical `critical_unblock_low` snapshot (the account's saved
+    /// contacts + push name) can arrive before the encrypted app-state key-share
+    /// has been processed, when a heavy history sync saturates the stream at
+    /// pairing time. The SAME snapshot fails to decode with `KeyNotFound` while
+    /// the key is still in flight, and decodes cleanly the instant the key lands
+    /// — proving the failure is purely a key-ORDERING race, not a bad snapshot.
+    ///
+    /// Mirrors the field symptom: `critical_unblock_low v3: N records` failing
+    /// with "didn't find app state key" (`AppStateProcessor::get_app_state_key`
+    /// -> `backend.get_sync_key` returning `None` -> this `get_keys` closure
+    /// returning `KeyNotFound`).
+    #[test]
+    fn critical_snapshot_fails_key_not_found_until_key_share_lands() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"appstate-sync-key-1".to_vec();
+
+        // A critical_unblock_low-style snapshot carrying a contact record.
+        let record = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &[1u8; 32],
+            &keys,
+            &key_id,
+            1_700_000_000,
+        );
+        let snapshot = wa::SyncdSnapshot {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(3) }),
+            records: vec![record],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        // Leg 1 — key-share NOT yet processed: the decode fails with KeyNotFound,
+        // exactly the "didn't find app state key" the paired companion hits.
+        let key_missing = |_: &[u8]| -> Result<Arc<ExpandedAppStateKeys>, AppStateError> {
+            Err(AppStateError::KeyNotFound)
+        };
+        let mut state = HashState::default();
+        let err = process_snapshot(
+            &snapshot,
+            &mut state,
+            key_missing,
+            false,
+            "critical_unblock_low",
+        )
+        .expect_err("must fail while the key-share is still in flight");
+        assert!(
+            matches!(err, AppStateError::KeyNotFound),
+            "expected KeyNotFound (the 'didn't find app state key' failure), got {err:?}"
+        );
+
+        // Leg 2 — key-share lands: the SAME snapshot decodes cleanly. The failure
+        // was ordering, not the snapshot — so the fix is about ensuring the key is
+        // present (event-driven), never about the snapshot or a longer fixed wait.
+        let key_present = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let mut state2 = HashState::default();
+        let result = process_snapshot(
+            &snapshot,
+            &mut state2,
+            key_present,
+            false,
+            "critical_unblock_low",
+        )
+        .expect("the same snapshot must decode once the key is present");
+        assert_eq!(result.state.version, 3);
+        assert_eq!(result.mutations.len(), 1, "the contact record must apply");
     }
 
     #[test]
@@ -599,7 +721,7 @@ mod tests {
         let index_mac = vec![1; 32];
 
         let record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -607,12 +729,12 @@ mod tests {
         );
 
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(2) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                record: Some(record),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                record: buffa::MessageField::some(record),
             }],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -641,12 +763,55 @@ mod tests {
         assert!(result.removed_index_macs.is_empty());
     }
 
+    /// SyncdOperation is open: a wire value beyond SET/REMOVE must fail the
+    /// patch with a typed error before any hash math, not be folded into SET
+    /// (the closed-enum behavior) and corrupt the LTHash.
+    #[test]
+    fn test_process_patch_rejects_unknown_operation() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let index_mac = vec![1; 32];
+
+        let record = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &index_mac,
+            &keys,
+            &key_id,
+            1234567890,
+        );
+
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
+            mutations: vec![wa::SyncdMutation {
+                operation: Some(buffa::EnumValue::Unknown(7)),
+                record: buffa::MessageField::some(record),
+            }],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let get_prev = |_: &[u8]| Ok(None);
+
+        let mut state = HashState::default();
+        let before = state.hash;
+        let err = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
+            .expect_err("unknown operation must be rejected");
+
+        assert!(matches!(err, AppStateError::UnsupportedSyncdOperation(7)));
+        assert_eq!(state.hash, before, "hash must be untouched on rejection");
+        assert_eq!(state.version, 0, "version must be untouched on rejection");
+    }
+
     #[test]
     fn validate_patch_macs_rejects_snapshot_mismatch_even_with_missing_remove() {
         let master_key = [7u8; 32];
         let keys = expand_app_state_keys(&master_key);
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(2) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             snapshot_mac: Some(vec![0u8; 32]),
             ..Default::default()
         };
@@ -667,7 +832,7 @@ mod tests {
         let master_key = [7u8; 32];
         let keys = expand_app_state_keys(&master_key);
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(2) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             patch_mac: Some(vec![0u8; 32]),
             ..Default::default()
         };
@@ -683,6 +848,105 @@ mod tests {
         assert!(matches!(err, AppStateError::PatchMACMismatch));
     }
 
+    // F2: WA Web validates snapshotMac/patchMac on every patch, including the
+    // genesis (v1) patch. These lock that a genesis patch is no longer exempt.
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_tampered_snapshot_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            snapshot_mac: Some(vec![0u8; 32]),
+            ..Default::default()
+        };
+        let state = HashState {
+            version: 1,
+            hash: [3u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis snapshotMAC must be validated, not skipped");
+        assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_tampered_patch_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            patch_mac: Some(vec![0u8; 32]),
+            ..Default::default()
+        };
+        let state = HashState {
+            version: 1,
+            hash: [5u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis patchMAC must be validated, not skipped");
+        assert!(matches!(err, AppStateError::PatchMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_missing_patch_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        // No snapshot_mac and no patch_mac: a curated baseline with the aggregate
+        // MAC stripped. The server can't forge it (no app-state key), so a genesis
+        // patch that omits it must be rejected rather than silently accepted.
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            ..Default::default()
+        };
+        let state = HashState {
+            version: 1,
+            hash: [5u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis patch without patchMAC must be rejected");
+        assert!(matches!(err, AppStateError::PatchMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_missing_snapshot_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let state = HashState {
+            version: 1,
+            hash: [3u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        // Valid patchMac but snapshotMac stripped: WA Web validates both, so still
+        // rejected — a server can't forge either, so neither may be omitted.
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            ..Default::default()
+        };
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 1));
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis patch without snapshotMAC must be rejected");
+        assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_accepts_genesis_valid_macs() {
+        // Regression guard: a legitimate genesis patch, whose MACs are computed over
+        // the empty-seeded ltHash exactly as WA Web does, must still be accepted.
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let state = HashState {
+            version: 1,
+            hash: [3u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            ..Default::default()
+        };
+        patch.snapshot_mac = Some(state.generate_snapshot_mac("regular", &keys.snapshot_mac));
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 1));
+        validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect("legitimate genesis patch with correct MACs must be accepted");
+    }
+
     #[test]
     fn process_patch_rejects_duplicate_set_index() {
         let master_key = [7u8; 32];
@@ -692,23 +956,24 @@ mod tests {
 
         // Two SET mutations colliding on the same index within one patch.
         let mk = |ts| wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-            record: Some(create_encrypted_record(
-                wa::syncd_mutation::SyncdOperation::Set,
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+            record: buffa::MessageField::some(create_encrypted_record(
+                wa::syncd_mutation::SyncdOperation::SET,
                 &index_mac,
                 &keys,
                 &key_id,
                 ts,
             )),
         };
-        let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations: vec![mk(1), mk(2)],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
         };
+        sign_genesis_patch(&mut patch, &keys, "regular");
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);
@@ -728,9 +993,9 @@ mod tests {
         // SET and REMOVE share an index legitimately: WA Web tracks the two
         // operations in separate sets, so this is not tampering.
         let set = wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-            record: Some(create_encrypted_record(
-                wa::syncd_mutation::SyncdOperation::Set,
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+            record: buffa::MessageField::some(create_encrypted_record(
+                wa::syncd_mutation::SyncdOperation::SET,
                 &index_mac,
                 &keys,
                 &key_id,
@@ -738,23 +1003,24 @@ mod tests {
             )),
         };
         let remove = wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::Remove as i32),
-            record: Some(create_encrypted_record(
-                wa::syncd_mutation::SyncdOperation::Remove,
+            operation: Some(wa::syncd_mutation::SyncdOperation::REMOVE.into()),
+            record: buffa::MessageField::some(create_encrypted_record(
+                wa::syncd_mutation::SyncdOperation::REMOVE,
                 &index_mac,
                 &keys,
                 &key_id,
                 2,
             )),
         };
-        let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations: vec![set, remove],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
         };
+        sign_genesis_patch(&mut patch, &keys, "regular");
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);
@@ -773,23 +1039,24 @@ mod tests {
         let key_id = b"test_key_id".to_vec();
 
         let mk = |index: &[u8], ts| wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-            record: Some(create_encrypted_record(
-                wa::syncd_mutation::SyncdOperation::Set,
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+            record: buffa::MessageField::some(create_encrypted_record(
+                wa::syncd_mutation::SyncdOperation::SET,
                 index,
                 &keys,
                 &key_id,
                 ts,
             )),
         };
-        let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations: vec![mk(&[3u8; 32], 1), mk(&[4u8; 32], 2)],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
         };
+        sign_genesis_patch(&mut patch, &keys, "regular");
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);
@@ -807,7 +1074,7 @@ mod tests {
 
         // Create initial record
         let initial_record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -815,8 +1082,6 @@ mod tests {
         );
         let initial_value_blob = initial_record
             .value
-            .as_ref()
-            .expect("test data should be valid")
             .blob
             .as_ref()
             .expect("test data should be valid");
@@ -824,9 +1089,9 @@ mod tests {
 
         // Process initial snapshot to get starting state
         let snapshot = wa::SyncdSnapshot {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             records: vec![initial_record],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -840,7 +1105,7 @@ mod tests {
 
         // Create overwrite record
         let overwrite_record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -848,12 +1113,12 @@ mod tests {
         );
 
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(2) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                record: Some(overwrite_record.clone()),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                record: buffa::MessageField::some(overwrite_record.clone()),
             }],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -894,6 +1159,7 @@ mod tests {
         // Verify the hash was updated correctly (old value removed, new added)
         let new_value_blob = overwrite_record
             .value
+            .into_option()
             .expect("test data should be valid")
             .blob
             .expect("test data should be valid");
@@ -921,14 +1187,14 @@ mod tests {
         let index_mac = vec![1; 32];
 
         let first = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
             1000,
         );
         let second = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -936,7 +1202,7 @@ mod tests {
         );
 
         let tail = |rec: &wa::SyncdRecord| {
-            let blob = rec.value.as_ref().unwrap().blob.as_ref().unwrap();
+            let blob = rec.value.as_option().unwrap().blob.as_ref().unwrap();
             blob[blob.len() - 32..].to_vec()
         };
         let first_tail = tail(&first);
@@ -947,18 +1213,18 @@ mod tests {
         );
 
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations: vec![
                 wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                    record: Some(first),
+                    operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                    record: buffa::MessageField::some(first),
                 },
                 wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                    record: Some(second),
+                    operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                    record: buffa::MessageField::some(second),
                 },
             ],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -1013,14 +1279,14 @@ mod tests {
         let store_prev = vec![9u8; 32];
 
         let set = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
             2000,
         );
         let remove = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Remove,
+            wa::syncd_mutation::SyncdOperation::REMOVE,
             &index_mac,
             &keys,
             &key_id,
@@ -1028,26 +1294,26 @@ mod tests {
         );
 
         let tail = |rec: &wa::SyncdRecord| {
-            let blob = rec.value.as_ref().unwrap().blob.as_ref().unwrap();
+            let blob = rec.value.as_option().unwrap().blob.as_ref().unwrap();
             blob[blob.len() - 32..].to_vec()
         };
         let set_tail = tail(&set);
 
         let build_patch = |mutations: Vec<wa::SyncdMutation>| wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(1) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations,
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
         };
         let set_mutation = wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-            record: Some(set),
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+            record: buffa::MessageField::some(set),
         };
         let remove_mutation = wa::SyncdMutation {
-            operation: Some(wa::syncd_mutation::SyncdOperation::Remove as i32),
-            record: Some(remove),
+            operation: Some(wa::syncd_mutation::SyncdOperation::REMOVE.into()),
+            record: buffa::MessageField::some(remove),
         };
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
@@ -1105,7 +1371,7 @@ mod tests {
         let index_mac = vec![99; 32];
 
         let record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -1120,12 +1386,12 @@ mod tests {
 
         // Patch claims version 3 (rollback: 3 < 5 + 1)
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(3) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(3) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                record: Some(record),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                record: buffa::MessageField::some(record),
             }],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -1159,7 +1425,7 @@ mod tests {
         let index_mac = vec![99; 32];
 
         let record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -1174,12 +1440,12 @@ mod tests {
 
         // Patch claims version 8 (gap: 8 != 5 + 1)
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(8) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(8) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                record: Some(record),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                record: buffa::MessageField::some(record),
             }],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -1212,7 +1478,7 @@ mod tests {
         let index_mac = vec![99; 32];
 
         let record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -1227,12 +1493,12 @@ mod tests {
 
         // Patch version 6 (exactly local + 1)
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(6) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(6) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                record: Some(record),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                record: buffa::MessageField::some(record),
             }],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
@@ -1257,7 +1523,7 @@ mod tests {
         let index_mac = vec![99; 32];
 
         let record = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &keys,
             &key_id,
@@ -1269,12 +1535,12 @@ mod tests {
 
         // Patch version 42 — should be accepted since no prior state
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion { version: Some(42) }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(42) }),
             mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                record: Some(record),
+                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+                record: buffa::MessageField::some(record),
             }],
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()

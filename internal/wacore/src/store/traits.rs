@@ -12,7 +12,12 @@ use crate::store::error::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use wacore_appstate::processor::AppStateMutationMAC;
+
+/// Inline protocol-sized message secret. The array makes invalid lengths
+/// unrepresentable without a heap allocation or pointer indirection per row.
+pub type MessageSecret = [u8; crate::reporting_token::MESSAGE_SECRET_SIZE];
 
 /// App state synchronization key for WhatsApp's app state protocol.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,10 +58,15 @@ pub struct TcTokenEntry {
 /// Message-secret write entry keyed by chat, sender, and message ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MsgSecretEntry {
-    pub chat: String,
-    pub sender: String,
-    pub msg_id: String,
-    pub secret: Vec<u8>,
+    /// Canonical non-AD chat JID. Shared across entries from the same history
+    /// conversation instead of allocating one identical string per message.
+    pub chat: Arc<str>,
+    /// Canonical non-AD sender JID. Often aliases `chat` for direct messages.
+    pub sender: Arc<str>,
+    /// Message identifier. `Arc<str>` keeps entry clones used by buffered
+    /// persistence cheap without changing the serialized representation.
+    pub msg_id: Arc<str>,
+    pub secret: MessageSecret,
     /// Absolute unix-seconds retention deadline. `0` means never expire.
     /// Computed by the caller from the parent message's event time plus a
     /// per-add-on-kind horizon (see `MsgSecretRetention`). The store prunes
@@ -77,6 +87,42 @@ pub struct DeviceInfo {
     pub device_id: u32,
     /// The key index, if known
     pub key_index: Option<u32>,
+    /// Whether the device uses the hosted PN/LID address space.
+    #[serde(default)]
+    pub is_hosted: bool,
+}
+
+impl DeviceInfo {
+    /// Construct a regular device entry.
+    pub const fn new(device_id: u32, key_index: Option<u32>) -> Self {
+        Self {
+            device_id,
+            key_index,
+            is_hosted: false,
+        }
+    }
+
+    /// Apply the hosted bit reported by the device-list source.
+    pub const fn with_hosting(mut self, is_hosted: bool) -> Self {
+        self.is_hosted = is_hosted;
+        self
+    }
+}
+
+#[cfg(test)]
+mod device_info_tests {
+    use super::DeviceInfo;
+
+    #[test]
+    fn hosted_flag_is_backward_compatible_with_persisted_json() {
+        let legacy: DeviceInfo = serde_json::from_str(r#"{"device_id":7,"key_index":3}"#).unwrap();
+        assert!(!legacy.is_hosted);
+
+        let hosted = DeviceInfo::new(7, Some(3)).with_hosting(true);
+        let roundtrip: DeviceInfo =
+            serde_json::from_str(&serde_json::to_string(&hosted).unwrap()).unwrap();
+        assert!(roundtrip.is_hosted);
+    }
 }
 
 /// Device list record matching WhatsApp Web's DeviceListRecord structure.
@@ -94,6 +140,14 @@ pub struct DeviceListRecord {
     /// When this changes, all sessions and sender keys for the user must be cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_id: Option<u32>,
+}
+
+impl crate::stats::HeapSize for DeviceListRecord {
+    fn heap_bytes(&self) -> usize {
+        self.user.capacity()
+            + self.devices.capacity() * size_of::<DeviceInfo>()
+            + self.phash.as_ref().map_or(0, |p| p.capacity())
+    }
 }
 
 /// Signal protocol cryptographic storage operations.
@@ -276,15 +330,19 @@ pub trait AppSyncStore: Send + Sync {
     /// single backend round-trip. The default delegates to per-item lookups;
     /// backends with a set-membership query (SQL `IN (...)`) should override to
     /// avoid an N+1 (one DB round-trip per mutation in appstate sync).
+    ///
+    /// Index MACs are full HMAC-SHA256 outputs, so the batch path passes them as
+    /// inline `[u8; 32]` arrays ([`crate::appstate_sync::IndexMac`]) — no per-MAC
+    /// heap allocation on either side of the call.
     async fn get_mutation_macs(
         &self,
         name: &str,
-        index_macs: &[Vec<u8>],
-    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+        index_macs: &[[u8; 32]],
+    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>> {
         let mut out = std::collections::HashMap::with_capacity(index_macs.len());
         for index_mac in index_macs {
-            if let Some(mac) = self.get_mutation_mac(name, index_mac).await? {
-                out.insert(index_mac.clone(), mac);
+            if let Some(mac) = self.get_mutation_mac(name, index_mac.as_slice()).await? {
+                out.insert(*index_mac, mac);
             }
         }
         Ok(out)
@@ -439,8 +497,85 @@ pub trait ProtocolStore: Send + Sync {
     /// Get all JIDs that have stored tc tokens.
     async fn get_all_tc_token_jids(&self) -> Result<Vec<String>>;
 
-    /// Delete tc tokens with token_timestamp older than cutoff. Returns count deleted.
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32>;
+    /// Delete tc tokens that have no live state left. A row is removed only when
+    /// its received token is expired-or-absent (`token_timestamp < token_cutoff`
+    /// or empty) **and** its sender bucket is expired-or-absent
+    /// (`sender_timestamp < sender_cutoff` or null), so recent sender state is
+    /// never dropped just because the received token expired. Returns count deleted.
+    async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32>;
+
+    /// Advance `sender_timestamp` toward `sender_timestamp` for a contact,
+    /// inserting a byte-less placeholder when absent and preserving any existing
+    /// token bytes. The stored value only ever moves forward (max), so
+    /// concurrent writers (post-send issuance, history sync) converge regardless
+    /// of ordering and never regress the sender bucket.
+    ///
+    /// Must be atomic w.r.t. [`put_tc_token`](Self::put_tc_token): the sender-side
+    /// issuance path and the notification writer both touch the same row, so a
+    /// non-atomic read-modify-write could drop a real token for a placeholder.
+    /// The default is a read-modify-write for third-party backends; the built-in
+    /// stores override it with a single atomic upsert.
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> Result<()> {
+        let entry = match self.get_tc_token(jid).await? {
+            Some(existing) => TcTokenEntry {
+                sender_timestamp: Some(
+                    existing
+                        .sender_timestamp
+                        .map_or(sender_timestamp, |e| e.max(sender_timestamp)),
+                ),
+                ..existing
+            },
+            None => TcTokenEntry {
+                token: Vec::new(),
+                token_timestamp: sender_timestamp,
+                sender_timestamp: Some(sender_timestamp),
+            },
+        };
+        self.put_tc_token(jid, &entry).await
+    }
+
+    /// Store a token received from a contact, preserving any existing
+    /// `sender_timestamp`. The symmetric counterpart of
+    /// [`touch_tc_token_sender_timestamp`](Self::touch_tc_token_sender_timestamp):
+    /// each writer owns its own field, so the notification path never drops a
+    /// sender bucket that the issuance path wrote concurrently.
+    ///
+    /// **Newer-wins**: the token pair is overwritten only when the stored token
+    /// is a byte-less placeholder or the incoming `token_timestamp` is at least
+    /// as new — a stale write must not clobber a fresher real token. Doing this
+    /// in the store (atomically for the built-in backends) is what lets the
+    /// concurrent history-sync and privacy-notification writers converge without
+    /// a lock. Same atomicity requirement as the sender bucket — the default
+    /// read-modify-write here is a best-effort for third-party backends.
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> Result<()> {
+        let existing = self.get_tc_token(jid).await?;
+        // Keep a fresher real token; a placeholder never blocks the first real one.
+        if let Some(existing) = &existing
+            && !existing.token.is_empty()
+            && token_timestamp < existing.token_timestamp
+        {
+            return Ok(());
+        }
+        let sender_timestamp = existing.and_then(|existing| existing.sender_timestamp);
+        self.put_tc_token(
+            jid,
+            &TcTokenEntry {
+                token: token.to_vec(),
+                token_timestamp,
+                sender_timestamp,
+            },
+        )
+        .await
+    }
 
     // --- Sent Message Store (retry support, matches WA Web's getMessageTable) ---
 
@@ -505,6 +640,47 @@ pub trait ProtocolStore: Send + Sync {
     async fn delete_expired_pending_inbound(&self, _cutoff_timestamp: i64) -> Result<u32> {
         Ok(0)
     }
+
+    /// Batched [`store_pending_inbound`](Self::store_pending_inbound): the
+    /// offline drain buffers one commit-batch of messages per call, so backends
+    /// should override this with a single transaction (the bundled SqliteStore
+    /// does). The default iterates the single-row method, preserving behavior
+    /// for third-party backends.
+    async fn store_pending_inbound_batch(&self, rows: &[PendingInboundRow<'_>]) -> Result<()> {
+        for row in rows {
+            self.store_pending_inbound(row.chat, row.sender, row.id, row.message)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Batched [`delete_pending_inbound`](Self::delete_pending_inbound); same
+    /// override guidance as [`store_pending_inbound_batch`](Self::store_pending_inbound_batch).
+    async fn delete_pending_inbound_batch(&self, keys: &[PendingInboundKey<'_>]) -> Result<()> {
+        for key in keys {
+            self.delete_pending_inbound(key.chat, key.sender, key.id)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// One row of a pending-inbound batch write. Fields borrow from the in-flight
+/// commit batch so building a batch allocates nothing per row.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingInboundRow<'a> {
+    pub chat: &'a str,
+    pub sender: &'a str,
+    pub id: &'a str,
+    pub message: &'a [u8],
+}
+
+/// Key of a buffered pending-inbound row, for batched deletes.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingInboundKey<'a> {
+    pub chat: &'a str,
+    pub sender: &'a str,
+    pub id: &'a str,
 }
 
 /// Device data persistence operations.
@@ -529,6 +705,23 @@ pub trait DeviceStore: Send + Sync {
     async fn snapshot_db(&self, _name: &str, _extra_content: Option<&[u8]>) -> Result<()> {
         Ok(())
     }
+
+    /// Best-effort process-local memory this backend attributes to the session
+    /// (e.g. a SQLite page cache — often the single largest per-session chunk,
+    /// living entirely outside the `Client`). Defaults to an all-`None`
+    /// [`StorageResourceReport`] ("not reported"); backends that can introspect
+    /// their memory override it, and remote/store-backed backends report
+    /// `memory_bytes: Some(0)` (their data isn't process memory).
+    ///
+    /// This is a defaulted method on `DeviceStore` — an already-implemented,
+    /// non-blanket sub-trait of `Backend` — rather than an inherent method
+    /// (which wouldn't compose through the `Arc<dyn Backend>` the client holds)
+    /// or a new `Backend` supertrait (which would force *every* backend,
+    /// including external ones, to add an impl). The default keeps it fully
+    /// non-breaking, exactly like [`Self::snapshot_db`].
+    async fn resource_report(&self) -> crate::stats::StorageResourceReport {
+        crate::stats::StorageResourceReport::default()
+    }
 }
 
 /// Per-outbound-message secret storage for addon-style decryption.
@@ -540,7 +733,7 @@ pub trait DeviceStore: Send + Sync {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait MsgSecretStore: Send + Sync {
-    /// Persist `secret` (typically 32 bytes) under the composite key with NO
+    /// Persist the protocol-sized `secret` under the composite key with NO
     /// expiry (`expires_at = 0`). Convenience wrapper over [`put_msg_secrets`].
     /// `chat`, `sender`, and `msg_id` are JID strings / message ID strings;
     /// callers should pass non-AD (no-device) form for the JIDs so lookups
@@ -555,13 +748,13 @@ pub trait MsgSecretStore: Send + Sync {
         chat: &str,
         sender: &str,
         msg_id: &str,
-        secret: &[u8],
+        secret: &[u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
     ) -> Result<()> {
         self.put_msg_secrets(vec![MsgSecretEntry {
-            chat: chat.to_string(),
-            sender: sender.to_string(),
-            msg_id: msg_id.to_string(),
-            secret: secret.to_vec(),
+            chat: Arc::from(chat),
+            sender: Arc::from(sender),
+            msg_id: Arc::from(msg_id),
+            secret: *secret,
             expires_at: 0,
             message_ts: 0,
         }])

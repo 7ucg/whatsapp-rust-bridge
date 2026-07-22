@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use crate::kem;
 use crate::protocol::{IdentityKey, IdentityKeyPair, KeyPair, PublicKey};
 
 #[derive(Clone, Copy)]
@@ -30,7 +29,6 @@ pub struct AliceSignalProtocolParameters {
     their_signed_pre_key: PublicKey,
     their_one_time_pre_key: Option<PublicKey>,
     their_ratchet_key: PublicKey,
-    their_kyber_pre_key: Option<kem::PublicKey>,
 
     use_pq_ratchet: UsePQRatchet,
 }
@@ -51,18 +49,8 @@ impl AliceSignalProtocolParameters {
             their_signed_pre_key,
             their_one_time_pre_key: None,
             their_ratchet_key,
-            their_kyber_pre_key: None,
             use_pq_ratchet,
         }
-    }
-
-    pub fn set_their_kyber_pre_key(&mut self, kyber_key: kem::PublicKey) {
-        self.their_kyber_pre_key = Some(kyber_key);
-    }
-
-    pub fn with_their_kyber_pre_key(mut self, kyber_key: kem::PublicKey) -> Self {
-        self.set_their_kyber_pre_key(kyber_key);
-        self
     }
 
     pub fn set_their_one_time_pre_key(&mut self, ec_public: PublicKey) {
@@ -105,11 +93,6 @@ impl AliceSignalProtocolParameters {
     }
 
     #[inline]
-    pub fn their_kyber_pre_key(&self) -> Option<&kem::PublicKey> {
-        self.their_kyber_pre_key.as_ref()
-    }
-
-    #[inline]
     pub fn use_pq_ratchet(&self) -> UsePQRatchet {
         self.use_pq_ratchet
     }
@@ -120,10 +103,8 @@ pub struct BobSignalProtocolParameters {
     our_signed_pre_key_pair: KeyPair,
     our_one_time_pre_key_pair: Option<KeyPair>,
     our_ratchet_key_pair: KeyPair,
-    our_kyber_pre_key_pair: Option<kem::KeyPair>,
     their_identity_key: IdentityKey,
     their_base_key: PublicKey,
-    their_kyber_ciphertext: Option<Box<[u8]>>,
 
     use_pq_ratchet: UsePQRatchet,
 }
@@ -144,20 +125,10 @@ impl BobSignalProtocolParameters {
             our_signed_pre_key_pair,
             our_one_time_pre_key_pair,
             our_ratchet_key_pair,
-            our_kyber_pre_key_pair: None,
             their_identity_key,
             their_base_key,
-            their_kyber_ciphertext: None,
             use_pq_ratchet,
         }
-    }
-
-    pub fn set_our_kyber_pre_key_pair(&mut self, key_pair: kem::KeyPair) {
-        self.our_kyber_pre_key_pair = Some(key_pair);
-    }
-
-    pub fn set_their_kyber_ciphertext(&mut self, ciphertext: Box<[u8]>) {
-        self.their_kyber_ciphertext = Some(ciphertext);
     }
 
     #[inline]
@@ -188,16 +159,6 @@ impl BobSignalProtocolParameters {
     #[inline]
     pub fn their_base_key(&self) -> &PublicKey {
         &self.their_base_key
-    }
-
-    #[inline]
-    pub fn our_kyber_pre_key_pair(&self) -> Option<&kem::KeyPair> {
-        self.our_kyber_pre_key_pair.as_ref()
-    }
-
-    #[inline]
-    pub fn their_kyber_ciphertext(&self) -> Option<&Box<[u8]>> {
-        self.their_kyber_ciphertext.as_ref()
     }
 
     #[inline]

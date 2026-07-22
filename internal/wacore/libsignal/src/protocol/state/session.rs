@@ -6,16 +6,20 @@
 use std::result::Result;
 use std::sync::Arc;
 
-use prost::Message;
+use buffa::view::MessageView;
+use buffa::{Message, MessageField};
 use subtle::ConstantTimeEq;
 
 use crate::core::curve::KeyType;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
-use crate::protocol::state::{KyberPreKeyId, PreKeyId, SignedPreKeyId};
+use crate::protocol::record_components::{
+    SessionRecordComponents, session_components_from_structure, session_structure_from_components,
+};
+use crate::protocol::state::{PreKeyId, SignedPreKeyId};
+use crate::protocol::stores::SessionStructure;
 use crate::protocol::stores::session_structure::{self};
-use crate::protocol::stores::{RecordStructure, SessionStructure};
-use crate::protocol::{consts, IdentityKey, KeyPair, PrivateKey, PublicKey, SignalProtocolError};
+use crate::protocol::{IdentityKey, KeyPair, PrivateKey, PublicKey, SignalProtocolError, consts};
 
 /// A distinct error type to keep from accidentally propagating deserialization errors.
 #[derive(Debug)]
@@ -38,8 +42,6 @@ pub struct UnacknowledgedPreKeyMessageItems {
     pre_key_id: Option<PreKeyId>,
     signed_pre_key_id: SignedPreKeyId,
     base_key: PublicKey,
-    kyber_pre_key_id: Option<KyberPreKeyId>,
-    kyber_ciphertext: Option<Vec<u8>>,
 }
 
 impl UnacknowledgedPreKeyMessageItems {
@@ -47,15 +49,11 @@ impl UnacknowledgedPreKeyMessageItems {
         pre_key_id: Option<PreKeyId>,
         signed_pre_key_id: SignedPreKeyId,
         base_key: PublicKey,
-        kyber_pre_key_id: Option<KyberPreKeyId>,
-        kyber_ciphertext: Option<Vec<u8>>,
     ) -> Self {
         Self {
             pre_key_id,
             signed_pre_key_id,
             base_key,
-            kyber_pre_key_id,
-            kyber_ciphertext,
         }
     }
 
@@ -69,14 +67,6 @@ impl UnacknowledgedPreKeyMessageItems {
 
     pub fn base_key(&self) -> &PublicKey {
         &self.base_key
-    }
-
-    pub fn kyber_pre_key_id(&self) -> Option<KyberPreKeyId> {
-        self.kyber_pre_key_id
-    }
-
-    pub fn kyber_ciphertext(&self) -> Option<&[u8]> {
-        self.kyber_ciphertext.as_deref()
     }
 }
 
@@ -94,8 +84,10 @@ pub struct SessionState {
 /// Held opaque; restore via `SessionState::restore_decrypt_snapshot`.
 pub struct DecryptSnapshot {
     receiver_chains: Vec<session_structure::Chain>,
-    root_key: Option<::prost::alloc::vec::Vec<u8>>,
+    root_key: Option<Vec<u8>>,
     previous_counter: Option<u32>,
+    // Stored as `Option` rather than `MessageField` so the snapshot doesn't
+    // bind to buffa's sub-message representation (Box vs inline).
     sender_chain: Option<session_structure::Chain>,
 }
 
@@ -113,7 +105,7 @@ impl SessionState {
             receiver_chains: self.session.receiver_chains.clone(),
             root_key: self.session.root_key.clone(),
             previous_counter: self.session.previous_counter,
-            sender_chain: self.session.sender_chain.clone(),
+            sender_chain: self.session.sender_chain.as_option().cloned(),
         }
     }
 
@@ -125,7 +117,7 @@ impl SessionState {
         self.session.receiver_chains = snap.receiver_chains;
         self.session.root_key = snap.root_key;
         self.session.previous_counter = snap.previous_counter;
-        self.session.sender_chain = snap.sender_chain;
+        self.session.sender_chain = snap.sender_chain.into();
     }
 
     pub fn new(
@@ -142,14 +134,11 @@ impl SessionState {
                 remote_identity_public: Some(their_identity.serialize().to_vec()),
                 root_key: Some(root_key.key().to_vec()),
                 previous_counter: Some(0),
-                sender_chain: None,
                 receiver_chains: vec![],
-                pending_pre_key: None,
                 remote_registration_id: Some(0),
                 local_registration_id: Some(0),
                 alice_base_key: Some(alice_base_key.serialize().to_vec()),
-                needs_refresh: None,
-                pending_key_exchange: None,
+                ..Default::default()
             },
         }
     }
@@ -223,17 +212,17 @@ impl SessionState {
     }
 
     pub fn sender_ratchet_key(&self) -> Result<PublicKey, InvalidSessionError> {
-        match self.session.sender_chain {
-            None => Err(InvalidSessionError("missing sender chain")),
-            Some(ref c) => {
-                let key_bytes = c
-                    .sender_ratchet_key
-                    .as_ref()
-                    .ok_or(InvalidSessionError("missing sender ratchet key"))?;
-                PublicKey::deserialize(key_bytes)
-                    .map_err(|_| InvalidSessionError("invalid sender chain ratchet key"))
-            }
-        }
+        let c = self
+            .session
+            .sender_chain
+            .as_option()
+            .ok_or(InvalidSessionError("missing sender chain"))?;
+        let key_bytes = c
+            .sender_ratchet_key
+            .as_ref()
+            .ok_or(InvalidSessionError("missing sender ratchet key"))?;
+        PublicKey::deserialize(key_bytes)
+            .map_err(|_| InvalidSessionError("invalid sender chain ratchet key"))
     }
 
     pub fn sender_ratchet_key_for_logging(&self) -> Result<String, InvalidSessionError> {
@@ -241,25 +230,27 @@ impl SessionState {
     }
 
     pub fn sender_ratchet_private_key(&self) -> Result<PrivateKey, InvalidSessionError> {
-        match self.session.sender_chain {
-            None => Err(InvalidSessionError("missing sender chain")),
-            Some(ref c) => {
-                let key_bytes = c
-                    .sender_ratchet_key_private
-                    .as_ref()
-                    .ok_or(InvalidSessionError("missing sender ratchet private key"))?;
-                PrivateKey::deserialize(key_bytes)
-                    .map_err(|_| InvalidSessionError("invalid sender chain private ratchet key"))
-            }
-        }
+        let c = self
+            .session
+            .sender_chain
+            .as_option()
+            .ok_or(InvalidSessionError("missing sender chain"))?;
+        let key_bytes = c
+            .sender_ratchet_key_private
+            .as_ref()
+            .ok_or(InvalidSessionError("missing sender ratchet private key"))?;
+        PrivateKey::deserialize(key_bytes)
+            .map_err(|_| InvalidSessionError("invalid sender chain private ratchet key"))
     }
 
     pub fn has_usable_sender_chain(&self) -> Result<bool, InvalidSessionError> {
-        if self.session.sender_chain.is_none() {
+        if self.session.sender_chain.is_unset() {
             return Ok(false);
         }
-        // We removed timestamp from PendingPreKey, so we can't check for expiration here.
-        // Assuming it's valid if it exists.
+
+        self.sender_ratchet_key()?;
+        self.sender_ratchet_private_key()?;
+        self.get_sender_chain_key()?;
         Ok(true)
     }
 
@@ -270,7 +261,7 @@ impl SessionState {
 
             let chain_key_idx = chain
                 .chain_key
-                .as_ref()
+                .as_option()
                 .and_then(|chain_key| chain_key.index);
 
             results.push((sender_ratchet_public, chain_key_idx))
@@ -328,7 +319,7 @@ impl SessionState {
         let chain = &self.session.receiver_chains[idx];
         let chain_key = chain
             .chain_key
-            .as_ref()
+            .as_option()
             .ok_or(InvalidSessionError("missing receiver chain key"))?;
         let key_bytes = chain_key
             .key
@@ -344,7 +335,7 @@ impl SessionState {
     }
 
     pub fn add_receiver_chain(&mut self, sender: &PublicKey, chain_key: &ChainKey) {
-        use prost::bytes::Bytes;
+        use bytes::Bytes;
         let chain_key = session_structure::chain::ChainKey {
             index: Some(chain_key.index()),
             key: Some(Bytes::copy_from_slice(chain_key.key())),
@@ -353,7 +344,7 @@ impl SessionState {
         let chain = session_structure::Chain {
             sender_ratchet_key: Some(sender.serialize().to_vec()),
             sender_ratchet_key_private: Some(vec![]),
-            chain_key: Some(chain_key),
+            chain_key: MessageField::some(chain_key),
             message_keys: vec![],
         };
 
@@ -380,7 +371,7 @@ impl SessionState {
     }
 
     pub fn set_sender_chain(&mut self, sender: &KeyPair, next_chain_key: &ChainKey) {
-        use prost::bytes::Bytes;
+        use bytes::Bytes;
         let chain_key = session_structure::chain::ChainKey {
             index: Some(next_chain_key.index()),
             key: Some(Bytes::copy_from_slice(next_chain_key.key())),
@@ -389,11 +380,11 @@ impl SessionState {
         let new_chain = session_structure::Chain {
             sender_ratchet_key: Some(sender.public_key.serialize().to_vec()),
             sender_ratchet_key_private: Some(sender.private_key.serialize().to_vec()),
-            chain_key: Some(chain_key),
+            chain_key: MessageField::some(chain_key),
             message_keys: vec![],
         };
 
-        self.session.sender_chain = Some(new_chain);
+        self.session.sender_chain = MessageField::some(new_chain);
     }
 
     pub fn with_sender_chain(mut self, sender: &KeyPair, next_chain_key: &ChainKey) -> Self {
@@ -405,12 +396,12 @@ impl SessionState {
         let sender_chain = self
             .session
             .sender_chain
-            .as_ref()
+            .as_option()
             .ok_or(InvalidSessionError("missing sender chain"))?;
 
         let chain_key = sender_chain
             .chain_key
-            .as_ref()
+            .as_option()
             .ok_or(InvalidSessionError("missing sender chain key"))?;
 
         let key_bytes = chain_key
@@ -431,29 +422,60 @@ impl SessionState {
         Ok(self.get_sender_chain_key()?.key().to_vec())
     }
 
-    pub fn set_sender_chain_key(&mut self, next_chain_key: &ChainKey) {
-        use prost::bytes::Bytes;
+    pub fn set_sender_chain_key(
+        &mut self,
+        next_chain_key: &ChainKey,
+    ) -> Result<(), InvalidSessionError> {
+        use bytes::Bytes;
         let chain_key = session_structure::chain::ChainKey {
             index: Some(next_chain_key.index()),
             key: Some(Bytes::copy_from_slice(next_chain_key.key())),
         };
 
-        // Is it actually valid to call this function with sender_chain == None?
+        let mut new_chain = self
+            .session
+            .sender_chain
+            .take()
+            .ok_or(InvalidSessionError("missing sender chain"))?;
+        new_chain.chain_key = MessageField::some(chain_key);
 
-        let new_chain = match self.session.sender_chain.take() {
-            None => session_structure::Chain {
-                sender_ratchet_key: Some(vec![]),
-                sender_ratchet_key_private: Some(vec![]),
-                chain_key: Some(chain_key),
-                message_keys: vec![],
-            },
-            Some(mut c) => {
-                c.chain_key = Some(chain_key);
-                c
-            }
+        self.session.sender_chain = MessageField::some(new_chain);
+        Ok(())
+    }
+
+    /// Advance the sender chain until its next counter is at least `target`,
+    /// discarding the intermediate message keys. Restores the no-counter-reuse
+    /// invariant when this state re-enters service under a durable reservation
+    /// (snapshot reload, archived-state promotion): every counter the lease may
+    /// have already spent becomes underivable. A state without a usable sender
+    /// chain is left untouched — it cannot encrypt, so it has nothing to burn.
+    pub(crate) fn fast_forward_sender_chain(
+        &mut self,
+        target: u32,
+    ) -> Result<(), SignalProtocolError> {
+        let Ok(mut chain_key) = self.get_sender_chain_key() else {
+            return Ok(());
         };
+        if target.saturating_sub(chain_key.index()) > consts::MAX_RESERVATION_FAST_FORWARD {
+            return Err(SignalProtocolError::InvalidSessionStructure(
+                "reserved sender chain index implausibly far ahead",
+            ));
+        }
+        if chain_key.index() >= target {
+            return Ok(());
+        }
+        while chain_key.index() < target {
+            chain_key = chain_key.next_chain_key()?;
+        }
+        self.set_sender_chain_key(&chain_key)?;
+        Ok(())
+    }
 
-        self.session.sender_chain = Some(new_chain);
+    fn fast_forward_sender_chain_or_drop(&mut self, target: u32) {
+        if let Err(error) = self.fast_forward_sender_chain(target) {
+            log::error!("dropping unusable sender chain: {error}");
+            self.session.sender_chain = MessageField::none();
+        }
     }
 
     pub fn get_message_keys(
@@ -479,10 +501,11 @@ impl SessionState {
         }
 
         if let Some(position) = message_key_position {
-            // Only now do we mutate - remove the message key directly
+            // swap_remove: lookup is by counter, so slot order is free to
+            // scramble.
             let message_key = self.session.receiver_chains[chain_idx]
                 .message_keys
-                .remove(position);
+                .swap_remove(position);
             let keys = MessageKeyGenerator::from_pb(message_key).map_err(InvalidSessionError)?;
             return Ok(Some(keys));
         }
@@ -502,13 +525,33 @@ impl SessionState {
         let chain = &mut self.session.receiver_chains[chain_idx];
 
         // AMORTIZED EVICTION: Only prune when exceeding MAX + threshold.
-        // This reduces O(n) drain() calls from every insert to once every PRUNE_THRESHOLD inserts.
+        // This reduces O(n) prunes from every insert to once every PRUNE_THRESHOLD inserts.
         // The lookup in get_message_keys() does a linear search by counter value, so order
         // doesn't matter for correctness.
         let len = chain.message_keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
-            chain.message_keys.drain(..excess);
+            // Evict the oldest keys by counter value, not slot position:
+            // swap_remove (here and in get_message_keys) scrambles slot
+            // order, so the front is not the oldest after the first prune.
+            let mut counters: Vec<u32> = chain
+                .message_keys
+                .iter()
+                .map(|m| m.index.unwrap_or(0))
+                .collect();
+            let (_, &mut threshold, _) = counters.select_nth_unstable(excess - 1);
+            // The removal ceiling keeps duplicate counters at the threshold
+            // (impossible in a valid session) from evicting extra keys.
+            let mut removed = 0;
+            let mut i = 0;
+            while i < chain.message_keys.len() && removed < excess {
+                if chain.message_keys[i].index.unwrap_or(0) <= threshold {
+                    chain.message_keys.swap_remove(i);
+                    removed += 1;
+                } else {
+                    i += 1;
+                }
+            }
         }
         chain.message_keys.push(message_keys.into_pb());
 
@@ -524,9 +567,9 @@ impl SessionState {
             .get_receiver_chain_index(sender)?
             .expect("called set_receiver_chain_key for a non-existent chain");
 
-        use prost::bytes::Bytes;
+        use bytes::Bytes;
         self.session.receiver_chains[chain_idx].chain_key =
-            Some(session_structure::chain::ChainKey {
+            MessageField::some(session_structure::chain::ChainKey {
                 index: Some(chain_key.index()),
                 key: Some(Bytes::copy_from_slice(chain_key.key())),
             });
@@ -539,24 +582,23 @@ impl SessionState {
         pre_key_id: Option<PreKeyId>,
         signed_ec_pre_key_id: SignedPreKeyId,
         base_key: &PublicKey,
-        kyber_pre_key_id: Option<KyberPreKeyId>,
-        kyber_ciphertext: Option<Vec<u8>>,
     ) {
         let signed_ec_pre_key_id: u32 = signed_ec_pre_key_id.into();
         let pending = session_structure::PendingPreKey {
             pre_key_id: pre_key_id.map(PreKeyId::into),
             signed_pre_key_id: Some(signed_ec_pre_key_id as i32),
             base_key: Some(base_key.serialize().to_vec()),
-            kyber_pre_key_id: kyber_pre_key_id.map(|id| id.value()),
-            kyber_ciphertext,
+            // Post-quantum (Kyber) prekeys are not implemented; classic X3DH only.
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
         };
-        self.session.pending_pre_key = Some(pending);
+        self.session.pending_pre_key = MessageField::some(pending);
     }
 
     pub fn unacknowledged_pre_key_message_items(
         &self,
     ) -> Result<Option<UnacknowledgedPreKeyMessageItems>, InvalidSessionError> {
-        if let Some(ref pending_pre_key) = self.session.pending_pre_key {
+        if let Some(pending_pre_key) = self.session.pending_pre_key.as_option() {
             Ok(Some(UnacknowledgedPreKeyMessageItems::new(
                 pending_pre_key.pre_key_id.map(Into::into),
                 (pending_pre_key.signed_pre_key_id.unwrap_or(0) as u32).into(),
@@ -567,8 +609,6 @@ impl SessionState {
                         .ok_or(InvalidSessionError("missing base key"))?,
                 )
                 .map_err(|_| InvalidSessionError("invalid pending PreKey message base key"))?,
-                pending_pre_key.kyber_pre_key_id.map(KyberPreKeyId::new),
-                pending_pre_key.kyber_ciphertext.clone(),
             )))
         } else {
             Ok(None)
@@ -594,7 +634,7 @@ impl SessionState {
             pending_key_exchange: _pending_key_exchange,
         } = &self.session;
 
-        self.session.pending_pre_key = None;
+        self.session.pending_pre_key = MessageField::none();
     }
 
     pub fn set_remote_registration_id(&mut self, registration_id: u32) {
@@ -632,10 +672,37 @@ impl From<&SessionState> for SessionStructure {
     }
 }
 
+/// Record-level field number carrying the sender-chain counter reservation in
+/// the serialized `RecordStructure`. The upstream (whatspec) proto cannot be
+/// edited to add local fields, so the record encoder — already hand-rolled in
+/// [`SessionRecord::serialize_into`] — writes it directly; the number sits far
+/// above RecordStructure's fields (1, 2) so a future upstream addition cannot
+/// collide. Standard unknown-field skipping keeps old readers compatible.
+///
+/// That compatibility is one-way: a build without lease support silently
+/// ignores this field, so downgrading the library across a crash can resume a
+/// leased chain from its stale snapshot and reuse a counter. Nothing here can
+/// prevent that — already-released readers skip unknown fields by definition —
+/// so it is a release-note constraint, not a code one. Never lower this
+/// number into a range an older reader might interpret.
+const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 =
+    crate::protocol::local_field::COUNTER_RESERVATION_FIELD;
+
 #[derive(Clone)]
 pub struct SessionRecord {
     current_session: Option<SessionState>,
     previous_sessions: Arc<Vec<SessionStructure>>,
+    /// Durability lease: ceiling (exclusive) of sender-chain counters this
+    /// record's durable snapshots may already have spent on the wire. Any
+    /// state entering service from such a snapshot must fast-forward its
+    /// sender chain here first — message keys and IVs are derived
+    /// deterministically from the counter, so re-deriving a spent counter
+    /// reuses a (key, IV) pair.
+    reserved_sender_chain_index: u32,
+    /// A reservation was raised but not yet durably flushed. While set, the
+    /// owning ciphertext must not reach the wire; the store layer transfers
+    /// this into its flush gating. Transient — never serialized.
+    pending_reservation: bool,
 }
 
 impl SessionRecord {
@@ -643,6 +710,8 @@ impl SessionRecord {
         Self {
             current_session: None,
             previous_sessions: Arc::new(Vec::new()),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
         }
     }
 
@@ -650,28 +719,162 @@ impl SessionRecord {
         Self {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
         }
     }
 
-    pub fn deserialize(bytes: &[u8]) -> Result<Self, SignalProtocolError> {
-        let mut record = RecordStructure::decode(bytes)
-            .map_err(|_| InvalidSessionError("failed to decode session record protobuf"))?;
-
-        // OPTIMIZATION: Aggressively prune previous_sessions on load.
-        // This avoids deserializing and keeping in memory more sessions than needed.
-        // The constant ARCHIVED_STATES_MAX_LENGTH (40) defines the maximum we ever use,
-        // so any sessions beyond that are wasted memory and CPU cycles.
-        if record.previous_sessions.len() > consts::ARCHIVED_STATES_MAX_LENGTH {
-            // Keep only the most recent sessions (at the front of the vec)
-            record
-                .previous_sessions
-                .truncate(consts::ARCHIVED_STATES_MAX_LENGTH);
-        }
+    /// Builds a record from validated protocol components.
+    ///
+    /// Components do not carry process-local durability metadata. The imported
+    /// chain therefore starts a fresh reservation lifecycle, while archived
+    /// sessions are bounded to the same limit used by record deserialization.
+    pub fn from_components(value: SessionRecordComponents) -> Result<Self, SignalProtocolError> {
+        let current_session = value
+            .current_session
+            .map(session_structure_from_components)
+            .transpose()?
+            .map(SessionState::from_session_structure);
+        let previous_sessions = value
+            .previous_sessions
+            .into_iter()
+            .take(consts::ARCHIVED_STATES_MAX_LENGTH)
+            .map(session_structure_from_components)
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            current_session: record.current_session.map(|s| s.into()),
-            previous_sessions: Arc::new(record.previous_sessions),
+            current_session,
+            previous_sessions: Arc::new(previous_sessions),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
         })
+    }
+
+    /// Consumes the record and projects its protocol components.
+    ///
+    /// Any durably reserved sender range is advanced to its exclusive ceiling
+    /// before export so rebuilding the record cannot derive a possibly spent
+    /// message key again. A chain too stale to advance is dropped fail-closed
+    /// without discarding the rest of the record.
+    pub fn into_components(mut self) -> Result<SessionRecordComponents, SignalProtocolError> {
+        let reserved_sender_chain_index = self.reserved_sender_chain_index;
+        if reserved_sender_chain_index > 0
+            && let Some(state) = self.current_session.as_mut()
+        {
+            state.fast_forward_sender_chain_or_drop(reserved_sender_chain_index);
+        }
+        let current_session = self
+            .current_session
+            .map(|state| session_components_from_structure(state.session))
+            .transpose()?;
+        let previous_sessions = Arc::try_unwrap(self.previous_sessions)
+            .unwrap_or_else(|shared| shared.as_ref().clone())
+            .into_iter()
+            .map(|session| {
+                if reserved_sender_chain_index == 0 {
+                    return session_components_from_structure(session);
+                }
+                let mut state = SessionState::from_session_structure(session);
+                state.fast_forward_sender_chain_or_drop(reserved_sender_chain_index);
+                session_components_from_structure(state.session)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(SessionRecordComponents {
+            current_session,
+            previous_sessions,
+        })
+    }
+
+    pub fn reserved_sender_chain_index(&self) -> u32 {
+        self.reserved_sender_chain_index
+    }
+
+    /// Lease a fresh batch of sender-chain counters after `spent_counter` was
+    /// issued past the current reservation. Marks the record pending: the
+    /// caller's ciphertext must not hit the wire until a flush persists the
+    /// raised ceiling.
+    pub fn reserve_sender_chain_counters(&mut self, spent_counter: u32) {
+        self.reserved_sender_chain_index =
+            spent_counter.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
+        self.pending_reservation = true;
+    }
+
+    pub fn has_pending_reservation(&self) -> bool {
+        self.pending_reservation
+    }
+
+    /// The store layer takes ownership of the wire gate (it tracks the address
+    /// until a successful flush), so the transient flag is dropped here.
+    pub fn clear_pending_reservation(&mut self) {
+        self.pending_reservation = false;
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, SignalProtocolError> {
+        Self::deserialize_inner(bytes, None)
+    }
+
+    /// A matching live cache proves this snapshot was not recovered after a crash.
+    #[doc(hidden)]
+    pub fn deserialize_for_store(
+        bytes: &[u8],
+        incarnation: &[u8; 16],
+    ) -> Result<Self, SignalProtocolError> {
+        Self::deserialize_inner(bytes, Some(incarnation))
+    }
+
+    fn deserialize_inner(
+        bytes: &[u8],
+        incarnation: Option<&[u8; 16]>,
+    ) -> Result<Self, SignalProtocolError> {
+        use waproto::whatsapp::RecordStructureView;
+
+        // Decode to a zero-copy view first, then only convert sessions we
+        // actually keep to owned. Excess previous_sessions beyond
+        // ARCHIVED_STATES_MAX_LENGTH are never fully allocated.
+        let view = RecordStructureView::decode_view(bytes)
+            .map_err(|_| InvalidSessionError("failed to decode session record protobuf"))?;
+
+        let limit = consts::ARCHIVED_STATES_MAX_LENGTH;
+        let previous_sessions: Vec<SessionStructure> = view
+            .previous_sessions
+            .iter()
+            .take(limit)
+            .map(|sv| sv.to_owned_message())
+            .collect::<Result<_, _>>()
+            .map_err(|_| InvalidSessionError("failed to decode archived session protobuf"))?;
+
+        let local_fields = crate::protocol::local_field::decode_local_record_fields(
+            bytes,
+            RESERVED_SENDER_CHAIN_INDEX_FIELD,
+            || InvalidSessionError("invalid local session metadata"),
+        )?;
+
+        let mut record = Self {
+            current_session: view
+                .current_session
+                .as_option()
+                .map(|sv| sv.to_owned_message())
+                .transpose()
+                .map_err(|_| InvalidSessionError("failed to decode current session protobuf"))?
+                .map(Into::into),
+            previous_sessions: Arc::new(previous_sessions),
+            reserved_sender_chain_index: local_fields.reservation,
+            pending_reservation: false,
+        };
+
+        let trusted_reload =
+            incarnation.is_some_and(|current| local_fields.incarnation == Some(*current));
+
+        // An untrusted snapshot may predate sends covered by its lease.
+        if !trusted_reload
+            && record.reserved_sender_chain_index > 0
+            && let Some(state) = record.current_session.as_mut()
+        {
+            state.fast_forward_sender_chain(record.reserved_sender_chain_index)?;
+        }
+
+        Ok(record)
     }
 
     /// If there's a session with a matching version and `alice_base_key`, ensures that it is the
@@ -685,14 +888,13 @@ impl SessionRecord {
         version: u32,
         alice_base_key: &[u8],
     ) -> Result<bool, InvalidSessionError> {
-        if let Some(current_session) = &self.current_session {
-            if current_session.session_version()? == version
-                && alice_base_key
-                    .ct_eq(current_session.alice_base_key())
-                    .into()
-            {
-                return Ok(true);
-            }
+        if let Some(current_session) = &self.current_session
+            && current_session.session_version()? == version
+            && alice_base_key
+                .ct_eq(current_session.alice_base_key())
+                .into()
+        {
+            return Ok(true);
         }
 
         // OPTIMIZATION: Find matching session by index without cloning all sessions.
@@ -807,9 +1009,34 @@ impl SessionRecord {
         self.promote_state(updated_session)
     }
 
+    /// Make `new_state` current. A promoted state may have been current under
+    /// this record's lease before (archived → promoted round trip), so its
+    /// sender chain is fast-forwarded past every counter the lease may have
+    /// spent. States whose chain was never current here (fresh ratchets) go
+    /// through [`Self::promote_fresh_state`] instead, which skips the burn.
     pub fn promote_state(&mut self, new_state: SessionState) {
         self.archive_current_state_inner();
+        let mut state = new_state;
+        if self.reserved_sender_chain_index > 0 {
+            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
+        }
+        self.current_session = Some(state);
+    }
+
+    /// Make a freshly ratcheted state current. Its sender chain key material
+    /// was just generated from a fresh random ephemeral, so no counter on it
+    /// can ever have been spent. Burn the inherited lease into the state being
+    /// archived before resetting it for the fresh chain; otherwise the archive
+    /// could later reissue a counter covered by the discarded lease.
+    pub fn promote_fresh_state(&mut self, new_state: SessionState) {
+        if self.reserved_sender_chain_index > 0
+            && let Some(state) = self.current_session.as_mut()
+        {
+            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
+        }
+        self.archive_current_state_inner();
         self.current_session = Some(new_state);
+        self.reserved_sender_chain_index = 0;
     }
 
     fn archive_current_state_inner(&mut self) -> bool {
@@ -841,35 +1068,100 @@ impl SessionRecord {
 
     /// Encode into a caller-supplied buffer (allows reuse across flushes).
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
-        use prost::encoding::{encoded_len_varint, message::encode as encode_msg};
+        self.serialize_into_inner(buf, None);
+    }
 
-        let current_len = self
+    /// The incarnation prevents clean reloads from looking like crashes.
+    #[doc(hidden)]
+    pub fn serialize_into_for_store(&self, buf: &mut Vec<u8>, incarnation: &[u8; 16]) {
+        self.serialize_into_inner(buf, Some(incarnation));
+    }
+
+    // Session storage protos are hand-spliced only here; direct buffa calls
+    // duplicate nothing, so no codec pin.
+    #[allow(clippy::disallowed_methods)]
+    fn serialize_into_inner(&self, buf: &mut Vec<u8>, incarnation: Option<&[u8; 16]>) {
+        use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
+
+        fn write_len_delimited(
+            field: u32,
+            msg: &impl Message,
+            msg_len: usize,
+            cache: &mut buffa::SizeCache,
+            buf: &mut Vec<u8>,
+        ) {
+            Tag::new(field, WireType::LengthDelimited).encode(buf);
+            encode_varint(msg_len as u64, buf);
+            msg.write_to(cache, buf);
+        }
+
+        let mut cache = buffa::SizeCache::new();
+        let current_msg_len = self
             .current_session
             .as_ref()
-            .map(|s| {
-                let msg_len = s.session.encoded_len();
-                1 + encoded_len_varint(msg_len as u64) + msg_len
-            })
+            .map(|s| s.session.compute_size(&mut cache) as usize);
+        let current_len = current_msg_len
+            .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
 
+        let mut previous_msg_lens = Vec::with_capacity(self.previous_sessions.len());
         let previous_len: usize = self
             .previous_sessions
             .iter()
             .map(|s| {
-                let msg_len = s.encoded_len();
-                1 + encoded_len_varint(msg_len as u64) + msg_len
+                let msg_len = s.compute_size(&mut cache) as usize;
+                previous_msg_lens.push(msg_len);
+                1 + varint_len(msg_len as u64) + msg_len
             })
             .sum();
 
-        buf.clear();
-        buf.reserve(current_len + previous_len);
+        let reserved = self.reserved_sender_chain_index;
+        let incarnation = incarnation.filter(|_| reserved > 0);
+        let reserved_len = if reserved > 0 {
+            2 + varint_len(reserved as u64)
+        } else {
+            0
+        };
+        let incarnation_len = incarnation
+            .map(|_| crate::protocol::local_field::STORE_INCARNATION_ENCODED_LEN)
+            .unwrap_or(0);
 
-        if let Some(state) = &self.current_session {
-            encode_msg(1, &state.session, buf);
+        buf.clear();
+        buf.reserve(current_len + previous_len + reserved_len + incarnation_len);
+
+        if let Some(state) = &self.current_session
+            && let Some(msg_len) = current_msg_len
+        {
+            write_len_delimited(1, &state.session, msg_len, &mut cache, buf);
         }
-        for session in self.previous_sessions.iter() {
-            encode_msg(2, session, buf);
+        for (session, msg_len) in self.previous_sessions.iter().zip(previous_msg_lens) {
+            write_len_delimited(2, session, msg_len, &mut cache, buf);
         }
+        if reserved > 0 {
+            Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(buf);
+            encode_varint(reserved as u64, buf);
+        }
+        if let Some(incarnation) = incarnation {
+            crate::protocol::local_field::encode_store_incarnation(buf, incarnation);
+        }
+    }
+
+    /// Estimated in-memory footprint proxy: the protobuf-encoded size of the
+    /// current plus archived states. Size computation only — no encode buffer
+    /// is allocated. Used by per-session memory reports.
+    pub fn estimated_size(&self) -> usize {
+        let mut cache = buffa::SizeCache::new();
+        let current = self
+            .current_session
+            .as_ref()
+            .map(|s| s.session.compute_size(&mut cache) as usize)
+            .unwrap_or(0);
+        let previous: usize = self
+            .previous_sessions
+            .iter()
+            .map(|s| s.compute_size(&mut cache) as usize)
+            .sum();
+        current + previous
     }
 
     pub fn remote_registration_id(&self) -> Result<u32, SignalProtocolError> {
@@ -985,7 +1277,7 @@ impl SessionRecord {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::protocol::ratchet::keys::MessageKeyGenerator;
@@ -1014,6 +1306,307 @@ mod tests {
         state
     }
 
+    fn assert_malformed_sender_chain(
+        state: &SessionState,
+        expected_error: &str,
+        mutate: impl FnOnce(&mut session_structure::Chain),
+    ) {
+        let mut structure = SessionStructure::from(state);
+        mutate(
+            structure
+                .sender_chain
+                .as_option_mut()
+                .expect("test sender chain"),
+        );
+        let state = SessionState::from(structure);
+        assert_eq!(
+            state
+                .has_usable_sender_chain()
+                .expect_err("malformed sender chain must fail")
+                .to_string(),
+            expected_error
+        );
+    }
+
+    #[test]
+    fn complete_sender_chain_is_usable() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        assert!(state.has_usable_sender_chain().unwrap());
+    }
+
+    #[test]
+    fn present_sender_chain_must_be_structurally_usable() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        assert_malformed_sender_chain(&state, "missing sender ratchet key", |chain| {
+            chain.sender_ratchet_key = None;
+        });
+        assert_malformed_sender_chain(&state, "invalid sender chain ratchet key", |chain| {
+            chain.sender_ratchet_key = Some(Vec::new());
+        });
+        assert_malformed_sender_chain(&state, "missing sender ratchet private key", |chain| {
+            chain.sender_ratchet_key_private = None;
+        });
+        assert_malformed_sender_chain(
+            &state,
+            "invalid sender chain private ratchet key",
+            |chain| {
+                chain.sender_ratchet_key_private = Some(vec![0; 31]);
+            },
+        );
+        assert_malformed_sender_chain(&state, "missing sender chain key", |chain| {
+            chain.chain_key = MessageField::none();
+        });
+        assert_malformed_sender_chain(&state, "missing sender chain key index", |chain| {
+            chain
+                .chain_key
+                .as_option_mut()
+                .expect("test chain key")
+                .index = None;
+        });
+        assert_malformed_sender_chain(&state, "missing sender chain key bytes", |chain| {
+            chain.chain_key.as_option_mut().expect("test chain key").key = None;
+        });
+        assert_malformed_sender_chain(&state, "invalid sender chain key", |chain| {
+            chain.chain_key.as_option_mut().expect("test chain key").key =
+                Some(bytes::Bytes::from_static(&[0; 31]));
+        });
+    }
+
+    #[test]
+    fn set_sender_chain_key_requires_existing_sender_chain() {
+        let mut csprng = rng();
+        let identity_keypair = KeyPair::generate(&mut csprng);
+        let their_identity = IdentityKey::new(identity_keypair.public_key);
+        let our_identity = IdentityKey::new(KeyPair::generate(&mut csprng).public_key);
+        let root_key = crate::protocol::ratchet::RootKey::new([0u8; 32]);
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut state = SessionState::new(3, &our_identity, &their_identity, &root_key, &base_key);
+        let chain_key = crate::protocol::ratchet::ChainKey::new([1u8; 32], 0);
+
+        let err = state
+            .set_sender_chain_key(&chain_key)
+            .expect_err("missing sender chain should fail");
+
+        assert_eq!(err.to_string(), "missing sender chain");
+        assert!(!state.has_usable_sender_chain().unwrap());
+    }
+
+    /// An archived state promoted back to current may have spent counters
+    /// under the record's lease while it was current before; the promotion
+    /// must burn the whole lease into its chain.
+    #[test]
+    fn promote_state_fast_forwards_past_the_lease() {
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let state = create_test_session_state(3, &base_key);
+
+        let mut record = SessionRecord::new_fresh();
+        record.reserve_sender_chain_counters(0);
+        let reserved = record.reserved_sender_chain_index();
+        assert_eq!(reserved, consts::SENDER_CHAIN_RESERVATION_BATCH);
+
+        record.promote_state(state);
+        let chain = record
+            .session_state()
+            .unwrap()
+            .get_sender_chain_key()
+            .unwrap();
+        assert_eq!(
+            chain.index(),
+            reserved,
+            "promotion must make every leased counter underivable"
+        );
+    }
+
+    #[test]
+    fn component_handoff_drops_a_stale_archived_sender_chain() {
+        let mut csprng = rng();
+        let archived_base_key = KeyPair::generate(&mut csprng).public_key;
+        let archived = create_test_session_state(3, &archived_base_key);
+        let current_base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut current = create_test_session_state(3, &current_base_key);
+        let spent_counter = consts::MAX_RESERVATION_FAST_FORWARD + 1;
+        current
+            .set_sender_chain_key(&ChainKey::new([9; 32], spent_counter))
+            .expect("current sender chain");
+
+        let mut record = SessionRecord::new(archived);
+        record.promote_fresh_state(current);
+        record.reserve_sender_chain_counters(spent_counter);
+        let reserved = record.reserved_sender_chain_index();
+
+        let components = record
+            .into_components()
+            .expect("stale archive must not block handoff");
+        assert_eq!(
+            components
+                .current_session
+                .as_ref()
+                .and_then(|session| session.sender_chain.as_ref())
+                .and_then(|chain| chain.chain_key.as_ref())
+                .and_then(|chain_key| chain_key.index),
+            Some(reserved)
+        );
+        assert_eq!(components.previous_sessions.len(), 1);
+        assert!(components.previous_sessions[0].sender_chain.is_none());
+    }
+
+    /// A freshly ratcheted chain starts at zero, while the state being archived
+    /// must retain the safety provided by the lease that is about to be reset.
+    #[test]
+    fn promote_fresh_state_retires_the_archived_lease_before_reset() {
+        let mut csprng = rng();
+        let archived_base_key = KeyPair::generate(&mut csprng).public_key;
+        let archived = create_test_session_state(3, &archived_base_key);
+        let fresh_base_key = KeyPair::generate(&mut csprng).public_key;
+        let fresh = create_test_session_state(3, &fresh_base_key);
+
+        let mut record = SessionRecord::new(archived);
+        record.reserve_sender_chain_counters(0);
+        let retired_ceiling = record.reserved_sender_chain_index();
+
+        record.promote_fresh_state(fresh);
+        assert_eq!(record.reserved_sender_chain_index(), 0);
+        let chain = record
+            .session_state()
+            .unwrap()
+            .get_sender_chain_key()
+            .unwrap();
+        assert_eq!(chain.index(), 0, "a fresh chain must not be burned");
+
+        let components = record.into_components().expect("safe handoff");
+        let archived_index = components.previous_sessions[0]
+            .sender_chain
+            .as_ref()
+            .and_then(|chain| chain.chain_key.as_ref())
+            .and_then(|chain_key| chain_key.index);
+        assert_eq!(archived_index, Some(retired_ceiling));
+    }
+
+    /// A corrupt reservation absurdly far ahead of the chain must be refused
+    /// instead of turning the load into an unbounded KDF loop.
+    #[test]
+    fn deserialize_rejects_an_implausible_reservation() {
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let record = SessionRecord::new(create_test_session_state(3, &base_key));
+
+        let mut bytes = record.serialize().unwrap();
+        {
+            use buffa::encoding::{Tag, WireType, encode_varint};
+            Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(&mut bytes);
+            encode_varint(
+                (consts::MAX_RESERVATION_FAST_FORWARD as u64) + 1,
+                &mut bytes,
+            );
+        }
+
+        assert!(
+            SessionRecord::deserialize(&bytes).is_err(),
+            "an implausible lease must fail the load, not fast-forward"
+        );
+    }
+
+    #[test]
+    fn cache_incarnation_separates_clean_reload_from_recovery() {
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut record = SessionRecord::new(create_test_session_state(3, &base_key));
+        record.reserve_sender_chain_counters(0);
+        let incarnation = [0xA1; 16];
+        let replacement = [0xB2; 16];
+        let mut bytes = Vec::new();
+        record.serialize_into_for_store(&mut bytes, &incarnation);
+
+        let clean = SessionRecord::deserialize_for_store(&bytes, &incarnation).unwrap();
+        assert_eq!(
+            clean
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            0
+        );
+
+        let recovered = SessionRecord::deserialize_for_store(&bytes, &replacement).unwrap();
+        assert_eq!(
+            recovered
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let conservative = SessionRecord::deserialize(&bytes).unwrap();
+        assert_eq!(
+            conservative
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+
+        let legacy = record.serialize().unwrap();
+        let migrated = SessionRecord::deserialize_for_store(&legacy, &incarnation).unwrap();
+        assert_eq!(
+            migrated
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index(),
+            consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+    }
+
+    /// A lease field that is unreadable — wrong wire type, or duplicated so
+    /// "last one wins" could pick a lower ceiling — must fail the load. Were
+    /// it skipped, the record would load with reservation 0, silently
+    /// re-enabling every counter the real lease had already spent.
+    #[test]
+    fn deserialize_rejects_a_malformed_or_duplicated_lease_field() {
+        use buffa::encoding::{Tag, WireType, encode_varint};
+
+        let mut csprng = rng();
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut record = SessionRecord::new(create_test_session_state(3, &base_key));
+        record.reserve_sender_chain_counters(0);
+        let good = record.serialize().unwrap();
+        assert!(
+            SessionRecord::deserialize(&good).is_ok(),
+            "the well-formed record must still load"
+        );
+
+        // Same field number, non-varint wire type.
+        let mut wrong_type = record.serialize().unwrap();
+        Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::LengthDelimited)
+            .encode(&mut wrong_type);
+        encode_varint(0, &mut wrong_type); // zero-length payload
+        assert!(
+            SessionRecord::deserialize(&wrong_type).is_err(),
+            "a non-varint lease field must fail the load, not be skipped"
+        );
+
+        // Duplicated field: a trailing 0 would win under last-one-wins and
+        // wipe the ceiling.
+        let mut duplicated = record.serialize().unwrap();
+        Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(&mut duplicated);
+        encode_varint(0, &mut duplicated);
+        assert!(
+            SessionRecord::deserialize(&duplicated).is_err(),
+            "a duplicated lease field must fail the load rather than lower the ceiling"
+        );
+    }
+
     /// Creates a SessionRecord with N previous sessions for testing.
     fn create_record_with_previous_sessions(count: usize) -> SessionRecord {
         let mut csprng = rng();
@@ -1026,6 +1619,57 @@ mod tests {
         }
 
         record
+    }
+
+    fn make_cache_shape_chain(seed: u8, message_key_count: usize) -> session_structure::Chain {
+        let chain_key = session_structure::chain::ChainKey {
+            index: Some(seed as u32),
+            key: Some(vec![seed; 32].into()),
+        };
+        let message_keys = (0..message_key_count)
+            .map(|idx| {
+                let idx = idx as u8;
+                session_structure::chain::MessageKey {
+                    index: Some(idx as u32),
+                    cipher_key: Some(vec![seed.wrapping_add(idx); 32].into()),
+                    mac_key: Some(vec![seed.wrapping_add(idx).wrapping_add(1); 32].into()),
+                    iv: Some(vec![seed.wrapping_add(idx).wrapping_add(2); 16].into()),
+                }
+            })
+            .collect();
+
+        session_structure::Chain {
+            sender_ratchet_key: Some(vec![seed; 33]),
+            sender_ratchet_key_private: Some(vec![seed.wrapping_add(1); 32]),
+            chain_key: MessageField::some(chain_key),
+            message_keys,
+        }
+    }
+
+    fn make_cache_shape_session(
+        seed: u8,
+        receiver_chain_count: usize,
+        message_key_count: usize,
+    ) -> SessionStructure {
+        let receiver_chains = (0..receiver_chain_count)
+            .map(|idx| make_cache_shape_chain(seed.wrapping_add(idx as u8 + 1), idx + 1))
+            .collect();
+
+        SessionStructure {
+            session_version: Some(3),
+            local_identity_public: Some(vec![seed; 33]),
+            remote_identity_public: Some(vec![seed.wrapping_add(1); 33]),
+            root_key: Some(vec![seed.wrapping_add(2); 32]),
+            previous_counter: Some(seed as u32),
+            sender_chain: MessageField::some(make_cache_shape_chain(seed, message_key_count)),
+            receiver_chains,
+            pending_key_exchange: MessageField::none(),
+            pending_pre_key: MessageField::none(),
+            remote_registration_id: Some(10_000 + seed as u32),
+            local_registration_id: Some(20_000 + seed as u32),
+            needs_refresh: Some(seed.is_multiple_of(2)),
+            alice_base_key: Some(vec![seed.wrapping_add(3); 33]),
+        }
     }
 
     #[test]
@@ -1183,6 +1827,40 @@ mod tests {
         }
     }
 
+    /// Eviction must drop the lowest counters on EVERY prune, not just the
+    /// first: swap_remove scrambles slot order, so a position-based prune
+    /// would evict the freshly skipped (most likely to arrive) keys from the
+    /// second prune on.
+    #[test]
+    fn test_message_keys_eviction_stays_oldest_across_prunes() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let mut state = create_test_session_state(3, &base_key);
+
+        let sender_key = KeyPair::generate(&mut rng()).public_key;
+        let chain_key = crate::protocol::ratchet::ChainKey::new([2u8; 32], 0);
+        state.add_receiver_chain(&sender_key, &chain_key);
+
+        // Enough inserts for two prunes: pushing counter 2051 prunes 0..=50,
+        // pushing counter 2102 prunes 51..=101 (the trigger re-arms only
+        // after the buffer refills past MAX + THRESHOLD).
+        let total_keys =
+            (consts::MAX_MESSAGE_KEYS + 2 * (consts::MESSAGE_KEY_PRUNE_THRESHOLD + 1) + 1) as u32;
+        for counter in 0..total_keys {
+            let keys = create_test_message_key_generator(counter);
+            state.set_message_keys(&sender_key, keys).unwrap();
+        }
+
+        let evicted = 2 * (consts::MESSAGE_KEY_PRUNE_THRESHOLD + 1) as u32;
+        for counter in 0..evicted {
+            let key = state.get_message_keys(&sender_key, counter).unwrap();
+            assert!(key.is_none(), "Key {} should have been evicted", counter);
+        }
+        for counter in evicted..total_keys {
+            let key = state.get_message_keys(&sender_key, counter).unwrap();
+            assert!(key.is_some(), "Key {} should exist", counter);
+        }
+    }
+
     fn create_test_message_key_generator(counter: u32) -> MessageKeyGenerator {
         // Create a MessageKeyGenerator with the given counter using a seed
         let mut seed = [0u8; 32];
@@ -1312,6 +1990,47 @@ mod tests {
             .map(|s| s.unwrap().alice_base_key().to_vec())
             .collect();
         assert_eq!(original_base_keys, restored_base_keys);
+    }
+
+    #[test]
+    fn test_session_record_manual_encoding_matches_generated_record_structure() {
+        let record = create_record_with_previous_sessions(4);
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(
+                record.current_session.as_ref().unwrap().session.clone(),
+            ),
+            previous_sessions: record.previous_sessions.as_ref().clone(),
+        }
+        .encode_to_vec();
+
+        assert_eq!(record.serialize().unwrap(), expected);
+
+        let mut reused = vec![0xaa; 16];
+        record.serialize_into(&mut reused);
+        assert_eq!(reused, expected);
+    }
+
+    #[test]
+    fn test_session_record_manual_encoding_handles_mixed_size_cache_shapes() {
+        let current = make_cache_shape_session(1, 3, 2);
+        let previous_sessions = vec![
+            make_cache_shape_session(20, 0, 5),
+            make_cache_shape_session(40, 6, 0),
+            make_cache_shape_session(60, 1, 8),
+        ];
+        let record = SessionRecord {
+            current_session: Some(SessionState::from_session_structure(current.clone())),
+            previous_sessions: Arc::new(previous_sessions.clone()),
+            reserved_sender_chain_index: 0,
+            pending_reservation: false,
+        };
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(current),
+            previous_sessions,
+        }
+        .encode_to_vec();
+
+        assert_eq!(record.serialize().unwrap(), expected);
     }
 
     #[test]

@@ -11,28 +11,28 @@ description = "Noise Protocol implementation for WhatsApp with AES-256-GCM"
 crate-type = ["rlib"]
 
 [features]
+# Exposes `wacore_noise::test_util` (cert-chain bytes builder, etc.) so
+# downstream crates can share fixtures with the unit tests in this crate.
 test-util = []
+# Skips XEdDSA signature verification of the server's Noise cert chain.
+# Required for the e2e mock server, which uses self-signed certs that
+# can't be verified against the real WA root key. NEVER enable in prod.
 danger-skip-cert-chain-verify = []
 
 [dependencies]
-anyhow           = { version = "1.0", default-features = false }
-bytes            = { version = "1.5", default-features = false }
-hkdf             = { version = "0.13.0", default-features = false }
-log              = "0.4"
-prost            = { version = "0.14.3", default-features = false, features = ["std"] }
-rand             = { version = "0.10", features = ["thread_rng"] }
-# Required on ALL targets — were previously misfiled under the wasm32 target
-# section, which broke native builds (the `native/` crate never depends on
-# wacore-noise, so it went unnoticed until the wa-client-rust native client).
-sha2             = { version = "0.11.0", default-features = false }
-thiserror        = "2.0.17"
-wacore-binary    = { path = "../binary" }
-wacore-libsignal = { path = "../libsignal" }
-waproto          = { path = "../../waproto" }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.4", features = ["wasm_js"] }
+anyhow = { workspace = true }
+buffa = { workspace = true }
+bytes = { workspace = true }
+hkdf = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+wacore-binary = { workspace = true }
+wacore-libsignal = { workspace = true }
+waproto = { workspace = true }
 
 [dev-dependencies]
-prost            = { version = "0.14.3", default-features = false, features = ["std"] }
-waproto          = { path = "../../waproto" }
+divan = { workspace = true }
+waproto = { workspace = true }
+

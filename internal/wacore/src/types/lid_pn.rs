@@ -14,7 +14,16 @@
 use std::sync::Arc;
 
 /// The source from which a LID-PN mapping was learned.
-/// Different sources have different trust levels and handling for identity changes.
+///
+/// The source is load-bearing, not just provenance: it selects the write
+/// policy applied when the pair reaches the cache — see `lid_pn_write_policy`
+/// in the `whatsapp-rust` client, which mirrors WhatsApp Web's
+/// `createLidPnMappings` `switch (learningSource)`. Directed sources overwrite
+/// on any change; observational bulk sources (`Other` and friends, WA Web
+/// `"other"`) only seed new LIDs and re-resolve conflicts via a live query;
+/// known-stale sources are stamped `created_at = 0` so they never outrank a
+/// fresher mapping for the same phone (the PN→LID resolution direction; the
+/// LID→PN reverse map always takes the latest write).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum LearningSource {
     /// Mapping learned from usync (device sync) query response
@@ -74,6 +83,14 @@ pub struct LidPnEntry {
     pub created_at: i64,
     /// The source from which this mapping was learned
     pub learning_source: LearningSource,
+}
+
+impl crate::stats::HeapSize for LidPnEntry {
+    /// The identifier strings are shared with the cache keys (`Arc<str>`), so
+    /// counting them here means the report must not count the keys again.
+    fn heap_bytes(&self) -> usize {
+        self.lid.len() + self.phone_number.len()
+    }
 }
 
 impl LidPnEntry {

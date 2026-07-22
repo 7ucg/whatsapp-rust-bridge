@@ -4,7 +4,14 @@
 //! All data lives in RAM behind a single [`async_lock::Mutex`] and is lost
 //! when the struct is dropped.
 
+use hashbrown::hash_map::Entry;
+use hashbrown::{Equivalent, HashMap as HbHashMap};
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
+use std::hash::Hash;
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-util"))]
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::appstate::hash::HashState;
@@ -34,7 +41,31 @@ struct PreKeyEntry {
 type BaseKeyKey = (String, String);
 
 /// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
-type MsgSecretRow = (Vec<u8>, i64, i64);
+type MsgSecretRow = (MessageSecret, i64, i64);
+
+#[derive(Eq, Hash, PartialEq)]
+struct MsgSecretKey {
+    chat: Arc<str>,
+    sender: Arc<str>,
+    msg_id: Arc<str>,
+}
+
+#[derive(Hash)]
+struct MsgSecretKeyRef<'a> {
+    chat: &'a str,
+    sender: &'a str,
+    msg_id: &'a str,
+}
+
+impl Equivalent<MsgSecretKey> for MsgSecretKeyRef<'_> {
+    fn equivalent(&self, key: &MsgSecretKey) -> bool {
+        self.chat == key.chat.as_ref()
+            && self.sender == key.sender.as_ref()
+            && self.msg_id == key.msg_id.as_ref()
+    }
+}
+
+type MsgSecretMap = HbHashMap<MsgSecretKey, MsgSecretRow, RandomState>;
 
 /// Inner state protected by the mutex.
 #[derive(Default)]
@@ -70,7 +101,7 @@ struct InMemoryState {
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
     /// event time is unknown. The keepalive cleanup prunes expired rows.
-    msg_secrets: HashMap<(String, String, String), MsgSecretRow>,
+    msg_secrets: MsgSecretMap,
 
     // --- Device ---
     device: Option<Device>,
@@ -90,6 +121,26 @@ const MAX_SENT_MESSAGES: usize = 4096;
 pub struct InMemoryBackend {
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
+    /// Count of `put_sessions_batch` calls. Test hook (see `test-util`): lets a
+    /// harness prove receive-path flush coalescing (N receives collapse to fewer
+    /// batch writes). Gated so normal builds carry neither the field nor the
+    /// per-call bookkeeping.
+    #[cfg(any(test, feature = "test-util"))]
+    session_batch_writes: AtomicU32,
+    /// Count of `put_sender_keys_batch` calls. Test hook for sender-key lease
+    /// boundaries; absent from normal builds.
+    #[cfg(any(test, feature = "test-util"))]
+    sender_key_batch_writes: AtomicU32,
+    /// When set, `put_sessions_batch` fails. Test hook (see `test-util`): lets a
+    /// harness prove the send path aborts (and never hits the wire) when the
+    /// ratchet advance cannot be persisted.
+    #[cfg(any(test, feature = "test-util"))]
+    fail_session_writes: AtomicBool,
+    /// When set, `put_sender_keys_batch` fails. Test hook: the sender-key
+    /// counterpart of `fail_session_writes` (wire gate must survive a failed
+    /// flush).
+    #[cfg(any(test, feature = "test-util"))]
+    fail_sender_key_writes: AtomicBool,
 }
 
 impl InMemoryBackend {
@@ -98,7 +149,53 @@ impl InMemoryBackend {
         Self {
             state: Mutex::new(InMemoryState::default()),
             next_device_id: AtomicI32::new(1),
+            #[cfg(any(test, feature = "test-util"))]
+            session_batch_writes: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            sender_key_batch_writes: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_session_writes: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_sender_key_writes: AtomicBool::new(false),
         }
+    }
+
+    /// Number of `put_sessions_batch` attempts since construction, including
+    /// injected failures.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn session_batch_write_count(&self) -> u32 {
+        self.session_batch_writes.load(Ordering::Relaxed)
+    }
+
+    /// Number of `put_sender_keys_batch` attempts since construction, including
+    /// injected failures.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn sender_key_batch_write_count(&self) -> u32 {
+        self.sender_key_batch_writes.load(Ordering::Relaxed)
+    }
+
+    /// Make every subsequent `put_sessions_batch` fail (or stop failing).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_session_writes(&self, fail: bool) {
+        self.fail_session_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Make every subsequent `put_sender_keys_batch` fail (or stop failing).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_sender_key_writes(&self, fail: bool) {
+        self.fail_sender_key_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Lets recovery tests remove only the state needed to trigger a key request.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn remove_sync_key_for_test(&self, key_id: &[u8]) -> bool {
+        self.state.lock().await.sync_keys.remove(key_id).is_some()
+    }
+
+    /// Keeps readiness failures attributable without exposing key material.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn sync_key_count_for_test(&self) -> usize {
+        self.state.lock().await.sync_keys.len()
     }
 }
 
@@ -143,6 +240,28 @@ impl SignalStore for InMemoryBackend {
             .await
             .sessions
             .insert(address.to_string(), Bytes::copy_from_slice(session));
+        Ok(())
+    }
+
+    async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            self.session_batch_writes.fetch_add(1, Ordering::Relaxed);
+            if self.fail_session_writes.load(Ordering::Relaxed) {
+                return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                    "put_sessions_batch failing (test hook)",
+                )));
+            }
+        }
+        let mut state = self.state.lock().await;
+        state.sessions.reserve(sessions.len());
+        for (address, session) in sessions {
+            if let Some(stored) = state.sessions.get_mut(address.as_ref()) {
+                *stored = session.clone();
+            } else {
+                state.sessions.insert(address.to_string(), session.clone());
+            }
+        }
         Ok(())
     }
 
@@ -263,11 +382,42 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.fail_sender_key_writes.load(Ordering::Relaxed) {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "put_sender_key failing (test hook)",
+            )));
+        }
         self.state
             .lock()
             .await
             .sender_keys
             .insert(address.to_string(), record.to_vec());
+        Ok(())
+    }
+
+    async fn put_sender_keys_batch(&self, sender_keys: &[(Arc<str>, Bytes)]) -> Result<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            self.sender_key_batch_writes.fetch_add(1, Ordering::Relaxed);
+            if self.fail_sender_key_writes.load(Ordering::Relaxed) {
+                return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                    "put_sender_keys_batch failing (test hook)",
+                )));
+            }
+        }
+        let mut state = self.state.lock().await;
+        state.sender_keys.reserve(sender_keys.len());
+        for (address, record) in sender_keys {
+            if let Some(stored) = state.sender_keys.get_mut(address.as_ref()) {
+                stored.clear();
+                stored.extend_from_slice(record);
+            } else {
+                state
+                    .sender_keys
+                    .insert(address.to_string(), record.to_vec());
+            }
+        }
         Ok(())
     }
 
@@ -412,9 +562,8 @@ impl ProtocolStore for InMemoryBackend {
             return Ok(());
         }
         let mut state = self.state.lock().await;
-        let targets: std::collections::HashSet<&str> = device_jids.iter().copied().collect();
         for group_map in state.sender_key_devices.values_mut() {
-            group_map.retain(|jid, _| !targets.contains(jid.as_str()));
+            group_map.retain(|jid, _| !device_jids.contains(&jid.as_str()));
         }
         Ok(())
     }
@@ -564,12 +713,76 @@ impl ProtocolStore for InMemoryBackend {
         Ok(self.state.lock().await.tc_tokens.keys().cloned().collect())
     }
 
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32> {
+    async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32> {
         let mut s = self.state.lock().await;
         let before = s.tc_tokens.len();
-        s.tc_tokens
-            .retain(|_, entry| entry.token_timestamp >= cutoff_timestamp);
+        // Keep a row while either window is still live: the received token or the
+        // sender bucket. A row is dropped only when both are stale.
+        s.tc_tokens.retain(|_, entry| {
+            let token_live = !entry.token.is_empty() && entry.token_timestamp >= token_cutoff;
+            let sender_live = entry.sender_timestamp.is_some_and(|ts| ts >= sender_cutoff);
+            token_live || sender_live
+        });
         Ok((before - s.tc_tokens.len()) as u32)
+    }
+
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> Result<()> {
+        let mut s = self.state.lock().await;
+        match s.tc_tokens.get_mut(jid) {
+            Some(entry) => {
+                entry.sender_timestamp = Some(
+                    entry
+                        .sender_timestamp
+                        .map_or(sender_timestamp, |e| e.max(sender_timestamp)),
+                );
+            }
+            None => {
+                s.tc_tokens.insert(
+                    jid.to_string(),
+                    TcTokenEntry {
+                        token: Vec::new(),
+                        token_timestamp: sender_timestamp,
+                        sender_timestamp: Some(sender_timestamp),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> Result<()> {
+        let mut s = self.state.lock().await;
+        match s.tc_tokens.get_mut(jid) {
+            Some(entry) => {
+                // Newer-wins (see the trait doc): don't let a stale write
+                // clobber a fresher token.
+                if entry.token.is_empty() || token_timestamp >= entry.token_timestamp {
+                    entry.token = token.to_vec();
+                    entry.token_timestamp = token_timestamp;
+                    // sender_timestamp left untouched
+                }
+            }
+            None => {
+                s.tc_tokens.insert(
+                    jid.to_string(),
+                    TcTokenEntry {
+                        token: token.to_vec(),
+                        token_timestamp,
+                        sender_timestamp: None,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     // --- Sent Message Store ---
@@ -685,18 +898,29 @@ impl MsgSecretStore for InMemoryBackend {
         use crate::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
         let stored = entries.len();
         let mut state = self.state.lock().await;
+        // Initial history batches are overwhelmingly new rows, so reserve
+        // once. Once populated, a batch may be mostly overwrites; reserving its
+        // full length then would grow the table without adding any rows.
+        if state.msg_secrets.is_empty() {
+            state.msg_secrets.reserve(stored);
+        }
         for entry in entries {
-            let key = (entry.chat, entry.sender, entry.msg_id);
-            let (expires_at, message_ts) = match state.msg_secrets.get(&key) {
-                Some((_, existing_exp, existing_ts)) => (
-                    merge_msg_secret_expiry(*existing_exp, entry.expires_at),
-                    merge_msg_secret_message_ts(*existing_ts, entry.message_ts),
-                ),
-                None => (entry.expires_at, entry.message_ts),
+            let key = MsgSecretKey {
+                chat: entry.chat,
+                sender: entry.sender,
+                msg_id: entry.msg_id,
             };
-            state
-                .msg_secrets
-                .insert(key, (entry.secret, expires_at, message_ts));
+            match state.msg_secrets.entry(key) {
+                Entry::Occupied(mut occupied) => {
+                    let (secret, expires_at, message_ts) = occupied.get_mut();
+                    *secret = entry.secret;
+                    *expires_at = merge_msg_secret_expiry(*expires_at, entry.expires_at);
+                    *message_ts = merge_msg_secret_message_ts(*message_ts, entry.message_ts);
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert((entry.secret, entry.expires_at, entry.message_ts));
+                }
+            }
         }
         Ok(stored)
     }
@@ -724,8 +948,12 @@ impl MsgSecretStore for InMemoryBackend {
             .lock()
             .await
             .msg_secrets
-            .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .map(|(secret, _, message_ts)| (secret.clone(), *message_ts)))
+            .get(&MsgSecretKeyRef {
+                chat,
+                sender,
+                msg_id,
+            })
+            .map(|(secret, _, message_ts)| (secret.to_vec(), *message_ts)))
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
@@ -779,6 +1007,34 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    #[tokio::test]
+    async fn put_sessions_batch_inserts_and_updates() {
+        let backend = InMemoryBackend::new();
+        let first: Arc<str> = "15550000001:1@s.whatsapp.net".into();
+        let second: Arc<str> = "15550000002:2@s.whatsapp.net".into();
+
+        backend
+            .put_sessions_batch(&[
+                (first.clone(), Bytes::from_static(b"first")),
+                (second.clone(), Bytes::from_static(b"second")),
+            ])
+            .await
+            .unwrap();
+        backend
+            .put_sessions_batch(&[(first.clone(), Bytes::from_static(b"updated"))])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.get_session(&first).await.unwrap().unwrap(),
+            Bytes::from_static(b"updated")
+        );
+        assert_eq!(
+            backend.get_session(&second).await.unwrap().unwrap(),
+            Bytes::from_static(b"second")
+        );
     }
 
     #[tokio::test]
@@ -986,7 +1242,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M1".into(),
-                    secret: vec![1u8; 32],
+                    secret: [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
                     expires_at: 0,
                     message_ts: 0,
                 },
@@ -994,7 +1250,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M2".into(),
-                    secret: vec![2u8; 32],
+                    secret: [2u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
                     expires_at: 0,
                     message_ts: 0,
                 },
@@ -1002,7 +1258,7 @@ mod tests {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M1".into(),
-                    secret: vec![9u8; 32],
+                    secret: [9u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
                     expires_at: 0,
                     message_ts: 0,
                 },
@@ -1041,7 +1297,11 @@ mod tests {
             let mut state = backend.state.lock().await;
             let entry = state
                 .msg_secrets
-                .get_mut(&("c".into(), "s".into(), "OLD".into()))
+                .get_mut(&MsgSecretKeyRef {
+                    chat: "c",
+                    sender: "s",
+                    msg_id: "OLD",
+                })
                 .unwrap();
             entry.1 = crate::time::now_secs() - 86_400 * 30;
         }
@@ -1090,5 +1350,222 @@ mod tests {
             vec![9u8; 32],
             "last write wins for the same composite key"
         );
+    }
+
+    #[tokio::test]
+    async fn touch_tc_token_creates_placeholder_then_preserves_real_token() {
+        let backend = InMemoryBackend::new();
+
+        backend
+            .touch_tc_token_sender_timestamp("u1", 1000)
+            .await
+            .unwrap();
+        let placeholder = backend.get_tc_token("u1").await.unwrap().unwrap();
+        assert!(placeholder.token.is_empty());
+        assert_eq!(placeholder.sender_timestamp, Some(1000));
+
+        // A real token stored by the notification path must survive a later touch.
+        backend
+            .put_tc_token(
+                "u1",
+                &TcTokenEntry {
+                    token: vec![7, 8, 9],
+                    token_timestamp: 2000,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .touch_tc_token_sender_timestamp("u1", 3000)
+            .await
+            .unwrap();
+
+        let merged = backend.get_tc_token("u1").await.unwrap().unwrap();
+        assert_eq!(
+            merged.token,
+            vec![7, 8, 9],
+            "touch must not clobber the real token"
+        );
+        assert_eq!(merged.token_timestamp, 2000);
+        assert_eq!(merged.sender_timestamp, Some(3000));
+    }
+
+    #[tokio::test]
+    async fn touch_sender_timestamp_only_advances() {
+        let backend = InMemoryBackend::new();
+        backend
+            .touch_tc_token_sender_timestamp("uadv", 5000)
+            .await
+            .unwrap();
+        // An older touch (e.g. a stale history-sync sender epoch) must not regress.
+        backend
+            .touch_tc_token_sender_timestamp("uadv", 3000)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_tc_token("uadv")
+                .await
+                .unwrap()
+                .unwrap()
+                .sender_timestamp,
+            Some(5000)
+        );
+    }
+
+    #[tokio::test]
+    async fn store_received_tc_token_preserves_sender_timestamp() {
+        let backend = InMemoryBackend::new();
+        // Placeholder from the issuance path.
+        backend
+            .touch_tc_token_sender_timestamp("u2", 5000)
+            .await
+            .unwrap();
+
+        // Notification stores the real token; the sender bucket must survive.
+        backend
+            .store_received_tc_token("u2", &[1, 2, 3], 4000)
+            .await
+            .unwrap();
+
+        let entry = backend.get_tc_token("u2").await.unwrap().unwrap();
+        assert_eq!(entry.token, vec![1, 2, 3]);
+        assert_eq!(entry.token_timestamp, 4000);
+        assert_eq!(
+            entry.sender_timestamp,
+            Some(5000),
+            "store_received_tc_token must not drop the sender bucket"
+        );
+
+        // No prior entry: sender_timestamp starts unset.
+        backend
+            .store_received_tc_token("u3", &[9], 4000)
+            .await
+            .unwrap();
+        let fresh = backend.get_tc_token("u3").await.unwrap().unwrap();
+        assert_eq!(fresh.sender_timestamp, None);
+    }
+
+    #[tokio::test]
+    async fn store_received_tc_token_is_newer_wins() {
+        let backend = InMemoryBackend::new();
+
+        // First real token at t=5000.
+        backend
+            .store_received_tc_token("c", &[1, 1, 1], 5000)
+            .await
+            .unwrap();
+
+        // A stale write (older timestamp) must not clobber the fresher token —
+        // this is what lets concurrent history-sync chunks converge lock-free.
+        backend
+            .store_received_tc_token("c", &[2, 2, 2], 3000)
+            .await
+            .unwrap();
+        let e = backend.get_tc_token("c").await.unwrap().unwrap();
+        assert_eq!(e.token, vec![1, 1, 1], "older write must not overwrite");
+        assert_eq!(e.token_timestamp, 5000);
+
+        // A newer write wins.
+        backend
+            .store_received_tc_token("c", &[3, 3, 3], 7000)
+            .await
+            .unwrap();
+        let e = backend.get_tc_token("c").await.unwrap().unwrap();
+        assert_eq!(e.token, vec![3, 3, 3]);
+        assert_eq!(e.token_timestamp, 7000);
+
+        // A byte-less placeholder (sender epoch t=9000) never blocks a real token,
+        // even when the real token's timestamp is older than the placeholder's.
+        backend
+            .touch_tc_token_sender_timestamp("p", 9000)
+            .await
+            .unwrap();
+        backend
+            .store_received_tc_token("p", &[4, 4, 4], 6000)
+            .await
+            .unwrap();
+        let e = backend.get_tc_token("p").await.unwrap().unwrap();
+        assert_eq!(
+            e.token,
+            vec![4, 4, 4],
+            "placeholder must accept first real token"
+        );
+        assert_eq!(e.token_timestamp, 6000);
+        assert_eq!(e.sender_timestamp, Some(9000), "sender bucket preserved");
+    }
+
+    #[tokio::test]
+    async fn prune_respects_sender_and_token_windows() {
+        let backend = InMemoryBackend::new();
+        // token_cutoff = 1000, sender_cutoff = 2000 (wider sender window).
+
+        // Recent placeholder: sender bucket still live → kept.
+        backend
+            .touch_tc_token_sender_timestamp("recent_ph", 2500)
+            .await
+            .unwrap();
+        // Stale placeholder: both windows passed → pruned.
+        backend
+            .touch_tc_token_sender_timestamp("stale_ph", 100)
+            .await
+            .unwrap();
+        // Expired token but recent sender bucket → kept (issuance state survives).
+        backend
+            .put_tc_token(
+                "expired_tok_live_sender",
+                &TcTokenEntry {
+                    token: vec![1],
+                    token_timestamp: 1,
+                    sender_timestamp: Some(2500),
+                },
+            )
+            .await
+            .unwrap();
+        // Expired token, no sender state → pruned.
+        backend
+            .put_tc_token(
+                "orphan_expired",
+                &TcTokenEntry {
+                    token: vec![2],
+                    token_timestamp: 1,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Fresh received token → kept.
+        backend
+            .put_tc_token(
+                "fresh_tok",
+                &TcTokenEntry {
+                    token: vec![3],
+                    token_timestamp: 5000,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let removed = backend.delete_expired_tc_tokens(1000, 2000).await.unwrap();
+        assert_eq!(removed, 2, "only fully-stale rows are pruned");
+        assert!(backend.get_tc_token("recent_ph").await.unwrap().is_some());
+        assert!(backend.get_tc_token("stale_ph").await.unwrap().is_none());
+        assert!(
+            backend
+                .get_tc_token("expired_tok_live_sender")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .get_tc_token("orphan_expired")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(backend.get_tc_token("fresh_tok").await.unwrap().is_some());
     }
 }

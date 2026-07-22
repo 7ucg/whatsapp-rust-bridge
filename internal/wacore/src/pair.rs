@@ -3,16 +3,14 @@ use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{KeyPair, PublicKey};
 use base64::Engine as _;
 use base64::prelude::*;
-use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use prost::Message;
 
 use sha2::Sha256;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, SERVER_JID};
 use wacore_binary::{Node, NodeRef};
 use waproto::whatsapp as wa;
-use waproto::whatsapp::AdvEncryptionType;
+use waproto::whatsapp::ADVEncryptionType;
 
 // Prefixes from whatsmeow/pair.go, crucial for signature verification
 const ADV_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 0];
@@ -118,22 +116,68 @@ impl PairUtils {
             .build()
     }
 
+    /// Extract the `<device-identity>` bytes from a `pair-success` node, ignoring
+    /// any extra children. SHORTCAKE_PASSKEY (QR-less) pair-success adds
+    /// `<encryption-metadata>`, `<jurisdiction>`, `<client-props>` siblings; the
+    /// companion completes linking purely via this `<device-identity>` (HMAC vs
+    /// the ADV secret), never decrypting the metadata. Returns `None` when the
+    /// child is absent or carries no byte content (caller maps that to a 500).
+    ///
+    /// This is the single production parse point shared by the live handler and
+    /// the passkey regression test, so a child-parsing regression breaks both.
+    pub fn extract_device_identity_bytes<'n, 'a>(
+        success_node: &'n NodeRef<'a>,
+    ) -> Option<&'n [u8]> {
+        success_node
+            .get_optional_child_by_tag(&["device-identity"])
+            .and_then(|n| n.content_bytes())
+    }
+
+    /// Decode the optional `<client-props>` protobuf the primary attaches to
+    /// `pair-success` (WA Web `parseSetRegRequestPairSuccessClientProps`).
+    /// Carries account state such as `isChatDbLidMigrated`. A malformed
+    /// payload is treated as absent: the props are advisory and must never
+    /// fail the pairing itself.
+    pub fn extract_pairing_props(success_node: &NodeRef<'_>) -> Option<wa::ClientPairingProps> {
+        let bytes = success_node
+            .get_optional_child_by_tag(&["client-props"])?
+            .content_bytes()?;
+        waproto::codec::client_pairing_props_decode(bytes).ok()
+    }
+
+    /// Pair-time `lid_migrated` write decision. `Some(true)` whenever the
+    /// primary reports the account migrated; `Some(false)` only when a
+    /// DIFFERENT account is being paired onto this store (WA Web starts those
+    /// from prefs cleared at logout); `None` preserves the stored value on a
+    /// same-account relink whose pair-success omitted client-props — WA Web's
+    /// HandlePairSuccess never lowers the pref.
+    pub fn lid_migrated_update(props_migrated: bool, account_changed: bool) -> Option<bool> {
+        if props_migrated {
+            Some(true)
+        } else if account_changed {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// Performs the cryptographic operations for pairing
     pub fn do_pair_crypto(
         device_state: &DeviceState,
         device_identity_bytes: &[u8],
     ) -> Result<(Vec<u8>, u32), PairCryptoError> {
         // 1. Unmarshal HMAC container and verify HMAC
-        let hmac_container = wa::AdvSignedDeviceIdentityHmac::decode(device_identity_bytes)
-            .map_err(|e| PairCryptoError {
-                code: 500,
-                text: "internal-error",
-                source: e.into(),
-            })?;
+        let hmac_container = waproto::codec::adv_signed_device_identity_hmac_decode(
+            device_identity_bytes,
+        )
+        .map_err(|e| PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: e.into(),
+        })?;
 
         // Determine if this is a hosted account
-        let is_hosted_account = hmac_container.account_type.is_some()
-            && hmac_container.account_type() == AdvEncryptionType::Hosted;
+        let is_hosted_account = hmac_container.account_type == Some(ADVEncryptionType::HOSTED);
 
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&device_state.adv_secret_key)
             .map_err(|e| PairCryptoError {
@@ -174,16 +218,26 @@ impl PairUtils {
         })?;
 
         // 2. Unmarshal inner container and verify account signature
-        let mut signed_identity =
-            wa::AdvSignedDeviceIdentity::decode(details_bytes).map_err(|e| PairCryptoError {
+        let mut signed_identity = waproto::codec::adv_signed_device_identity_decode(details_bytes)
+            .map_err(|e| PairCryptoError {
                 code: 500,
                 text: "internal-error",
                 source: e.into(),
             })?;
 
-        let account_sig_key_bytes = signed_identity.account_signature_key();
-        let account_sig_bytes = signed_identity.account_signature();
-        let inner_details_bytes = signed_identity.details().to_vec();
+        let account_sig_key_bytes = signed_identity
+            .account_signature_key
+            .as_deref()
+            .unwrap_or_default();
+        let account_sig_bytes = signed_identity
+            .account_signature
+            .as_deref()
+            .unwrap_or_default();
+        let inner_details_bytes = signed_identity
+            .details
+            .as_deref()
+            .unwrap_or_default()
+            .to_vec();
 
         let account_sig_prefix = if is_hosted_account {
             ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
@@ -237,16 +291,21 @@ impl PairUtils {
         signed_identity.device_signature = Some(device_signature.to_vec());
 
         // 4. Unmarshal final details to get key_index
-        let identity_details =
-            wa::AdvDeviceIdentity::decode(&*inner_details_bytes).map_err(|e| PairCryptoError {
+        let identity_details = waproto::codec::adv_device_identity_decode(&inner_details_bytes)
+            .map_err(|e| PairCryptoError {
                 code: 500,
                 text: "internal-error",
                 source: e.into(),
             })?;
-        let key_index = identity_details.key_index();
+        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: anyhow::anyhow!("ADVDeviceIdentity missing key_index"),
+        })?;
 
         // 5. Marshal the modified signed_identity to send back
-        let self_signed_identity_bytes = signed_identity.encode_to_vec();
+        let self_signed_identity_bytes =
+            waproto::codec::adv_signed_device_identity_to_vec(&signed_identity);
 
         Ok((self_signed_identity_bytes, key_index))
     }
@@ -349,8 +408,7 @@ impl PairUtils {
 
         // Encrypt the final message
         let mut encryption_key = [0u8; 32];
-        Hkdf::<Sha256>::new(None, &shared_secret)
-            .expand(b"WA-Ads-Key", &mut encryption_key)
+        crate::crypto::hkdf_sha256_into(&shared_secret, None, b"WA-Ads-Key", &mut encryption_key)
             .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
         let nonce = [0u8; 12];
         let mut encrypted = Vec::with_capacity(final_message.len() + 16);
@@ -394,8 +452,10 @@ impl PairUtils {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use buffa::Message;
     use rand::RngExt;
 
     fn dummy_device_state() -> DeviceState {
@@ -547,23 +607,23 @@ mod tests {
         use waproto::whatsapp as wa;
 
         let cases = [
-            (wa::device_props::PlatformType::Chrome, "1"),
-            (wa::device_props::PlatformType::Firefox, "3"),
-            (wa::device_props::PlatformType::Safari, "6"),
-            (wa::device_props::PlatformType::Edge, "2"),
-            (wa::device_props::PlatformType::Desktop, "7"),
-            (wa::device_props::PlatformType::Uwp, "8"),
-            (wa::device_props::PlatformType::AndroidPhone, "1"),
-            (wa::device_props::PlatformType::AndroidTablet, "1"),
-            (wa::device_props::PlatformType::AndroidAmbiguous, "1"),
-            (wa::device_props::PlatformType::IosPhone, "9"),
-            (wa::device_props::PlatformType::Vr, "9"),
-            (wa::device_props::PlatformType::Unknown, "9"),
+            (wa::device_props::PlatformType::CHROME, "1"),
+            (wa::device_props::PlatformType::FIREFOX, "3"),
+            (wa::device_props::PlatformType::SAFARI, "6"),
+            (wa::device_props::PlatformType::EDGE, "2"),
+            (wa::device_props::PlatformType::DESKTOP, "7"),
+            (wa::device_props::PlatformType::UWP, "8"),
+            (wa::device_props::PlatformType::ANDROID_PHONE, "1"),
+            (wa::device_props::PlatformType::ANDROID_TABLET, "1"),
+            (wa::device_props::PlatformType::ANDROID_AMBIGUOUS, "1"),
+            (wa::device_props::PlatformType::IOS_PHONE, "9"),
+            (wa::device_props::PlatformType::VR, "9"),
+            (wa::device_props::PlatformType::UNKNOWN, "9"),
         ];
         let state = dummy_device_state();
         for (pt, expected_wire) in cases {
             let props = wa::DeviceProps {
-                platform_type: Some(pt as i32),
+                platform_type: Some(pt),
                 ..Default::default()
             };
             let ct = companion_web_client_type_for_props(&props);
@@ -621,18 +681,31 @@ mod tests {
         adv_secret_for_hmac: &[u8; 32],
         is_hosted: bool,
     ) -> Vec<u8> {
-        use prost::Message;
+        build_pair_success_payload_with_key_index(state, adv_secret_for_hmac, is_hosted, Some(0))
+    }
+
+    fn build_pair_success_payload_with_key_index(
+        state: &DeviceState,
+        adv_secret_for_hmac: &[u8; 32],
+        is_hosted: bool,
+        key_index: Option<u32>,
+    ) -> Vec<u8> {
+        use buffa::Message;
         use waproto::whatsapp as wa;
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account_kp = KeyPair::generate(&mut rng);
-        let account_type_value = if is_hosted { 1 } else { 0 };
-        let inner = wa::AdvDeviceIdentity {
+        let account_type = if is_hosted {
+            wa::ADVEncryptionType::HOSTED
+        } else {
+            wa::ADVEncryptionType::E2EE
+        };
+        let inner = wa::ADVDeviceIdentity {
             raw_id: Some(1),
             timestamp: Some(0),
-            key_index: Some(0),
-            account_type: Some(account_type_value),
-            device_type: Some(account_type_value),
+            key_index,
+            account_type: Some(account_type),
+            device_type: Some(account_type),
         }
         .encode_to_vec();
         let account_sig_prefix: &[u8] = if is_hosted {
@@ -648,7 +721,7 @@ mod tests {
             .private_key
             .calculate_signature(&to_sign, &mut rng)
             .unwrap();
-        let signed = wa::AdvSignedDeviceIdentity {
+        let signed = wa::ADVSignedDeviceIdentity {
             details: Some(inner),
             account_signature_key: Some(account_kp.public_key.public_key_bytes().to_vec()),
             account_signature: Some(sig.to_vec()),
@@ -661,10 +734,10 @@ mod tests {
         }
         mac.update(&signed);
         let hmac_bytes = mac.finalize().into_bytes().to_vec();
-        wa::AdvSignedDeviceIdentityHmac {
+        wa::ADVSignedDeviceIdentityHMAC {
             details: Some(signed),
             hmac: Some(hmac_bytes),
-            account_type: Some(account_type_value),
+            account_type: Some(account_type),
         }
         .encode_to_vec()
     }
@@ -686,6 +759,168 @@ mod tests {
             .expect_err("mismatched HMAC must abort pairing");
         assert_eq!(err.code, 401, "expected 401 unauthorized, got {}", err.code);
         assert_eq!(err.text, "hmac-mismatch");
+    }
+
+    // A SHORTCAKE_PASSKEY (QR-less) login converges to the SAME pair-success as the
+    // classic QR flow, but the node carries extra children: <jurisdiction>, a new
+    // <encryption-metadata algorithm="aes-256-gcm"> block, <client-props>, <platform>.
+    // RE of WAWebHandlePairSuccess confirmed the
+    // companion PARSES but never DECRYPTS <encryption-metadata> — linking completes
+    // purely via the classic <device-identity> HMAC vs the ADV secret. This guards
+    // that our handler still extracts device-identity (ignoring the new children) and
+    // verifies, i.e. NO encryption-metadata decryption is needed.
+    #[test]
+    fn pair_success_with_passkey_encryption_metadata_completes_via_device_identity() {
+        let state = dummy_device_state();
+        let payload = build_pair_success_payload(&state, &state.adv_secret_key, false);
+
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([
+                NodeBuilder::new("jurisdiction")
+                    .attr("iso", "BR")
+                    .attr("cc", "55")
+                    .build(),
+                NodeBuilder::new("encryption-metadata")
+                    .attr("version", "1")
+                    .attr("algorithm", "aes-256-gcm")
+                    .children([
+                        NodeBuilder::new("encrypted_key")
+                            .bytes(vec![0xAAu8; 48])
+                            .build(),
+                        NodeBuilder::new("nonce").bytes(vec![0xBBu8; 12]).build(),
+                        NodeBuilder::new("encrypted_data")
+                            .bytes(vec![0xCCu8; 280])
+                            .build(),
+                        NodeBuilder::new("auth_tag").bytes(vec![0xDDu8; 16]).build(),
+                    ])
+                    .build(),
+                NodeBuilder::new("client-props")
+                    .bytes(vec![0x08u8, 0x01])
+                    .build(),
+                NodeBuilder::new("platform").attr("name", "android").build(),
+                NodeBuilder::new("device-identity")
+                    .bytes(payload.clone())
+                    .build(),
+                NodeBuilder::new("device")
+                    .attr("jid", "5511999999999:57@s.whatsapp.net")
+                    .build(),
+            ])
+            .build();
+
+        let success_ref = pair_success.as_node_ref();
+
+        // The new passkey block is present in the stanza...
+        assert!(
+            success_ref
+                .get_optional_child_by_tag(&["encryption-metadata"])
+                .is_some(),
+            "test fixture should include the new encryption-metadata block"
+        );
+
+        // ...but the PRODUCTION extraction (the same helper the live pair-success
+        // handler calls) pulls <device-identity> by tag, ignoring all extras.
+        let di_bytes = PairUtils::extract_device_identity_bytes(&success_ref)
+            .expect("production extraction must find device-identity among passkey children");
+        assert_eq!(di_bytes, payload.as_slice());
+
+        // Classic crypto completes the passkey link (HMAC vs ADV secret) — no
+        // decryption of <encryption-metadata> required.
+        PairUtils::do_pair_crypto(&state, di_bytes)
+            .expect("device-identity HMAC must verify for the passkey pair-success");
+    }
+
+    #[test]
+    fn do_pair_crypto_rejects_missing_key_index() {
+        let state = dummy_device_state();
+        let payload =
+            build_pair_success_payload_with_key_index(&state, &state.adv_secret_key, false, None);
+
+        let err = PairUtils::do_pair_crypto(&state, &payload)
+            .expect_err("missing key_index should abort pairing");
+
+        assert_eq!(err.code, 500);
+        assert!(err.source.to_string().contains("missing key_index"));
+    }
+
+    #[test]
+    fn extract_pairing_props_decodes_client_props_child() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([
+                NodeBuilder::new("device-identity")
+                    .bytes(vec![0x01u8])
+                    .build(),
+                NodeBuilder::new("client-props")
+                    .bytes(
+                        wa::ClientPairingProps {
+                            is_chat_db_lid_migrated: Some(true),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    )
+                    .build(),
+            ])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(props.is_chat_db_lid_migrated.unwrap_or(false));
+    }
+
+    #[test]
+    fn extract_pairing_props_explicit_false_decodes_as_unmigrated() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(
+                    wa::ClientPairingProps {
+                        is_chat_db_lid_migrated: Some(false),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .build()])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(!props.is_chat_db_lid_migrated.unwrap_or(false));
+    }
+
+    #[test]
+    fn extract_pairing_props_field_absent_defaults_to_unmigrated() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(wa::ClientPairingProps::default().encode_to_vec())
+                .build()])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(!props.is_chat_db_lid_migrated.unwrap_or(false));
+    }
+
+    #[test]
+    fn lid_migrated_update_only_lowers_on_account_change() {
+        // Primary reports migrated: always raise.
+        assert_eq!(PairUtils::lid_migrated_update(true, false), Some(true));
+        assert_eq!(PairUtils::lid_migrated_update(true, true), Some(true));
+        // Different account without (or with false) client-props: reset so the
+        // new account never inherits the previous one's state.
+        assert_eq!(PairUtils::lid_migrated_update(false, true), Some(false));
+        // Same-account relink without client-props: preserve the stored value.
+        assert_eq!(PairUtils::lid_migrated_update(false, false), None);
+    }
+
+    #[test]
+    fn extract_pairing_props_absent_or_malformed_is_none() {
+        let bare = NodeBuilder::new("pair-success").build();
+        assert!(PairUtils::extract_pairing_props(&bare.as_node_ref()).is_none());
+
+        let malformed = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(vec![0xFFu8, 0xFF, 0xFF])
+                .build()])
+            .build();
+        assert!(PairUtils::extract_pairing_props(&malformed.as_node_ref()).is_none());
     }
 
     #[test]

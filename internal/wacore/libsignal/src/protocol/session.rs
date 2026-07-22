@@ -6,14 +6,12 @@
 use rand::{CryptoRng, Rng};
 
 use crate::protocol::state::GenericSignedPreKey;
-use crate::protocol::state::KyberPreKeyId;
-use crate::protocol::storage::KyberPreKeyStore;
-use crate::protocol::{
-    ratchet, Direction, IdentityChange, IdentityKey, IdentityKeyStore, KeyPair, PreKeyBundle,
-    PreKeyId, PreKeySignalMessage, PreKeyStore, ProtocolAddress, Result, SessionRecord,
-    SessionStore, SignalProtocolError, SignedPreKeyStore,
-};
 use crate::protocol::{AliceSignalProtocolParameters, BobSignalProtocolParameters};
+use crate::protocol::{
+    Direction, IdentityChange, IdentityKey, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, Result, SessionCheckout, SessionRecord,
+    SessionStore, SignalProtocolError, SignedPreKeyStore, ratchet,
+};
 
 #[derive(Default)]
 pub struct PreKeysUsed {
@@ -47,7 +45,6 @@ pub async fn process_prekey<'a>(
     identity_store: &dyn IdentityKeyStore,
     pre_key_store: &dyn PreKeyStore,
     signed_prekey_store: &dyn SignedPreKeyStore,
-    kyber_prekey_store: Option<&dyn KyberPreKeyStore>,
     use_pq_ratchet: ratchet::UsePQRatchet,
 ) -> Result<(PreKeysUsed, IdentityToSave<'a>, bool)> {
     let their_identity_key = message.identity_key();
@@ -67,7 +64,6 @@ pub async fn process_prekey<'a>(
         session_record,
         signed_prekey_store,
         pre_key_store,
-        kyber_prekey_store,
         identity_store,
         use_pq_ratchet,
     )
@@ -87,7 +83,6 @@ async fn process_prekey_impl(
     session_record: &mut SessionRecord,
     signed_prekey_store: &dyn SignedPreKeyStore,
     pre_key_store: &dyn PreKeyStore,
-    kyber_prekey_store: Option<&dyn KyberPreKeyStore>,
     identity_store: &dyn IdentityKeyStore,
     use_pq_ratchet: ratchet::UsePQRatchet,
 ) -> Result<(PreKeysUsed, bool)> {
@@ -126,7 +121,7 @@ async fn process_prekey_impl(
         None
     };
 
-    let mut parameters = BobSignalProtocolParameters::new(
+    let parameters = BobSignalProtocolParameters::new(
         identity_store.get_identity_key_pair().await?,
         our_signed_pre_key_pair.clone(), // signed pre key
         our_one_time_pre_key_pair,
@@ -136,23 +131,14 @@ async fn process_prekey_impl(
         use_pq_ratchet,
     );
 
-    // If the message carries a Kyber ciphertext, look up the matching kyber pre-key pair.
-    if let (Some(store), Some(kyber_id), Some(kyber_ct)) = (
-        kyber_prekey_store,
-        message.kyber_pre_key_id(),
-        message.kyber_ciphertext(),
-    ) {
-        let kyber_record = store.get_kyber_pre_key(kyber_id).await?;
-        parameters.set_our_kyber_pre_key_pair(kyber_record.key_pair().clone());
-        parameters.set_their_kyber_ciphertext(kyber_ct.to_vec().into_boxed_slice());
-    }
-
     let mut new_session = ratchet::initialize_bob_session(&parameters)?;
 
     new_session.set_local_registration_id(identity_store.get_local_registration_id().await?);
     new_session.set_remote_registration_id(message.registration_id());
 
-    session_record.promote_state(new_session);
+    // Fresh random ratchet: no counter on this chain can have been spent, so
+    // the record's inherited lease must not be burned into it.
+    session_record.promote_fresh_state(new_session);
 
     let pre_keys_used = PreKeysUsed {
         pre_key_id: message.pre_key_id(),
@@ -186,13 +172,12 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
         return Err(SignalProtocolError::SignatureValidationFailed);
     }
 
-    let existing = session_store.load_session(remote_address).await?;
-    let had_session = existing.is_some();
-    let mut session_record = existing.unwrap_or_else(SessionRecord::new_fresh);
+    let mut session = SessionCheckout::load_or_create(session_store, remote_address).await?;
+    let had_session = session.had_session();
 
     let result = process_prekey_bundle_inner(
         remote_address,
-        &mut session_record,
+        session.record_mut(),
         identity_store,
         bundle,
         their_identity_key,
@@ -202,9 +187,9 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
     .await;
 
     if had_session || result.is_ok() {
-        session_store
-            .store_session(remote_address, session_record)
-            .await?;
+        session.commit().await?;
+    } else {
+        session.discard();
     }
 
     result
@@ -239,21 +224,7 @@ async fn process_prekey_bundle_inner<R: Rng + CryptoRng>(
         parameters.set_their_one_time_pre_key(key);
     }
 
-    // Validate and register the Kyber pre-key from the bundle, if present.
-    if let Some(kyber_pk) = bundle.kyber_pre_key_public() {
-        let kyber_sig = bundle
-            .kyber_pre_key_signature()
-            .ok_or(SignalProtocolError::SignatureValidationFailed)?;
-        if !their_identity_key
-            .public_key()
-            .verify_signature(&kyber_pk.serialize(), kyber_sig)
-        {
-            return Err(SignalProtocolError::SignatureValidationFailed);
-        }
-        parameters.set_their_kyber_pre_key(kyber_pk.clone());
-    }
-
-    let (mut session, kyber_ciphertext) = ratchet::initialize_alice_session(&parameters, csprng)?;
+    let mut session = ratchet::initialize_alice_session(&parameters, csprng)?;
 
     log::debug!(
         "set_unacknowledged_pre_key_message for: {} with preKeyId: {}",
@@ -261,15 +232,10 @@ async fn process_prekey_bundle_inner<R: Rng + CryptoRng>(
         their_one_time_prekey_id.map_or_else(|| "<none>".to_string(), |id| id.to_string())
     );
 
-    let kyber_id: Option<KyberPreKeyId> = bundle.kyber_pre_key_id();
-    let kyber_ct_vec: Option<Vec<u8>> = kyber_ciphertext.map(|ct| ct.into_vec());
-
     session.set_unacknowledged_pre_key_message(
         their_one_time_prekey_id,
         bundle.signed_pre_key_id()?,
         &our_base_public_key,
-        kyber_id,
-        kyber_ct_vec,
     );
 
     session.set_local_registration_id(identity_store.get_local_registration_id().await?);
@@ -279,7 +245,8 @@ async fn process_prekey_bundle_inner<R: Rng + CryptoRng>(
         .save_identity(remote_address, their_identity_key)
         .await?;
 
-    session_record.promote_state(session);
+    // Fresh random ratchet: see promote_fresh_state.
+    session_record.promote_fresh_state(session);
 
     Ok(identity_change)
 }

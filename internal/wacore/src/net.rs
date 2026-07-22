@@ -10,7 +10,12 @@ pub const WHATSAPP_WEB_WS_URL: &str = "wss://web.whatsapp.com/ws/chat";
 /// Why the transport connection ended. Lets a benign server-initiated stream
 /// recycle (a clean Close frame) be told apart from an abrupt EOF or a real
 /// read error when diagnosing reconnect behavior.
-#[derive(Debug, Clone)]
+///
+/// Serialize: carried by `events::Disconnected`, whose payload consumers forward
+/// as JSON (webhooks, dashboards) — snake_case so the wire shape doesn't leak
+/// Rust variant naming.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DisconnectReason {
     /// The peer sent a WebSocket Close frame. `code` is the RFC 6455 close
     /// code (1000 = normal closure); `reason` is the optional UTF-8 text.
@@ -84,6 +89,15 @@ pub trait Transport: crate::sync_marker::MaybeSendSync {
 
     /// Closes the connection.
     async fn disconnect(&self);
+
+    /// Best-effort per-session footprint of this transport: read/write framing
+    /// buffers plus a TLS/noise session-state estimate. `None` by default;
+    /// concrete transports (e.g. the Tokio WebSocket transport) fill in what
+    /// they can. Not blanket-impl'd, so a defaulted method here is cleanly
+    /// overridable — no `Backend`-style wrinkle.
+    fn resource_report(&self) -> Option<crate::stats::TransportResourceReport> {
+        None
+    }
 }
 
 /// A factory responsible for creating new transport instances.
@@ -198,6 +212,15 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
         Err(anyhow::anyhow!(
             "Upload streaming not supported by this HTTP client"
         ))
+    }
+
+    /// Best-effort per-session footprint of this client: idle connection-pool
+    /// buffers plus any in-flight download/media buffering the impl can see.
+    /// `None` by default; `ureq`/`reqwest`-backed clients report what their
+    /// (limited) introspection allows. Media downloads are a real transient-RAM
+    /// source, so a coarse estimate is still worth reporting.
+    fn resource_report(&self) -> Option<crate::stats::HttpResourceReport> {
+        None
     }
 }
 
