@@ -3091,6 +3091,45 @@ export function md5(buffer) {
 }
 
 /**
+ * Parse a `<call>` stanza (offer/preaccept/accept/reject/terminate/transport/
+ * relaylatency/video) into a plain JSON object for JS, converting every `Jid`
+ * field to its string form (`user@server`) instead of the raw `{user, server,
+ * agent, device, integrator}` shape `serde` would give it. Returns `null` for a
+ * stanza with no known action child (forward-compat: a future server action).
+ *
+ * `own_jid` (optional, `user@server` string) selects which `<enc>` in an offer
+ * is ours when the offer is multi-device; omit it for a single-device offer.
+ *
+ * The returned `media` field (present only on an `<offer>` that carries an
+ * `<enc>` for us) has `enc_type`/`version`/`ciphertext` (the Signal ciphertext
+ * to decrypt via your own session — this bridge does not manage Signal state)
+ * and, when the offer carried one, a `relay` block shaped exactly like
+ * `parseRelayFromAckNode`'s output.
+ * @param {Uint8Array} encoded_node
+ * @param {string | null} [own_jid]
+ * @returns {any}
+ */
+export function parseCallStanza(encoded_node, own_jid) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(encoded_node, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        var ptr1 = isLikeNone(own_jid) ? 0 : passStringToWasm0(own_jid, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        var len1 = WASM_VECTOR_LEN;
+        wasm.parseCallStanza(retptr, ptr0, len0, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        if (r2) {
+            throw takeObject(r1);
+        }
+        return takeObject(r0);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * Parse a JID string into its components.
  * Accepts: "user@server", "user@server:device", "user.agent:device@server"
  * @param {string} jid_str
@@ -3249,6 +3288,10 @@ function __wbg_get_imports() {
         __wbg___wbindgen_is_object_5ae8e5880f2c1fbd: function(arg0) {
             const val = getObject(arg0);
             const ret = typeof(val) === 'object' && val !== null;
+            return ret;
+        },
+        __wbg___wbindgen_is_string_cd444516edc5b180: function(arg0) {
+            const ret = typeof(getObject(arg0)) === 'string';
             return ret;
         },
         __wbg___wbindgen_is_undefined_9e4d92534c42d778: function(arg0) {
@@ -3474,7 +3517,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_2168(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_2277(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3484,6 +3527,10 @@ function __wbg_get_imports() {
             } finally {
                 state0.a = state0.b = 0;
             }
+        },
+        __wbg_new_dca287b076112a51: function() {
+            const ret = new Map();
+            return addHeapObject(ret);
         },
         __wbg_new_dd2b680c8bf6ae29: function(arg0) {
             const ret = new Uint8Array(getObject(arg0));
@@ -3555,6 +3602,10 @@ function __wbg_get_imports() {
             const ret = SessionRecord.__wrap(arg0);
             return addHeapObject(ret);
         },
+        __wbg_set_1eb0999cf5d27fc8: function(arg0, arg1, arg2) {
+            const ret = getObject(arg0).set(getObject(arg1), getObject(arg2));
+            return addHeapObject(ret);
+        },
         __wbg_set_3f1d0b984ed272ed: function(arg0, arg1, arg2) {
             getObject(arg0)[takeObject(arg1)] = takeObject(arg2);
         },
@@ -3622,8 +3673,8 @@ function __wbg_get_imports() {
             getObject(arg0).warn(getObject(arg1), arg2 === 0 ? undefined : getStringFromWasm0(arg2, arg3));
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 240, function: Function { arguments: [Externref], shim_idx: 241, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1260, __wasm_bindgen_func_elem_1262);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 277, function: Function { arguments: [Externref], shim_idx: 278, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1346, __wasm_bindgen_func_elem_1348);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -3665,12 +3716,12 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1262(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_1262(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_1348(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_1348(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_2168(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_2168(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_2277(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_2277(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const CallEngineFinalization = (typeof FinalizationRegistry === 'undefined')

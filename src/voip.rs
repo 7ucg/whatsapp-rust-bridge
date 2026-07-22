@@ -11,6 +11,16 @@ use wacore::voip::{
 };
 use wasm_bindgen::prelude::*;
 
+/// `serde_wasm_bindgen::to_value` renders a Rust map/struct as a JS `Map` by
+/// default; every other JSON-shaped export in this bridge is a plain object,
+/// so route these through the same serializer with that switched off.
+fn to_js_object<T: serde::Serialize + ?Sized>(value: &T) -> Result<JsValue, JsValue> {
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    value
+        .serialize(&serializer)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 /// Parse the `<relay>` block out of an encoded `<ack>` stanza (as produced by this
 /// bridge's own binary-node encoder) and return the fields `CallEngine.create()`
 /// needs to allocate the media relay: `relay_ip`, `relay_port`, `relay_token`,
@@ -19,7 +29,12 @@ use wasm_bindgen::prelude::*;
 /// can't derive itself, since it takes pre-parsed config, not raw stanzas.
 #[wasm_bindgen(js_name = parseRelayFromAckNode)]
 pub fn parse_relay_from_ack_node(encoded_ack_node: &[u8]) -> Result<JsValue, JsValue> {
-    let node = wacore_binary::marshal::unmarshal_ref(encoded_ack_node)
+    // Same framing `decodeNode` uses: a leading data-type byte (bit 2 = zlib), then the
+    // marshaled node. encodeNode() (what JS re-encodes an already-parsed node with to get
+    // here) produces exactly this shape.
+    let unpacked = wacore_binary::util::unpack(encoded_ack_node)
+        .map_err(|e| JsValue::from_str(&format!("unpack error: {e}")))?;
+    let node = wacore_binary::marshal::unmarshal_ref(&unpacked)
         .map_err(|e| JsValue::from_str(&format!("decode error: {e}")))?;
     let relay_data = relay_parse::parse_relay_data_from_ack(&node)
         .ok_or_else(|| JsValue::from_str("no <relay> child on this node"))?;
@@ -54,7 +69,215 @@ pub fn parse_relay_from_ack_node(encoded_ack_node: &[u8]) -> Result<JsValue, JsV
         integrity_key,
         warp_mi_tag_len,
     };
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+    to_js_object(&out)
+}
+
+/// Parse a `<call>` stanza (offer/preaccept/accept/reject/terminate/transport/
+/// relaylatency/video) into a plain JSON object for JS, converting every `Jid`
+/// field to its string form (`user@server`) instead of the raw `{user, server,
+/// agent, device, integrator}` shape `serde` would give it. Returns `null` for a
+/// stanza with no known action child (forward-compat: a future server action).
+///
+/// `own_jid` (optional, `user@server` string) selects which `<enc>` in an offer
+/// is ours when the offer is multi-device; omit it for a single-device offer.
+///
+/// The returned `media` field (present only on an `<offer>` that carries an
+/// `<enc>` for us) has `enc_type`/`version`/`ciphertext` (the Signal ciphertext
+/// to decrypt via your own session — this bridge does not manage Signal state)
+/// and, when the offer carried one, a `relay` block shaped exactly like
+/// `parseRelayFromAckNode`'s output.
+#[wasm_bindgen(js_name = parseCallStanza)]
+pub fn parse_call_stanza_js(
+    encoded_node: &[u8],
+    own_jid: Option<String>,
+) -> Result<JsValue, JsValue> {
+    use wacore::types::call::CallAction;
+
+    let unpacked = wacore_binary::util::unpack(encoded_node)
+        .map_err(|e| JsValue::from_str(&format!("unpack error: {e}")))?;
+    let node = wacore_binary::marshal::unmarshal_ref(&unpacked)
+        .map_err(|e| JsValue::from_str(&format!("decode error: {e}")))?;
+    let Some(incoming) = wacore::stanza::call::parse_call_stanza(&node)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+    else {
+        return Ok(JsValue::NULL);
+    };
+
+    let jid_str = |j: &wacore_binary::Jid| j.to_string();
+    let audio_json = |codecs: &[wacore::types::call::CallAudioCodec]| {
+        codecs
+            .iter()
+            .map(|c| serde_json::json!({ "enc": c.enc, "rate": c.rate }))
+            .collect::<Vec<_>>()
+    };
+
+    let action = match &incoming.action {
+        CallAction::Offer {
+            call_id,
+            call_creator,
+            caller_pn,
+            caller_country_code,
+            device_class,
+            joinable,
+            is_video,
+            audio,
+            group_jid,
+        } => serde_json::json!({
+            "type": "offer",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+            "caller_pn": caller_pn.as_ref().map(jid_str),
+            "caller_country_code": caller_country_code,
+            "device_class": device_class,
+            "joinable": joinable,
+            "is_video": is_video,
+            "audio": audio_json(audio),
+            "group_jid": group_jid.as_ref().map(jid_str),
+        }),
+        CallAction::OfferNotice {
+            call_id,
+            call_creator,
+            is_video,
+            is_group,
+        } => serde_json::json!({
+            "type": "offer_notice",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+            "is_video": is_video,
+            "is_group": is_group,
+        }),
+        CallAction::PreAccept {
+            call_id,
+            call_creator,
+            audio,
+        } => serde_json::json!({
+            "type": "preaccept",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+            "audio": audio_json(audio),
+        }),
+        CallAction::Accept {
+            call_id,
+            call_creator,
+            audio,
+        } => serde_json::json!({
+            "type": "accept",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+            "audio": audio_json(audio),
+        }),
+        CallAction::Reject {
+            call_id,
+            call_creator,
+        } => serde_json::json!({
+            "type": "reject",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+        }),
+        CallAction::Terminate {
+            call_id,
+            call_creator,
+            reason,
+            duration,
+            audio_duration,
+        } => serde_json::json!({
+            "type": "terminate",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+            "reason": reason,
+            "duration": duration,
+            "audio_duration": audio_duration,
+        }),
+        CallAction::Transport {
+            call_id,
+            call_creator,
+            p2p_cand_round,
+            transport_message_type,
+        } => serde_json::json!({
+            "type": "transport",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+            "p2p_cand_round": p2p_cand_round,
+            "transport_message_type": transport_message_type,
+        }),
+        CallAction::RelayLatency {
+            call_id,
+            call_creator,
+        } => serde_json::json!({
+            "type": "relaylatency",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+        }),
+        CallAction::VideoState {
+            call_id,
+            call_creator,
+            state,
+            orientation,
+            dec,
+        } => serde_json::json!({
+            "type": "video",
+            "call_id": call_id,
+            "call_creator": jid_str(call_creator),
+            "state": state.code(),
+            "orientation": orientation,
+            "dec": dec,
+        }),
+        // CallAction is #[non_exhaustive]: a future server action falls back to a bare
+        // type+call_id+call_creator so JS can still see the call_id and ignore the rest,
+        // rather than the whole parse failing.
+        other => serde_json::json!({
+            "type": other.action_kind(),
+            "call_id": other.call_id(),
+            "call_creator": jid_str(other.call_creator()),
+        }),
+    };
+
+    let mut out = serde_json::json!({
+        "from": jid_str(&incoming.from),
+        "stanza_id": incoming.stanza_id,
+        "notify": incoming.notify,
+        "platform": incoming.platform,
+        "version": incoming.version,
+        "timestamp": incoming.timestamp.timestamp(),
+        "offline": incoming.offline,
+        "action": action,
+    });
+
+    if let Some(media) = &incoming.media {
+        let own = own_jid.as_deref().and_then(|s| s.parse().ok());
+        let enc = media.enc_for(own.as_ref());
+        let mut media_json = serde_json::json!({});
+        if let Some(enc) = enc {
+            media_json["enc_type"] = serde_json::json!(enc.enc_type);
+            media_json["version"] = serde_json::json!(enc.version);
+            media_json["ciphertext"] = serde_json::json!(enc.ciphertext);
+        }
+        if let Some(relay_data) = &media.relay {
+            if let Some(endpoint) = relay_parse::get_media_relay_endpoint(relay_data) {
+                if let Some((relay_ip, relay_port)) =
+                    relay_parse::get_primary_ipv4_address(endpoint)
+                {
+                    let relay_token = relay_data
+                        .relay_tokens
+                        .get(endpoint.token_id as usize)
+                        .filter(|t| !t.is_empty())
+                        .cloned();
+                    media_json["relay"] = serde_json::json!({
+                        "relay_ip": relay_ip,
+                        "relay_port": relay_port,
+                        "relay_token": relay_token,
+                        "integrity_key": relay_data.relay_key_ascii,
+                        "warp_mi_tag_len": relay_data.warp_mi_tag_len.unwrap_or(4),
+                    });
+                }
+            }
+        }
+        if enc.is_some() || media.relay.is_some() {
+            out["media"] = media_json;
+        }
+    }
+
+    to_js_object(&out)
 }
 
 /// OS-RNG STUN transaction-id source (production-safe; consent freshness depends

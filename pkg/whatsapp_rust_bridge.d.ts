@@ -775,6 +775,24 @@ export function logMessage(level: string, message: string): void;
 export function md5(buffer: Uint8Array): Uint8Array;
 
 /**
+ * Parse a `<call>` stanza (offer/preaccept/accept/reject/terminate/transport/
+ * relaylatency/video) into a plain JSON object for JS, converting every `Jid`
+ * field to its string form (`user@server`) instead of the raw `{user, server,
+ * agent, device, integrator}` shape `serde` would give it. Returns `null` for a
+ * stanza with no known action child (forward-compat: a future server action).
+ *
+ * `own_jid` (optional, `user@server` string) selects which `<enc>` in an offer
+ * is ours when the offer is multi-device; omit it for a single-device offer.
+ *
+ * The returned `media` field (present only on an `<offer>` that carries an
+ * `<enc>` for us) has `enc_type`/`version`/`ciphertext` (the Signal ciphertext
+ * to decrypt via your own session — this bridge does not manage Signal state)
+ * and, when the offer carried one, a `relay` block shaped exactly like
+ * `parseRelayFromAckNode`'s output.
+ */
+export function parseCallStanza(encoded_node: Uint8Array, own_jid?: string | null): any;
+
+/**
  * Parse a JID string into its components.
  * Accepts: "user@server", "user@server:device", "user.agent:device@server"
  */
@@ -964,6 +982,7 @@ export interface InitOutput {
     readonly noisesession_processHandshakeInit: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
     readonly noisexxfallbacksession_buildClientFinish: (a: number, b: number) => void;
     readonly noisexxfallbacksession_finish: (a: number, b: number) => void;
+    readonly parseCallStanza: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly parseJid: (a: number, b: number) => number;
     readonly parseRelayFromAckNode: (a: number, b: number, c: number) => void;
     readonly protocoladdress_deviceId: (a: number) => number;
@@ -998,9 +1017,9 @@ export interface InitOutput {
     readonly generateKeyPair: () => number;
     readonly updateLogger: (a: number) => void;
     readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1260: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2168: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1262: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1346: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2277: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1348: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;
