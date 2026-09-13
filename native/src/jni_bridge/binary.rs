@@ -1,6 +1,6 @@
-use jni::JNIEnv;
 use jni::objects::JByteArray;
 use jni::sys::jbyteArray;
+use jni::JNIEnv;
 use serde::{Deserialize, Serialize};
 use wacore_binary::marshal::marshal_ref;
 use wacore_binary::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef};
@@ -67,7 +67,7 @@ fn node_ref_to_json(node: &NodeRef<'_>) -> JsonNode {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    let content = node.content.as_deref().map(|c| match c {
+    let content = node.content.as_ref().map(|c| match c {
         NodeContentRef::String(s) => JsonContent::Text(s.to_string()),
         NodeContentRef::Bytes(b) => {
             use base64::Engine;
@@ -75,11 +75,13 @@ fn node_ref_to_json(node: &NodeRef<'_>) -> JsonNode {
                 b64: base64::engine::general_purpose::STANDARD.encode(b.as_ref()),
             }
         }
-        NodeContentRef::Nodes(ch) => {
-            JsonContent::Nodes(ch.iter().map(node_ref_to_json).collect())
-        }
+        NodeContentRef::Nodes(ch) => JsonContent::Nodes(ch.iter().map(node_ref_to_json).collect()),
     });
-    JsonNode { tag: node.tag.to_string(), attrs, content }
+    JsonNode {
+        tag: node.tag.to_string(),
+        attrs,
+        content,
+    }
 }
 
 #[unsafe(no_mangle)]

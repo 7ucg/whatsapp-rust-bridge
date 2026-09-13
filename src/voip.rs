@@ -169,10 +169,12 @@ pub fn parse_call_stanza_js(
         CallAction::Reject {
             call_id,
             call_creator,
+            reason,
         } => serde_json::json!({
             "type": "reject",
             "call_id": call_id,
             "call_creator": jid_str(call_creator),
+            "reason": reason,
         }),
         CallAction::Terminate {
             call_id,
@@ -226,7 +228,7 @@ pub fn parse_call_stanza_js(
         // type+call_id+call_creator so JS can still see the call_id and ignore the rest,
         // rather than the whole parse failing.
         other => serde_json::json!({
-            "type": other.action_kind(),
+            "type": other.wire_tag(),
             "call_id": other.call_id(),
             "call_creator": jid_str(other.call_creator()),
         }),
@@ -243,7 +245,7 @@ pub fn parse_call_stanza_js(
         "action": action,
     });
 
-    if let Some(media) = &incoming.media {
+    if let Some(media) = incoming.media() {
         let own = own_jid.as_deref().and_then(|s| s.parse().ok());
         let enc = media.enc_for(own.as_ref());
         let mut media_json = serde_json::json!({});
@@ -565,6 +567,9 @@ struct EngineConfigJson {
     ssrc: u32,
     samples_per_packet: u32,
     relay_token: Vec<u8>,
+    /// The endpoint `<auth_token>` (ICE ufrag source). Optional; empty when absent.
+    #[serde(default)]
+    auth_token: Vec<u8>,
     relay_ip: String,
     relay_port: u16,
     integrity_key: Vec<u8>,
@@ -595,6 +600,7 @@ pub(crate) fn call_config_from_json(json: &str) -> Result<CallConfig, String> {
         // buffa/voip rework: the per-packet framing now lives in AudioConfig.
         audio: AudioConfig::MLOW_PCM,
         relay_token: c.relay_token,
+        auth_token: c.auth_token,
         relay_ip: c.relay_ip,
         relay_port: c.relay_port,
         integrity_key: c.integrity_key,

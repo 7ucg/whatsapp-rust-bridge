@@ -1,5 +1,5 @@
-use js_sys::{Array, Object, Uint8Array};
 use compact_str::CompactString;
+use js_sys::{Array, Object, Uint8Array};
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::mem;
@@ -76,7 +76,9 @@ pub(crate) fn js_to_node_ref(val: &EncodingNode) -> Result<NodeRef<'static>, JsV
     let content = if content_js.is_undefined() {
         Ok(None)
     } else if let Some(string_value) = content_js.as_string() {
-        Ok(Some(NodeContentRef::String(NodeStr::from(CompactString::from(string_value.as_str())))))
+        Ok(Some(NodeContentRef::String(NodeStr::from(
+            CompactString::from(string_value.as_str()),
+        ))))
     } else if content_js.is_instance_of::<Uint8Array>() {
         let byte_array: Uint8Array = content_js.unchecked_into();
         let len = byte_array.length() as usize;
@@ -92,7 +94,9 @@ pub(crate) fn js_to_node_ref(val: &EncodingNode) -> Result<NodeRef<'static>, JsV
                 js_to_node_ref(&child_node)
             })
             .collect::<Result<Vec<NodeRef<'static>>, _>>()?;
-        Ok(Some(NodeContentRef::Nodes(Box::from(nodes.into_boxed_slice()))))
+        Ok(Some(NodeContentRef::Nodes(Box::from(
+            nodes.into_boxed_slice(),
+        ))))
     } else {
         Err(JsValue::from_str("Invalid content type"))
     };
@@ -216,7 +220,7 @@ impl InternalBinaryNode {
             return Some(content.clone());
         }
 
-        let result: Option<Content> = match self.node_ref().content.as_deref() {
+        let result: Option<Content> = match self.node_ref().content.as_ref() {
             Some(NodeContentRef::Bytes(bytes)) => {
                 let bytes_ref = bytes.as_ref();
                 let u8arr = Uint8Array::new_with_length(bytes_ref.len() as u32);

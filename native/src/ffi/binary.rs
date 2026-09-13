@@ -67,7 +67,7 @@ fn node_ref_to_json(node: &NodeRef<'_>) -> JsonNode {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-    let content = node.content.as_deref().map(|c| match c {
+    let content = node.content.as_ref().map(|c| match c {
         NodeContentRef::String(s) => JsonContent::Text(s.to_string()),
         NodeContentRef::Bytes(b) => {
             use base64::Engine;

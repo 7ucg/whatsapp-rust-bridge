@@ -42,7 +42,7 @@ wacore-appstate  = { path = "../internal/wacore/appstate" }
 wacore           = { path = "../internal/wacore", features = ["voip", "voip-mlow"] }
 
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-compact_str = "0.9"
+compact_str = "0.10"
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 

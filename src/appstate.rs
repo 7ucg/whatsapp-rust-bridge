@@ -362,7 +362,7 @@ pub fn decode_app_state_record(
         operation: op as i32,
         index: mutation.index,
         index_mac: macs.index_mac,
-        value_mac: macs.value_mac,
+        value_mac: macs.value_mac.to_vec(),
         action_bytes,
     })
 }

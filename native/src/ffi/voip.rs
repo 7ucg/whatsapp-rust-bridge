@@ -9,8 +9,8 @@
 use super::crypto::{write_out_pub, BridgeError};
 use std::slice;
 use wacore::voip::{
-    AudioConfig, CallConfig, CallDirection, CallEngine, CallEvent, Input, MediaPipeline, MediaPipelineParams,
-    MlowDecoder, MlowEncoder, Output, TxIdSource, NEVER,
+    AudioConfig, CallConfig, CallDirection, CallEngine, CallEvent, Input, MediaPipeline,
+    MediaPipelineParams, MlowDecoder, MlowEncoder, Output, TxIdSource, NEVER,
 };
 
 /// SAFETY: `ptr` valid for `len` bytes (or null/0 → empty).
@@ -298,6 +298,9 @@ struct EngineConfigJson {
     ssrc: u32,
     samples_per_packet: u32,
     relay_token: Vec<u8>,
+    /// The endpoint `<auth_token>` (ICE ufrag source). Optional; empty when absent.
+    #[serde(default)]
+    auth_token: Vec<u8>,
     relay_ip: String,
     relay_port: u16,
     integrity_key: Vec<u8>,
@@ -323,6 +326,7 @@ pub(crate) fn call_config_from_json(json: &str) -> Option<CallConfig> {
         // buffa/voip rework: per-packet framing now lives in AudioConfig.
         audio: AudioConfig::MLOW_PCM,
         relay_token: c.relay_token,
+        auth_token: c.auth_token,
         relay_ip: c.relay_ip,
         relay_port: c.relay_port,
         integrity_key: c.integrity_key,

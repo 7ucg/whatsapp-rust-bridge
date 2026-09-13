@@ -415,8 +415,8 @@ export class NoiseSession {
     clearBuffer(): void;
     decodeFrame(new_data: Uint8Array): Array<any>;
     decrypt(ciphertext: Uint8Array): Uint8Array;
-    encodeFrame(node: EncodingNode): Uint8Array;
     encodeFrameRaw(data: Uint8Array): Uint8Array;
+    encodeFrame(node: EncodingNode): Uint8Array;
     encrypt(plaintext: Uint8Array): Uint8Array;
     finishInit(): void;
     getHash(): Uint8Array;
@@ -876,6 +876,7 @@ export interface InitOutput {
     readonly __wbg_senderkeyname_free: (a: number, b: number) => void;
     readonly __wbg_senderkeyrecord_free: (a: number, b: number) => void;
     readonly __wbg_sessionbuilder_free: (a: number, b: number) => void;
+    readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
     readonly __wbg_sessionrecord_free: (a: number, b: number) => void;
     readonly _serializeIdentityKeyPair: (a: number) => number;
     readonly aesDecrypt: (a: number, b: number, c: number, d: number, e: number) => void;
@@ -884,6 +885,7 @@ export interface InitOutput {
     readonly aesDecryptWithIV: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly aesEncrypWithIV: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly aesEncrypt: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly aesEncryptCTR: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly aesEncryptGCM: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly areSameUser: (a: number, b: number, c: number, d: number) => number;
     readonly buildAcceptStanza: (a: number, b: number, c: number) => void;
@@ -927,6 +929,7 @@ export interface InitOutput {
     readonly generateContentMac: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly generateIdentityKeyPair: () => number;
     readonly generateIndexMac: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly generateKeyPair: () => number;
     readonly generatePatchMac: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => void;
     readonly generatePreKey: (a: number) => number;
     readonly generateRegistrationId: () => number;
@@ -1050,25 +1053,22 @@ export interface InitOutput {
     readonly sessioncipher_decryptWhisperMessage: (a: number, b: number, c: number) => number;
     readonly sessioncipher_encrypt: (a: number, b: number, c: number) => number;
     readonly sessioncipher_hasOpenSession: (a: number) => number;
+    readonly sessioncipher_new: (a: number, b: number) => number;
     readonly sessionrecord_deserialize: (a: number, b: number) => void;
     readonly sessionrecord_haveOpenSession: (a: number) => number;
     readonly sessionrecord_serialize: (a: number) => number;
     readonly setLogger: (a: number, b: number) => void;
     readonly sha256: (a: number, b: number) => number;
-    readonly verifySignature: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
-    readonly sessioncipher_new: (a: number, b: number) => number;
-    readonly aesEncryptCTR: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
-    readonly generateKeyPair: () => number;
     readonly updateLogger: (a: number) => void;
-    readonly __wbg_sessioncipher_free: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1409: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2342: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1411: (a: number, b: number, c: number) => void;
+    readonly verifySignature: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly __wasm_bindgen_func_elem_2485: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_2500: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;
+    readonly __wbindgen_export4: (a: number, b: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
-    readonly __wbindgen_export4: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_export5: (a: number, b: number, c: number) => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;
