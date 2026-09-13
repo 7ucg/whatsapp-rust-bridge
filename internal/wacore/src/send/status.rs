@@ -9,10 +9,7 @@ use super::*;
 /// (already in `<participants>`) uses device JIDs with `<enc>` children.
 ///
 /// This is a pure function (no runtime or client dependencies).
-pub fn ensure_status_participants(
-    mut stanza: Node,
-    group_info: &crate::client::context::GroupInfo,
-) -> Node {
+pub fn ensure_status_participants(mut stanza: Node, group_info: &GroupInfo) -> Node {
     use wacore_binary::NodeContent;
     use wacore_binary::builder::NodeBuilder;
 
@@ -40,13 +37,12 @@ pub fn ensure_status_participants(
         // <participants> already exists (from SKDM distribution).
         // Add bare <to> user JID entries for users whose devices are NOT
         // already represented by SKDM device-level entries.
-        let existing_users: std::collections::HashSet<wacore_binary::CompactString> =
-            participants_node
-                .children()
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|n| n.attrs.get("jid").and_then(|v| v.to_jid()).map(|j| j.user))
-                .collect();
+        let existing_users: HashSet<CompactString> = participants_node
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|n| n.attrs.get("jid").and_then(|v| v.to_jid()).map(|j| j.user))
+            .collect();
 
         let new_to_nodes: Vec<Node> = bare_to_nodes
             .into_iter()
@@ -95,6 +91,19 @@ pub fn status_carries_privacy_meta(message: &wa::Message) -> bool {
     !is_revoke && !is_reaction
 }
 
+/// Return the message ID targeted by a status revoke, if this is a structurally
+/// complete revoke protocol message.
+///
+/// The target ID belongs to the embedded protocol key. It is distinct from the
+/// outer stanza ID generated for the revoke itself.
+pub fn status_revoke_target_id(message: &wa::Message) -> Option<&str> {
+    let protocol_message = unwrap_message(message).protocol_message.as_option()?;
+    if protocol_message.r#type != Some(wa::message::protocol_message::Type::Revoke) {
+        return None;
+    }
+    protocol_message.key.as_option()?.id.as_deref()
+}
+
 /// Dedup a pre-resolved status recipient list by user, then anchor the sender's
 /// own LID. Errors when no recipient was resolvable (matches WA Web's
 /// `WAWebLidMigrationUtils.toUserLid` + `compactMap` dropping unresolvable
@@ -103,7 +112,7 @@ pub fn status_carries_privacy_meta(message: &wa::Message) -> bool {
 /// Pure function: no allocations besides the returned `Vec` and (when needed)
 /// the own-LID push. Dedup is a linear Vec scan — status lists stay small
 /// enough that a HashSet is not worth its allocation.
-pub fn assemble_status_participants<I>(resolved: I, own_lid: &Jid) -> anyhow::Result<Vec<Jid>>
+pub fn assemble_status_participants<I>(resolved: I, own_lid: &Jid) -> Result<Vec<Jid>>
 where
     I: IntoIterator<Item = Option<Jid>>,
 {

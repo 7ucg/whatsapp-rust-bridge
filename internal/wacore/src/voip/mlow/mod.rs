@@ -10,7 +10,10 @@
 mod analysis;
 mod decoder;
 mod encode;
+#[cfg(test)]
+mod fixture;
 mod golden;
+mod multiframe;
 mod param_decode_match;
 mod params;
 mod quality_metrics;
@@ -41,5 +44,11 @@ mod smpl_tables_blob;
 mod smpl_vad;
 mod toc;
 
-pub use decoder::MlowDecoder;
+/// Per-stage bench surface (see `analysis::stage_bench`). Reachable only so the in-tree benchmark
+/// can attribute codec CPU per stage; not part of the consumer API, and compiled out entirely
+/// without the `bench-internals` feature.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub use analysis::stage_bench;
+pub use decoder::{MlowDecoder, MlowFrameReport};
 pub use encode::{MlowEncoder, MlowError};

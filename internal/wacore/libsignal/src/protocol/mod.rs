@@ -18,10 +18,13 @@
 #![deny(unsafe_code)]
 
 pub mod consts;
+mod counter_lease;
 mod crypto;
 pub mod error;
 mod group_cipher;
 mod identity_key;
+#[cfg(feature = "legacy-session-interop")]
+mod legacy_session;
 mod local_field;
 #[allow(clippy::module_inception)]
 mod protocol;
@@ -35,19 +38,26 @@ mod storage;
 mod stores;
 mod timestamp;
 pub use crate::core::curve::{CurveError, KeyPair, PreparedVerifyingKey, PrivateKey, PublicKey};
-pub use crate::core::{
-    Aci, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes, ServiceIdKind,
-};
+pub use crate::core::{AddressBuf, DeviceId, ProtocolAddress};
 pub use crate::protocol::protocol::SENDERKEY_MESSAGE_CURRENT_VERSION;
 pub use crate::protocol::sender_keys::InvalidSenderKeySessionError;
 pub use crate::store::sender_key_name::SenderKeyName;
 use error::Result;
 pub use error::SignalProtocolError;
 pub use group_cipher::{
-    create_sender_key_distribution_message, group_decrypt, group_encrypt,
+    create_sender_key_distribution_message, group_decrypt, group_decrypt_shared, group_encrypt,
     process_sender_key_distribution_message,
 };
 pub use identity_key::{IdentityKey, IdentityKeyPair};
+#[cfg(feature = "legacy-session-interop")]
+pub use legacy_session::{
+    LegacyIndexedSessionV1, LegacySessionBaseKeyRoleV1, LegacySessionChainCounterV1,
+    LegacySessionChainKeyV1, LegacySessionChainRoleV1, LegacySessionChainV1,
+    LegacySessionDispositionV1, LegacySessionFieldV1, LegacySessionIndexV1,
+    LegacySessionInteropError, LegacySessionKeyPairV1, LegacySessionLocalContext,
+    LegacySessionMessageKeyV1, LegacySessionPendingPreKeyV1, LegacySessionRatchetV1,
+    LegacySessionRecordV1, LegacySessionUnrepresentableFieldV1, LegacySessionV1,
+};
 pub use protocol::{
     CiphertextMessage, CiphertextMessageType, DecryptionErrorMessage, PlaintextContent,
     PreKeySignalMessage, SenderKeyDistributionMessage, SenderKeyMessage, SignalMessage,
@@ -77,6 +87,6 @@ pub use state::{
 pub use storage::{
     Direction, IdentityChange, IdentityKeyStore, PreKeyStore, ProtocolStore, SenderKeyStore,
     SessionCheckout, SessionCheckoutKey, SessionCheckoutStoreResult, SessionStore,
-    SignedPreKeyStore,
+    SignedPreKeyStore, has_session, is_trusted_identity, save_identity,
 };
 pub use timestamp::Timestamp;

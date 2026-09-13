@@ -51,14 +51,14 @@ impl AsRef<str> for NodeStr<'_> {
     }
 }
 
-impl std::fmt::Debug for NodeStr<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&**self, f)
+impl fmt::Debug for NodeStr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl std::fmt::Display for NodeStr<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for NodeStr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self)
     }
 }
@@ -229,6 +229,13 @@ impl From<CompactString> for NodeValue {
     }
 }
 
+impl From<&CompactString> for NodeValue {
+    #[inline]
+    fn from(s: &CompactString) -> Self {
+        NodeValue::String(s.clone())
+    }
+}
+
 impl From<Jid> for NodeValue {
     #[inline]
     fn from(jid: Jid) -> Self {
@@ -269,16 +276,17 @@ impl From<bool> for NodeValue {
 }
 
 /// Inline backing store for [`Attrs`]. A plain `Vec` paid one heap allocation
-/// per node on the encode hot path just for the backing buffer. Capacity 2 is
-/// the measured sweet spot: the per-recipient fanout nodes (`to`, `enc`) carry
-/// 1-2 attributes and stay inline, while stanza roots with 3+ attrs spill once
-/// per stanza. A larger inline array (4) grows `Node` enough that moving it
-/// through children Vecs costs more than the spared spills save.
-pub type AttrsVec = smallvec::SmallVec<[(Cow<'static, str>, NodeValue); 2]>;
+/// per node on the encode hot path just for the backing buffer. Capacity 3 is
+/// the measured optimum: it is the width of the `<enc>` fanout node (`v`,
+/// `type`, `mediatype`), the highest-multiplicity node in a send, so a 64-device
+/// fanout keeps it inline and drops a fifth of its allocations and a sixth of
+/// its live bytes. Capacity 4 spares almost no further spills but widens `Node`
+/// enough that moving it through the builder costs 8% more instructions.
+pub type AttrsVec = smallvec::SmallVec<[(Cow<'static, str>, NodeValue); 3]>;
 
 /// A collection of node attributes stored as key-value pairs.
-/// Stored inline for small attribute counts (typically 3-6) for cache locality
-/// and to avoid a per-node heap allocation; see [`AttrsVec`].
+/// Stored inline for small attribute counts for cache locality and to avoid a
+/// per-node heap allocation; see [`AttrsVec`].
 /// Values can be either strings or JIDs, avoiding stringification overhead for JID attributes.
 /// Keys use `Cow<'static, str>` to avoid heap allocation for compile-time-known strings
 /// (e.g., "type", "id", "to") which are the vast majority of attribute keys.
@@ -362,7 +370,7 @@ impl Attrs {
 /// Owned iterator implementation (consuming).
 impl IntoIterator for Attrs {
     type Item = (Cow<'static, str>, NodeValue);
-    type IntoIter = smallvec::IntoIter<[(Cow<'static, str>, NodeValue); 2]>;
+    type IntoIter = smallvec::IntoIter<[(Cow<'static, str>, NodeValue); 3]>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
@@ -647,7 +655,7 @@ pub struct Node {
 pub struct NodeRef<'a> {
     pub tag: NodeStr<'a>,
     pub attrs: AttrsRef<'a>,
-    pub content: Option<Box<NodeContentRef<'a>>>,
+    pub content: Option<NodeContentRef<'a>>,
 }
 
 impl Node {
@@ -685,7 +693,7 @@ impl Node {
                     (NodeStr::Borrowed(k.as_ref()), value_ref)
                 })
                 .collect(),
-            content: self.content.as_ref().map(|c| Box::new(c.as_content_ref())),
+            content: self.content.as_ref().map(|c| c.as_content_ref()),
         }
     }
 
@@ -710,9 +718,12 @@ impl Node {
     }
 
     pub fn get_children_by_tag<'a>(&'a self, tag: &'a str) -> impl Iterator<Item = &'a Node> {
+        // `unwrap_or_default` and not `into_iter().flatten()`: the absent case is
+        // already an empty slice, so flattening only buys a nested iterator whose
+        // state machine LLVM does not fold away on this hot traversal.
         self.children()
-            .into_iter()
-            .flatten()
+            .unwrap_or_default()
+            .iter()
             .filter(move |c| c.tag == tag)
     }
 
@@ -764,7 +775,7 @@ impl<'a> NodeRef<'a> {
         Self {
             tag,
             attrs,
-            content: content.map(Box::new),
+            content,
         }
     }
 
@@ -773,7 +784,7 @@ impl<'a> NodeRef<'a> {
     }
 
     pub fn children(&self) -> Option<&[NodeRef<'a>]> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::Nodes(nodes)) => Some(nodes),
             _ => None,
         }
@@ -801,8 +812,8 @@ impl<'a> NodeRef<'a> {
         'a: 'b,
     {
         self.children()
-            .into_iter()
-            .flatten()
+            .unwrap_or_default()
+            .iter()
             .filter(move |c| c.tag == tag)
     }
 
@@ -813,7 +824,7 @@ impl<'a> NodeRef<'a> {
 
     /// Extract text content, handling both String and Bytes (lossy UTF-8).
     pub fn content_as_string(&self) -> Option<CompactString> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::String(s)) => Some(s.to_compact_string()),
             Some(NodeContentRef::Bytes(b)) => Some(CompactString::from(
                 String::from_utf8_lossy(b.as_ref()).as_ref(),
@@ -824,7 +835,7 @@ impl<'a> NodeRef<'a> {
 
     /// Zero-copy byte content, if this node has Bytes content.
     pub fn content_bytes(&self) -> Option<&[u8]> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => Some(b.as_ref()),
             _ => None,
         }
@@ -832,7 +843,7 @@ impl<'a> NodeRef<'a> {
 
     /// Zero-copy string content, if this node has String content.
     pub fn content_str(&self) -> Option<&str> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::String(s)) => Some(s.as_ref()),
             _ => None,
         }
@@ -859,7 +870,7 @@ impl<'a> NodeRef<'a> {
                     (intern_cow(k), value)
                 })
                 .collect::<Attrs>(),
-            content: self.content.as_deref().map(|c| match c {
+            content: self.content.as_ref().map(|c| match c {
                 NodeContentRef::Bytes(b) => NodeContent::Bytes(b.to_vec()),
                 NodeContentRef::String(s) => NodeContent::String(s.to_compact_string()),
                 NodeContentRef::Nodes(nodes) => {
@@ -901,9 +912,9 @@ pub struct OwnedNodeRef {
 }
 
 impl OwnedNodeRef {
-    /// Decode a node from an owned buffer. The buffer should be the raw
-    /// binary-protocol bytes (after decompression, without the leading
-    /// format byte which `unpack` already strips).
+    /// Decode a node from an owned buffer of node bytes: after decompression and
+    /// without the format byte, which [`unpack`](crate::util::unpack) strips.
+    /// A buffer that still carries it goes through `unpack` first.
     pub fn new(buffer: impl Into<Bytes>) -> crate::error::Result<Self> {
         let inner = Yoke::try_attach_to_cart(BytesCart(buffer.into()), |buf| {
             crate::marshal::unmarshal_ref(buf)
@@ -921,6 +932,28 @@ impl OwnedNodeRef {
     /// Use sparingly — this is the allocation path that yoke is designed to avoid.
     pub fn to_owned_node(&self) -> Node {
         self.inner.get().to_owned()
+    }
+
+    /// The whole backing buffer, verbatim: exactly what [`Self::new`] consumed.
+    ///
+    /// A refcount bump, not a copy — the yoke already retains this buffer, and
+    /// [`Self::slice_bytes`] hands out views into the same allocation.
+    ///
+    /// These are node bytes, so they are **not** a sendable frame: send paths
+    /// take a packed payload, one format byte in front of the node bytes, which
+    /// [`unpack`](crate::util::unpack) stripped on the way in. Put it back with
+    /// [`pack`](crate::util::pack) before forwarding these bytes anywhere that
+    /// expects marshal output.
+    ///
+    /// Re-encoding through [`marshal_ref`] is the alternative and a worse one
+    /// for anything that forwards a stanza onward — to another process, a
+    /// recording, a replay harness. Re-encoding costs a second pass and is only
+    /// faithful while the token dictionaries match the ones that decoded it;
+    /// these bytes stay true whatever the dictionaries do.
+    ///
+    /// [`marshal_ref`]: crate::marshal::marshal_ref
+    pub fn backing_bytes(&self) -> Bytes {
+        self.inner.backing_cart().0.clone()
     }
 
     /// Return a zero-copy `Bytes` sub-view for a slice that borrows from this
@@ -1008,6 +1041,229 @@ impl OwnedNodeRef {
     }
 }
 
+#[cfg(test)]
+mod attrs_capacity_tests {
+    use super::*;
+
+    fn node_with(n: usize) -> Node {
+        const KEYS: [&str; 8] = ["to", "id", "type", "t", "edit", "phash", "count", "offline"];
+        let mut attrs = Attrs::new();
+        for (i, key) in KEYS.iter().take(n).enumerate() {
+            attrs.push(
+                Cow::Borrowed(*key),
+                NodeValue::String(format!("v{i}").into()),
+            );
+        }
+        Node::new("message", attrs, Some(NodeContent::String("body".into())))
+    }
+
+    /// Capacity is invisible to the wire: every attribute count decodes back to
+    /// what it was encoded from, on both sides of the inline/heap transition.
+    #[test]
+    fn every_attribute_count_survives_a_round_trip() {
+        for n in 0..=8 {
+            let node = node_with(n);
+            let bytes = crate::marshal::marshal(&node).unwrap();
+            let decoded = crate::marshal::unmarshal_ref(&bytes[1..])
+                .unwrap()
+                .to_owned();
+            assert_eq!(decoded, node, "{n} attributes did not round-trip");
+        }
+    }
+
+    /// The inline/heap boundary, where an off-by-one in the capacity hides.
+    #[test]
+    fn the_inline_boundary_is_where_the_declaration_says_it_is() {
+        assert!(!node_with(3).attrs.0.spilled(), "3 attrs must stay inline");
+        assert!(node_with(4).attrs.0.spilled(), "4 attrs must spill");
+    }
+}
+
+#[cfg(test)]
+mod value_ref_compare_tests {
+    use super::*;
+    use crate::jid::Server;
+    use std::str::FromStr;
+
+    /// Callers compare a `ValueRef` against a literal to decide whether a
+    /// stanza came from the server, so `v == needle` has to answer exactly what
+    /// `v.as_str() == needle` answered — including for the server-only shape
+    /// (`s.whatsapp.net`, no user), which is the one those checks actually use.
+    #[test]
+    fn comparing_a_jid_value_matches_comparing_its_rendered_form() {
+        let jids = [
+            "s.whatsapp.net",
+            "5511999998888@s.whatsapp.net",
+            "5511999998888:7@s.whatsapp.net",
+            "5511999998888.2@s.whatsapp.net",
+            "120363012345678901@g.us",
+            "123456789012345@lid",
+            "123456789012345:9@lid",
+            "123456789.4:17@interop",
+            "status@broadcast",
+            "12345.6@hosted.lid",
+        ];
+        let needles = [
+            "s.whatsapp.net",
+            "5511999998888@s.whatsapp.net",
+            "5511999998888:7@s.whatsapp.net",
+            "123456789012345@lid",
+            "",
+            "not-a-jid",
+        ];
+
+        for raw in jids {
+            let owned = Jid::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            let borrowed = ValueRef::Jid(JidRef {
+                user: NodeStr::Borrowed(&owned.user),
+                server: owned.server,
+                agent: owned.agent,
+                device: owned.device,
+                integrator: owned.integrator,
+            });
+            let as_string = ValueRef::String(NodeStr::Borrowed(raw));
+
+            for needle in needles {
+                assert_eq!(
+                    borrowed.as_str() == needle,
+                    borrowed == needle,
+                    "jid value {raw:?} vs {needle:?}"
+                );
+                assert_eq!(
+                    as_string.as_str() == needle,
+                    as_string == needle,
+                    "string value {raw:?} vs {needle:?}"
+                );
+            }
+        }
+
+        // The server-only shape is the one the server checks compare against.
+        let server_only = ValueRef::Jid(JidRef {
+            user: NodeStr::Borrowed(""),
+            server: Server::Pn,
+            agent: 0,
+            device: 0,
+            integrator: 0,
+        });
+        assert!(server_only == "s.whatsapp.net");
+        assert!(server_only != "5511999998888@s.whatsapp.net");
+    }
+}
+
+#[cfg(test)]
+mod owned_node_ref_tests {
+    use super::*;
+
+    /// Node bytes, as `OwnedNodeRef::new` wants them: marshal output with the
+    /// format byte taken off, the way the receive path gets them.
+    fn encoded(node: &Node) -> Bytes {
+        let packed = crate::marshal::marshal(node).unwrap();
+        Bytes::from(crate::util::unpack(&packed).unwrap().into_owned())
+    }
+
+    fn sample() -> Node {
+        Node::new(
+            "iq",
+            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("abc".into()))].into()),
+            Some(NodeContent::Bytes(b"payload".to_vec())),
+        )
+    }
+
+    #[test]
+    fn borrowed_payloads_survive_moving_the_cart() {
+        let node = sample();
+        let owned = OwnedNodeRef::new(encoded(&node)).unwrap();
+
+        // Move the value twice — through a Box and into a Vec — before reading
+        // anything back. That is the whole `StableDeref` claim: the yoked
+        // `NodeRef` keeps pointing at live bytes even though the wrapper it
+        // borrows from has moved. Nothing but an interpreter notices when it
+        // stops being true, which is why this test exists separately from the
+        // serde one it used to be a side effect of.
+        let mut moved = vec![*Box::new(owned)];
+        let owned = moved.pop().unwrap();
+
+        assert_eq!(owned.tag(), "iq");
+        assert!(owned.get_attr("id").unwrap() == "abc");
+        assert_eq!(owned.content_bytes(), Some(&b"payload"[..]));
+        assert_eq!(owned.to_owned_node(), node);
+    }
+
+    #[test]
+    fn yoked_attrs_ref_survives_make_transform_and_mutation() {
+        // `NodeRef`'s derived `Yokeable` transmutes the whole struct in one go,
+        // so yoking a node never calls `AttrsRef`'s hand-written impl — that one
+        // is there to satisfy the derive's bound on the field. Reaching its
+        // three methods takes a yoke of `AttrsRef` itself, and it is the only
+        // way to put our own transmutes, rather than yoke's generated ones, in
+        // front of the interpreter.
+        let cart = BytesCart(Bytes::from_static(b"idabc"));
+        let mut yoke: Yoke<AttrsRef<'static>, BytesCart> = Yoke::attach_to_cart(cart, |buf| {
+            // Borrowed from the cart, which is what makes the transmutes load-bearing.
+            let (key, value) = buf.split_at(2);
+            AttrsRef::from_vec(vec![(
+                NodeStr::Borrowed(std::str::from_utf8(key).expect("ascii")),
+                ValueRef::String(NodeStr::Borrowed(
+                    std::str::from_utf8(value).expect("ascii"),
+                )),
+            )])
+        });
+
+        // `make` ran on attach; `transform` runs here.
+        let (key, value) = &yoke.get().as_slice()[0];
+        assert!(*key == "id");
+        assert!(*value == "abc");
+
+        // `transform_mut`, which nothing in the workspace calls.
+        yoke.with_mut(|attrs| {
+            *attrs = AttrsRef::from_vec(vec![(
+                NodeStr::Owned("k".into()),
+                ValueRef::String(NodeStr::Owned("v".into())),
+            )]);
+        });
+        assert!(yoke.get().as_slice()[0].1 == "v");
+    }
+
+    #[test]
+    fn slice_bytes_views_the_backing_buffer_without_copying() {
+        let owned = OwnedNodeRef::new(encoded(&sample())).unwrap();
+        let content = owned.content_bytes().unwrap();
+
+        let view = owned.slice_bytes(content);
+
+        assert_eq!(view.as_ref(), b"payload");
+        assert_eq!(view.as_ptr(), content.as_ptr(), "slice_bytes copied");
+    }
+
+    #[test]
+    fn backing_bytes_returns_what_was_decoded_verbatim() {
+        let encoded = encoded(&sample());
+        let owned = OwnedNodeRef::new(encoded.clone()).unwrap();
+
+        let backing = owned.backing_bytes();
+
+        assert_eq!(backing.as_ref(), encoded.as_ref());
+        // Decoding the returned bytes reproduces the same node, which is what
+        // lets an observer forward a stanza instead of re-encoding it.
+        let reparsed = OwnedNodeRef::new(backing).unwrap();
+        assert_eq!(reparsed.to_owned_node(), owned.to_owned_node());
+    }
+
+    #[test]
+    fn backing_bytes_shares_the_allocation_rather_than_copying() {
+        let owned = OwnedNodeRef::new(encoded(&sample())).unwrap();
+        let content = owned.content_bytes().unwrap();
+
+        let backing = owned.backing_bytes();
+
+        // `slice_bytes` views into this same buffer, so a payload borrowed from
+        // the node is a subrange of what `backing_bytes` returns.
+        assert_eq!(owned.slice_bytes(content).as_ptr(), content.as_ptr());
+        let offset = content.as_ptr() as usize - backing.as_ptr() as usize;
+        assert_eq!(&backing[offset..offset + content.len()], content);
+    }
+}
+
 #[cfg(feature = "serde")]
 impl serde::Serialize for OwnedNodeRef {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1015,8 +1271,8 @@ impl serde::Serialize for OwnedNodeRef {
     }
 }
 
-impl std::fmt::Debug for OwnedNodeRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for OwnedNodeRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.get().fmt(f)
     }
 }
@@ -1138,9 +1394,9 @@ mod serde_tests {
             Some(NodeContent::String("payload".into())),
         );
 
-        let bytes = crate::marshal::marshal(&node).unwrap();
-        // marshal writes a leading format byte that unmarshal_ref doesn't expect
-        let owned_ref = OwnedNodeRef::new(Bytes::from(bytes[1..].to_vec())).unwrap();
+        let packed = crate::marshal::marshal(&node).unwrap();
+        let node_bytes = crate::util::unpack(&packed).unwrap().into_owned();
+        let owned_ref = OwnedNodeRef::new(Bytes::from(node_bytes)).unwrap();
 
         let from_ref = serde_json::to_value(&owned_ref).unwrap();
         let from_owned = serde_json::to_value(owned_ref.to_owned_node()).unwrap();

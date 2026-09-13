@@ -21,7 +21,12 @@ pub struct Mutation {
 #[derive(Debug, Clone)]
 pub struct RecordMacs {
     pub index_mac: Vec<u8>,
-    pub value_mac: Vec<u8>,
+    /// The value blob's trailing MAC. Fixed-size because the length is already
+    /// guaranteed: a blob shorter than `iv(16) + mac(32)` is rejected above, and
+    /// the MAC is exactly the last 32 bytes of what is left. A `Vec` here meant a
+    /// 32-byte heap allocation per decoded record, including for the REMOVE
+    /// mutations that discard the value MAC without ever reading it.
+    pub value_mac: [u8; 32],
 }
 
 /// Decode a single encrypted record into a mutation.
@@ -71,7 +76,12 @@ pub fn decode_record(
         }
     }
 
-    let mut plaintext = Vec::new();
+    // Sized up front from the ciphertext, which is the plaintext's exact upper
+    // bound (CBC output length minus PKCS7 padding). The bundled provider
+    // reserves this itself, but the trait only promises to clear and fill `out`,
+    // so an external provider that appends block by block reallocates its way up
+    // from an empty buffer on every mutation of every patch.
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
     aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, &mut plaintext)
         .map_err(|_| AppStateError::DecryptionFailed)?;
 
@@ -116,7 +126,9 @@ pub fn decode_record(
         },
         RecordMacs {
             index_mac,
-            value_mac: value_mac.to_vec(),
+            value_mac: value_mac
+                .try_into()
+                .expect("split_at leaves exactly the trailing 32 bytes"),
         },
     ))
 }
@@ -319,6 +331,262 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AppStateError::MismatchingIndexMAC));
+    }
+
+    // ── Negative cases ──────────────────────────────────────────────────────
+    //
+    // Every input here is server-controlled, so each rejection branch of
+    // `decode_record` needs a test: a silently-accepted malformed record either
+    // corrupts local app state or lets a tampered mutation through.
+
+    const MASTER_KEY: [u8; 32] = [7u8; 32];
+
+    fn test_keys() -> (ExpandedAppStateKeys, Vec<u8>) {
+        (expand_app_state_keys(&MASTER_KEY), b"test_key_id".to_vec())
+    }
+
+    fn valid_action_data() -> wa::SyncActionData {
+        wa::SyncActionData {
+            index: Some(br#"["mute","1555550100@s.whatsapp.net"]"#.to_vec()),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(1234567890),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Build a record whose value blob wraps `plaintext` verbatim, so a test can
+    /// hand `decode_record` bytes that decrypt fine but aren't a SyncActionData.
+    fn record_from_plaintext(
+        op: wa::syncd_mutation::SyncdOperation,
+        keys: &ExpandedAppStateKeys,
+        key_id: &[u8],
+        plaintext: &[u8],
+        index_bytes: &[u8],
+    ) -> wa::SyncdRecord {
+        let iv = vec![0u8; 16];
+        let mut ciphertext = Vec::new();
+        aes_256_cbc_encrypt_into(plaintext, &keys.value_encryption, &iv, &mut ciphertext)
+            .expect("test encryption should succeed");
+
+        let mut value_with_iv = iv;
+        value_with_iv.extend_from_slice(&ciphertext);
+        let value_mac = generate_content_mac(op, &value_with_iv, key_id, &keys.value_mac);
+        let mut value_blob = value_with_iv;
+        value_blob.extend_from_slice(&value_mac);
+
+        wa::SyncdRecord {
+            index: buffa::MessageField::some(wa::SyncdIndex {
+                blob: Some(generate_index_mac(index_bytes, &keys.index)),
+            }),
+            value: buffa::MessageField::some(wa::SyncdValue {
+                blob: Some(value_blob),
+            }),
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.to_vec()),
+            }),
+        }
+    }
+
+    /// Rewrite a record's value blob through `f` (MessageField has no DerefMut).
+    fn map_value_blob(record: &mut wa::SyncdRecord, f: impl FnOnce(&mut Vec<u8>)) {
+        let mut blob = record
+            .value
+            .as_option()
+            .and_then(|v| v.blob.clone())
+            .expect("fixture record has a value blob");
+        f(&mut blob);
+        record.value = buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) });
+    }
+
+    fn decode(record: &wa::SyncdRecord, validate_macs: bool) -> Result<Mutation, AppStateError> {
+        let (keys, key_id) = test_keys();
+        decode_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            record,
+            &keys,
+            &key_id,
+            validate_macs,
+        )
+        .map(|(mutation, _)| mutation)
+    }
+
+    #[test]
+    fn decode_record_rejects_missing_value_blob() {
+        let (keys, key_id) = test_keys();
+        let mut record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &valid_action_data(),
+        );
+        record.value = buffa::MessageField::some(wa::SyncdValue { blob: None });
+
+        assert!(matches!(
+            decode(&record, true).unwrap_err(),
+            AppStateError::MissingValueBlob
+        ));
+    }
+
+    #[test]
+    fn decode_record_rejects_truncated_value_blob() {
+        let (keys, key_id) = test_keys();
+        let mut record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &valid_action_data(),
+        );
+
+        // One byte short of the IV + MAC floor: the split_at calls below would
+        // otherwise panic instead of erroring.
+        map_value_blob(&mut record, |blob| blob.truncate(16 + 32 - 1));
+
+        assert!(matches!(
+            decode(&record, true).unwrap_err(),
+            AppStateError::ValueBlobTooShort
+        ));
+    }
+
+    #[test]
+    fn decode_record_rejects_tampered_content_mac() {
+        let (keys, key_id) = test_keys();
+        let mut record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &valid_action_data(),
+        );
+
+        map_value_blob(&mut record, |blob| {
+            let last = blob.len() - 1;
+            blob[last] ^= 0xFF;
+        });
+
+        assert!(matches!(
+            decode(&record, true).unwrap_err(),
+            AppStateError::MismatchingContentMAC
+        ));
+        // Without validation the same record decodes: the rejection above comes
+        // from the MAC check, not from a knock-on decrypt failure.
+        assert!(decode(&record, false).is_ok());
+    }
+
+    #[test]
+    fn decode_record_rejects_corrupt_ciphertext() {
+        let (keys, key_id) = test_keys();
+        let mut record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &valid_action_data(),
+        );
+
+        // Drop a single ciphertext byte so the remainder is no longer
+        // block-aligned — an unconditional CBC failure, unlike a bit flip whose
+        // padding can survive by chance.
+        map_value_blob(&mut record, |blob| {
+            blob.remove(16);
+        });
+
+        assert!(matches!(
+            decode(&record, false).unwrap_err(),
+            AppStateError::DecryptionFailed
+        ));
+    }
+
+    #[test]
+    fn decode_record_rejects_garbage_protobuf() {
+        let (keys, key_id) = test_keys();
+        // Field 1, length-delimited, length 255, no payload: decodes past the
+        // buffer end whatever the field means.
+        let record = record_from_plaintext(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &[0x0A, 0xFF],
+            &[],
+        );
+
+        assert!(matches!(
+            decode(&record, false).unwrap_err(),
+            AppStateError::DecodeFailed
+        ));
+    }
+
+    #[test]
+    fn decode_record_rejects_missing_index_mac_when_validating() {
+        let (keys, key_id) = test_keys();
+        let mut record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &valid_action_data(),
+        );
+        record.index = buffa::MessageField::none();
+
+        assert!(matches!(
+            decode(&record, true).unwrap_err(),
+            AppStateError::MissingIndexMAC
+        ));
+    }
+
+    #[test]
+    fn decode_record_rejects_missing_index_mac_without_validation() {
+        let (keys, key_id) = test_keys();
+        let mut record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &valid_action_data(),
+        );
+        // Skipping MAC validation must not turn a MAC-less record into an
+        // empty persisted MAC.
+        record.index = buffa::MessageField::some(wa::SyncdIndex { blob: None });
+
+        assert!(matches!(
+            decode(&record, false).unwrap_err(),
+            AppStateError::MissingIndexMAC
+        ));
+    }
+
+    #[test]
+    fn decode_record_parses_index_json_into_components() {
+        let (keys, key_id) = test_keys();
+        let record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &valid_action_data(),
+        );
+
+        let mutation = decode(&record, true).expect("valid record should decode");
+        assert_eq!(mutation.index, vec!["mute", "1555550100@s.whatsapp.net"]);
+    }
+
+    #[test]
+    fn decode_record_tolerates_non_json_index() {
+        let (keys, key_id) = test_keys();
+        let action_data = wa::SyncActionData {
+            index: Some(b"not-json".to_vec()),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &action_data,
+        );
+
+        // The index MAC still covers the raw bytes, so the record is authentic —
+        // only the component split is skipped.
+        let mutation = decode(&record, true).expect("authentic record should decode");
+        assert!(mutation.index.is_empty());
     }
 
     #[test]

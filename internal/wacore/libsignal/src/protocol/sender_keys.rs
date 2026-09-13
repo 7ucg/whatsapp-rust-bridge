@@ -5,11 +5,12 @@
 
 use std::collections::VecDeque;
 
-use buffa::{Message, MessageField};
+use buffa::MessageField;
 
-use hmac::{HmacReset, KeyInit, Mac};
+use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
+use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::crypto::hmac_sha256;
 use crate::protocol::record_components::{
     SenderKeyRecordComponents, sender_state_components_from_structure,
@@ -19,6 +20,7 @@ use crate::protocol::stores::{
     SenderKeyRecordStructure, SenderKeyStateStructure, sender_key_state_structure,
 };
 use crate::protocol::{PrivateKey, PublicKey, SignalProtocolError, consts};
+use subtle::ConstantTimeEq;
 
 /// A distinct error type to keep from accidentally propagating deserialization errors.
 #[derive(Debug)]
@@ -38,10 +40,23 @@ pub struct SenderMessageKey {
     seed: [u8; 32],
 }
 
+/// Group message keys run HKDF with no salt, so the extract step is HMAC
+/// keyed by a constant zero block. Same trick as `MESSAGE_KEY_EXTRACT_HMAC`
+/// on the pairwise ratchet: cloning the keyed state skips the ipad/opad key
+/// schedule (two SHA-256 compressions) on every group encrypt, every group
+/// decrypt, and every skipped key a forward jump buffers.
+static GROUP_KEY_EXTRACT_HMAC: std::sync::LazyLock<Hmac<Sha256>> = std::sync::LazyLock::new(|| {
+    Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("32-byte HMAC key")
+});
+
 impl SenderMessageKey {
     pub fn new(iteration: u32, seed: [u8; 32]) -> Self {
+        let mut extract = GROUP_KEY_EXTRACT_HMAC.clone();
+        extract.update(&seed);
+        let prk = extract.finalize().into_bytes();
         let mut derived = [0u8; 48];
-        hkdf::Hkdf::<sha2::Sha256>::new(None, &seed)
+        hkdf::Hkdf::<Sha256>::from_prk(&prk)
+            .expect("PRK is hash-sized")
             .expand(b"WhisperGroup", &mut derived)
             .expect("valid output length");
         Self {
@@ -91,11 +106,24 @@ impl StoredMessageKey {
         }
     }
 
-    fn as_protobuf(&self) -> sender_key_state_structure::SenderMessageKey {
-        sender_key_state_structure::SenderMessageKey {
-            iteration: Some(self.iteration),
-            seed: Some(bytes::Bytes::copy_from_slice(&self.seed)),
+    /// The backlog as protobuf entries, with every seed a slice of one shared
+    /// buffer: a store flush re-encodes the whole backlog of every dirty state,
+    /// and a busy group's out-of-order window is hundreds of keys, so one
+    /// allocation per key per flush was the dominant flush cost. `Bytes::slice`
+    /// is a refcount bump.
+    fn as_protobuf_list(keys: &[Self]) -> Vec<sender_key_state_structure::SenderMessageKey> {
+        let mut seeds = bytes::BytesMut::with_capacity(keys.len() * 32);
+        for key in keys {
+            seeds.extend_from_slice(&key.seed);
         }
+        let seeds = seeds.freeze();
+        keys.iter()
+            .enumerate()
+            .map(|(i, key)| sender_key_state_structure::SenderMessageKey {
+                iteration: Some(key.iteration),
+                seed: Some(seeds.slice(i * 32..(i + 1) * 32)),
+            })
+            .collect()
     }
 }
 
@@ -151,9 +179,18 @@ impl SenderChainKey {
         SenderMessageKey::new(self.iteration, self.get_derivative(Self::MESSAGE_KEY_SEED))
     }
 
-    /// Compute both sender message key and next chain key in one call, reusing HMAC key setup.
+    /// Advance one step, yielding this iteration's message-key *seed* and the
+    /// next chain key, without expanding the seed into a [`SenderMessageKey`].
+    ///
+    /// The seed is everything the backlog stores, and everything the full key is
+    /// re-derived from on removal, so a skipped iteration never needs its IV or
+    /// cipher key: expanding one costs an HKDF extract+expand to 48 bytes that is
+    /// thrown away on the next loop turn. A receiver catching up over a jump
+    /// pays that per skipped message, which is where the whole cost of a
+    /// forward jump lives. [`Self::step_with_message_key`] is this plus the
+    /// expansion, for the one iteration whose key is actually used.
     #[inline]
-    pub fn step_with_message_key(&self) -> Result<(SenderMessageKey, Self), SignalProtocolError> {
+    pub fn step_seed_only(&self) -> Result<([u8; 32], Self), SignalProtocolError> {
         let new_iteration = self.iteration.checked_add(1).ok_or_else(|| {
             SignalProtocolError::InvalidState(
                 "sender_chain_key_step",
@@ -170,13 +207,23 @@ impl SenderChainKey {
         hmac.update(&[Self::CHAIN_KEY_SEED]);
         let next_chain_key: [u8; 32] = hmac.finalize().into_bytes().into();
 
-        let message_key = SenderMessageKey::new(self.iteration, message_key_seed);
-        let next_chain = Self {
-            iteration: new_iteration,
-            chain_key: next_chain_key,
-        };
+        Ok((
+            message_key_seed,
+            Self {
+                iteration: new_iteration,
+                chain_key: next_chain_key,
+            },
+        ))
+    }
 
-        Ok((message_key, next_chain))
+    /// Compute both sender message key and next chain key in one call, reusing HMAC key setup.
+    #[inline]
+    pub fn step_with_message_key(&self) -> Result<(SenderMessageKey, Self), SignalProtocolError> {
+        let (message_key_seed, next_chain) = self.step_seed_only()?;
+        Ok((
+            SenderMessageKey::new(self.iteration, message_key_seed),
+            next_chain,
+        ))
     }
 
     #[inline]
@@ -196,7 +243,15 @@ impl SenderChainKey {
 
 #[derive(Clone)]
 pub struct SenderKeyState {
-    state: SenderKeyStateStructure,
+    /// The state's identity on the wire. `None` only for a structurally
+    /// invalid state decoded from a record missing field 1; it round-trips
+    /// back as absent so the persisted encoding stays byte-identical.
+    sender_key_id: Option<u32>,
+    /// The signing key as decoded. Kept because both halves are read on
+    /// every use; the other two protobuf fields (`sender_chain_key`,
+    /// `sender_message_keys`) live only in the typed fields below and are
+    /// reassembled into a fresh structure at serialization.
+    sender_signing_key: MessageField<sender_key_state_structure::SenderSigningKey>,
     /// The cached out-of-order message keys, held behind an `Arc` so cloning the
     /// state (and thus the whole `SenderKeyRecord` on every group load) is a
     /// refcount bump instead of a deep copy of up to `MAX_MESSAGE_KEYS` keys.
@@ -204,24 +259,31 @@ pub struct SenderKeyState {
     /// even when a prior out-of-order burst left a large backlog; a mutation
     /// (skip-ahead caching or an out-of-order removal) pays one copy-on-write via
     /// `Arc::make_mut`, leaving any sharing clone (the cache's copy) intact.
-    /// `state.sender_message_keys` is kept empty in memory; this is the source of
-    /// truth, reassembled into the protobuf only at `as_protobuf` (serialization).
+    /// This backlog is the source of truth; the protobuf `sender_message_keys`
+    /// is reassembled only at `as_protobuf` (serialization).
     message_keys: std::sync::Arc<Vec<StoredMessageKey>>,
     /// The current sender chain key, held as a `Copy` value instead of in the
     /// protobuf. The chain seed is a `Bytes` in the generated structure, so
     /// keeping it there made every record clone (and the copy-on-write on every
     /// encrypt/decrypt advance) promote that `Bytes` to a shared allocation.
     /// Same source-of-truth-outside-the-protobuf trick as `message_keys`:
-    /// `state.sender_chain_key` stays empty in memory, reassembled only at
-    /// `as_protobuf`. `None` only for a structurally invalid state.
+    /// reassembled into a fresh structure only at `as_protobuf`.
+    /// `None` only for a structurally invalid state.
     sender_chain: Option<SenderChainKey>,
     /// Parsed signing key with its XEdDSA cache pre-derived, memoized so the
-    /// per-send signature skips a basepoint multiplication (~18% of a warm
-    /// group send when re-derived from bytes every message). Clones carry the
-    /// warm value, and the record cache stores this object back after every
+    /// per-send signature skips a basepoint multiplication. Clones carry the
+    /// warm value, and a record cache stores this object back after every
     /// send, so the memo persists for the cache lifetime. Never persisted;
     /// rebuilt lazily after a cold load. If a signing-key setter is ever
     /// added, it must reset this memo.
+    ///
+    /// The payoff is the caller's to collect, in one of two ways: keep the
+    /// record, or keep the derivation and hand it back through
+    /// [`SenderKeyState::prewarm_signing_key`]. A caller that does neither, as
+    /// one persisting through `into_components` and rebuilding per operation
+    /// does, re-derives per message.
+    /// `benches/sender_key_derivation_benchmark.rs` in `wacore` measures all
+    /// three shapes.
     signing_key_memo: std::sync::OnceLock<PrivateKey>,
     /// Receive-side mirror of `signing_key_memo`: cached verifier whose
     /// Edwards derivations are reused across every incoming message under
@@ -260,19 +322,12 @@ impl SenderKeyState {
             .try_into()
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
         let sender_chain = Some(SenderChainKey::new(iteration, chain_key_arr));
-        let state = SenderKeyStateStructure {
-            sender_key_id: Some(chain_id),
-            // Source of truth is `sender_chain`; the protobuf field stays empty
-            // in memory and is reassembled at as_protobuf.
-            sender_chain_key: MessageField::none(),
-            sender_signing_key: MessageField::some(sender_key_state_structure::SenderSigningKey {
-                public: Some(Bytes::copy_from_slice(&signature_key.serialize())),
-                private: signature_private_key
-                    .as_ref()
-                    .map(|k| Bytes::copy_from_slice(k.serialize().as_ref())),
-            }),
-            sender_message_keys: vec![],
-        };
+        let sender_signing_key = MessageField::some(sender_key_state_structure::SenderSigningKey {
+            public: Some(Bytes::copy_from_slice(&signature_key.serialize())),
+            private: signature_private_key
+                .as_ref()
+                .map(|k| Bytes::copy_from_slice(k.serialize().as_ref())),
+        });
 
         let signing_key_memo = std::sync::OnceLock::new();
         if let Some(key) = signature_private_key {
@@ -289,7 +344,8 @@ impl SenderKeyState {
             let _ = verifying_key_memo.set(verifier);
         }
         Ok(Self {
-            state,
+            sender_key_id: Some(chain_id),
+            sender_signing_key,
             message_keys: std::sync::Arc::new(Vec::new()),
             sender_chain,
             signing_key_memo,
@@ -298,22 +354,22 @@ impl SenderKeyState {
     }
 
     pub(crate) fn from_protobuf(mut state: SenderKeyStateStructure) -> Self {
-        // Move the backlog out of the protobuf into the shared Arc so the
-        // in-memory `state` stays empty; see `message_keys` field docs.
+        // Move the backlog out of the protobuf into the shared Arc and the
+        // chain key out into the Copy field; the seeds were validated at
+        // deserialize before this runs. The id and signing key stay as is.
         let message_keys = std::sync::Arc::new(
             std::mem::take(&mut state.sender_message_keys)
                 .iter()
                 .map(StoredMessageKey::from_protobuf)
                 .collect::<Vec<_>>(),
         );
-        // Likewise move the chain key out into the Copy field; the seed was
-        // validated at deserialize before this runs.
         let sender_chain = state.sender_chain_key.take().and_then(|sc| {
             let seed: [u8; 32] = sc.seed.as_deref()?.try_into().ok()?;
             Some(SenderChainKey::new(sc.iteration.unwrap_or_default(), seed))
         });
         Self {
-            state,
+            sender_key_id: state.sender_key_id,
+            sender_signing_key: state.sender_signing_key.take().into(),
             message_keys,
             sender_chain,
             signing_key_memo: std::sync::OnceLock::new(),
@@ -326,7 +382,7 @@ impl SenderKeyState {
     }
 
     pub fn chain_id(&self) -> u32 {
-        self.state.sender_key_id.unwrap_or_default()
+        self.sender_key_id.unwrap_or_default()
     }
 
     pub fn sender_chain_key(&self) -> Option<SenderChainKey> {
@@ -366,7 +422,7 @@ impl SenderKeyState {
     }
 
     pub fn signing_key_public(&self) -> Result<PublicKey, InvalidSenderKeySessionError> {
-        if let Some(signing_key) = self.state.sender_signing_key.as_option() {
+        if let Some(signing_key) = self.sender_signing_key.as_option() {
             let public = signing_key
                 .public
                 .as_ref()
@@ -395,11 +451,93 @@ impl SenderKeyState {
             .expect("set on the line above"))
     }
 
+    /// Hand this state a signing key, so it skips the basepoint multiplication
+    /// the lazy path would pay.
+    ///
+    /// For a caller that rebuilds the record per operation, the memo never
+    /// survives to be reused; this lets it keep the derivation instead of the
+    /// record. Doing so makes the caller the owner of that cache, of how long
+    /// it lives, and of the private material in it, which the state would
+    /// otherwise hold only for its own lifetime.
+    ///
+    /// **Hold the key warm to collect anything.** A cold one is warmed here
+    /// rather than refused, because every read of the memo hands out a clone
+    /// and clones of a cold key each re-derive; but warming it costs the
+    /// derivation this call exists to skip, once per handover. Warm it once
+    /// when it enters your cache, with [`PrivateKey::precompute_signing_cache`].
+    ///
+    /// The key must be this state's own; one that is not is rejected and the
+    /// state keeps deriving for itself. A memo already populated is left alone,
+    /// since it holds the same derivation.
+    pub fn prewarm_signing_key(&self, key: PrivateKey) -> Result<(), InvalidSenderKeySessionError> {
+        if !bool::from(self.signing_key_bytes()?.ct_eq(key.serialize())) {
+            return Err(InvalidSenderKeySessionError(
+                "prewarmed signing key belongs to another state",
+            ));
+        }
+        // Check the slot before deriving: whatever is already there is warm,
+        // since the lazy path warms before it memoizes, and deriving first
+        // would spend a basepoint multiplication only to find `set` refuse it.
+        if self.signing_key_memo.get().is_some() {
+            return Ok(());
+        }
+        // Every read of the memo hands out a clone, and clones of a cold key
+        // each re-derive, so accepting one as passed would cost a derivation
+        // per message rather than none.
+        key.precompute_signing_cache();
+        let _ = self.signing_key_memo.set(key);
+        Ok(())
+    }
+
+    /// Receive-side counterpart of [`Self::prewarm_signing_key`], carrying the
+    /// verifier's Edwards derivations. The verifier holds only public material,
+    /// so the caller takes on its lifetime and nothing else.
+    ///
+    /// Same rule about holding it warm, with one difference in the caller's
+    /// favour: a verifier's entries sit behind a shared handle, so warming a
+    /// cold one warms every clone of it, including the copy in your cache.
+    pub fn prewarm_verifying_key(
+        &self,
+        verifier: crate::core::curve::PreparedVerifyingKey,
+    ) -> Result<(), InvalidSenderKeySessionError> {
+        if !verifier.is_for(&self.signing_key_public()?) {
+            return Err(InvalidSenderKeySessionError(
+                "prewarmed verifier belongs to another state",
+            ));
+        }
+        // Warm whichever instance is retained, not the one passed in: a lazy
+        // first use installs a verifier without deriving its entries, and that
+        // one stays when this `set` finds the memo already populated. The
+        // signing side needs no such care, since its lazy path warms before it
+        // memoizes.
+        let _ = self.verifying_key_memo.set(verifier);
+        if let Some(retained) = self.verifying_key_memo.get() {
+            retained.precompute();
+        }
+        Ok(())
+    }
+
+    /// This state's private signing key in the clamped form `PrivateKey` uses,
+    /// so a caller's key compares equal to it without either side deriving.
+    fn signing_key_bytes(&self) -> Result<[u8; 32], InvalidSenderKeySessionError> {
+        let signing_key = self
+            .sender_signing_key
+            .as_option()
+            .ok_or(InvalidSenderKeySessionError("missing signing key"))?;
+        let private = signing_key
+            .private
+            .as_ref()
+            .ok_or(InvalidSenderKeySessionError("missing private key bytes"))?;
+        Ok(*PrivateKey::deserialize(private)
+            .map_err(|_| InvalidSenderKeySessionError("invalid private signing key"))?
+            .serialize())
+    }
+
     pub fn signing_key_private(&self) -> Result<PrivateKey, InvalidSenderKeySessionError> {
         if let Some(key) = self.signing_key_memo.get() {
             return Ok(key.clone());
         }
-        if let Some(signing_key) = self.state.sender_signing_key.as_option() {
+        if let Some(signing_key) = self.sender_signing_key.as_option() {
             let private = signing_key
                 .private
                 .as_ref()
@@ -424,51 +562,45 @@ impl SenderKeyState {
     }
 
     pub(crate) fn as_protobuf(&self) -> SenderKeyStateStructure {
-        debug_assert!(
-            self.state.sender_message_keys.is_empty()
-                && self.state.sender_chain_key.as_option().is_none(),
-            "backlog and chain key must live only in their Copy/Arc fields; the protobuf copies stay empty"
-        );
-        let mut state = self.state.clone();
-        state.sender_message_keys = self
-            .message_keys
-            .iter()
-            .map(StoredMessageKey::as_protobuf)
-            .collect();
-        state.sender_chain_key = self
-            .sender_chain
-            .as_ref()
-            .map_or_else(MessageField::none, |c| MessageField::some(c.as_protobuf()));
-        state
+        SenderKeyStateStructure {
+            sender_key_id: self.sender_key_id,
+            sender_chain_key: self
+                .sender_chain
+                .as_ref()
+                .map_or_else(MessageField::none, |c| MessageField::some(c.as_protobuf())),
+            sender_signing_key: self.sender_signing_key.clone(),
+            sender_message_keys: StoredMessageKey::as_protobuf_list(&self.message_keys),
+        }
     }
 
-    fn into_protobuf(mut self) -> SenderKeyStateStructure {
-        debug_assert!(
-            self.state.sender_message_keys.is_empty()
-                && self.state.sender_chain_key.as_option().is_none(),
-            "backlog and chain key must have a single in-memory owner"
-        );
+    fn into_protobuf(self) -> SenderKeyStateStructure {
         let message_keys = std::sync::Arc::try_unwrap(self.message_keys)
             .unwrap_or_else(|shared| shared.as_ref().clone());
-        self.state.sender_message_keys = message_keys
-            .iter()
-            .map(StoredMessageKey::as_protobuf)
-            .collect();
-        self.state.sender_chain_key = self
-            .sender_chain
-            .as_ref()
-            .map_or_else(MessageField::none, |chain| {
-                MessageField::some(chain.as_protobuf())
-            });
-        self.state
+        SenderKeyStateStructure {
+            sender_key_id: self.sender_key_id,
+            sender_chain_key: self
+                .sender_chain
+                .as_ref()
+                .map_or_else(MessageField::none, |chain| {
+                    MessageField::some(chain.as_protobuf())
+                }),
+            sender_signing_key: self.sender_signing_key,
+            sender_message_keys: StoredMessageKey::as_protobuf_list(&message_keys),
+        }
     }
 
     pub fn add_sender_message_key(&mut self, sender_message_key: &SenderMessageKey) {
+        self.add_skipped_message_key(sender_message_key.iteration, sender_message_key.seed);
+    }
+
+    /// Buffer a skipped key from the `(iteration, seed)` pair the backlog
+    /// actually stores. Callers that hold a full [`SenderMessageKey`] go through
+    /// [`Self::add_sender_message_key`]; the catch-up loop in `get_sender_key`
+    /// never builds one, so it would only be paying the HKDF expansion to
+    /// discard both halves of it here.
+    pub(crate) fn add_skipped_message_key(&mut self, iteration: u32, seed: [u8; 32]) {
         let keys = std::sync::Arc::make_mut(&mut self.message_keys);
-        keys.push(StoredMessageKey {
-            iteration: sender_message_key.iteration,
-            seed: sender_message_key.seed,
-        });
+        keys.push(StoredMessageKey { iteration, seed });
         // AMORTIZED EVICTION: Only prune when exceeding MAX + threshold.
         // This reduces O(n) drain() calls from every insert to once every PRUNE_THRESHOLD inserts.
         let len = keys.len();
@@ -493,21 +625,16 @@ impl SenderKeyState {
 #[derive(Debug, Clone)]
 pub struct SenderKeyRecord {
     states: VecDeque<SenderKeyState>,
-    /// An outbound chain advance not yet known durable. Sender-key message
-    /// keys/IVs derive deterministically from the iteration, so the advance
-    /// must reach storage before its ciphertext reaches the wire (unlike
-    /// decrypt advances, which re-derive forward). Transient — never
-    /// serialized; the store layer converts it into flush gating.
-    wire_gated: bool,
-    /// Durably-reserved iteration ceiling for the current state's sender chain,
-    /// mirroring `SessionRecord::reserved_sender_chain_index` for DM. Iterations
-    /// below this ceiling are covered by a persisted reservation, so their sends
-    /// skip the synchronous pre-wire flush and ride the coalesced write-behind;
-    /// only the send that raises the ceiling gates. A reload fast-forwards the
-    /// current chain past this ceiling so no possibly-spent iteration is
-    /// re-derivable. Reset to 0 on any state change (rotation/promotion), which
-    /// forces the next send to re-reserve and gate; never reuses an iteration.
-    reserved_iteration: u32,
+    /// Durability lease over sender-chain iterations, mirroring
+    /// `SessionRecord`'s for DM, or the consumer's declaration that it needs
+    /// none. Iterations below the reserved ceiling ride the coalesced
+    /// write-behind; only the send that raises it gates the wire, and a reload
+    /// fast-forwards past it so no possibly-spent iteration is re-derivable.
+    /// Reset to 0 on any state change (rotation/promotion), which forces the
+    /// next send to re-reserve and gate. The wire-gate flag it carries is
+    /// transient and never serialized; the store layer converts it into flush
+    /// gating.
+    lease: CounterLease,
 }
 
 /// Local-only field appended to the serialized record for `reserved_iteration`.
@@ -517,19 +644,15 @@ pub struct SenderKeyRecord {
 const RESERVED_ITERATION_FIELD: u32 = super::local_field::COUNTER_RESERVATION_FIELD;
 
 impl SenderKeyRecord {
-    /// Replaces the states wholesale, so the wire gate — which belongs to the
-    /// advance being replaced — resets with them.
-    pub fn set_states_for_testing(&mut self, states: std::collections::VecDeque<SenderKeyState>) {
-        self.states = states;
-        self.wire_gated = false;
-        self.reserved_iteration = 0;
-    }
-
     pub fn new_empty() -> Self {
         Self {
-            states: VecDeque::with_capacity(consts::MAX_SENDER_KEY_STATES),
-            wire_gated: false,
-            reserved_iteration: 0,
+            // Not pre-sized to `MAX_SENDER_KEY_STATES`: a receive-side record
+            // holds one state for the life of the chain and only a rotation
+            // adds a second, so the four spare 256-byte slots were a 1 KiB
+            // allocation per sender learned — 255 of them on joining a large
+            // group — that the first `group_decrypt` clone dropped anyway.
+            states: VecDeque::new(),
+            lease: CounterLease::default(),
         }
     }
 
@@ -550,8 +673,7 @@ impl SenderKeyRecord {
 
         Ok(Self {
             states,
-            wire_gated: false,
-            reserved_iteration: 0,
+            lease: CounterLease::default(),
         })
     }
 
@@ -561,10 +683,11 @@ impl SenderKeyRecord {
     /// before export so rebuilding the record cannot derive a possibly spent
     /// message key again.
     pub fn into_components(mut self) -> Result<SenderKeyRecordComponents, SignalProtocolError> {
-        if self.reserved_iteration > 0
+        let reserved_iteration = self.lease.ceiling();
+        if reserved_iteration > 0
             && let Some(state) = self.states.front_mut()
         {
-            state.fast_forward_sender_chain(self.reserved_iteration)?;
+            state.fast_forward_sender_chain(reserved_iteration)?;
         }
         let states = self
             .states
@@ -582,7 +705,26 @@ impl SenderKeyRecord {
     /// Iterations strictly below this ceiling are covered by a durable
     /// reservation and their sends need no synchronous flush.
     pub fn reserved_iteration(&self) -> u32 {
-        self.reserved_iteration
+        self.lease.ceiling()
+    }
+
+    /// Waive counter leasing on this record.
+    ///
+    /// The group counterpart of
+    /// [`SessionRecord::waive_counter_lease`](crate::protocol::SessionRecord::waive_counter_lease),
+    /// including the guarantee it gives up.
+    pub fn waive_counter_lease(&mut self) -> Result<(), SignalProtocolError> {
+        // Materialize before dropping the ceiling: a chain too stale to advance
+        // leaves the record on its lease rather than free to reissue the
+        // iterations that ceiling covers.
+        let ceiling = self.lease.ceiling();
+        if ceiling > 0
+            && let Some(state) = self.states.front_mut()
+        {
+            state.fast_forward_sender_chain(ceiling)?;
+        }
+        self.lease.waive();
+        Ok(())
     }
 
     /// Lease a fresh batch of iterations after `spent_iteration` reached the
@@ -590,9 +732,7 @@ impl SenderKeyRecord {
     /// must not hit the wire until a flush persists the raised ceiling. Mirrors
     /// `SessionRecord::reserve_sender_chain_counters`.
     pub fn reserve_iterations(&mut self, spent_iteration: u32) {
-        self.reserved_iteration =
-            spent_iteration.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
-        self.wire_gated = true;
+        self.lease.reserve(spent_iteration);
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<SenderKeyRecord, SignalProtocolError> {
@@ -653,23 +793,22 @@ impl SenderKeyRecord {
 
         Ok(Self {
             states,
-            wire_gated: false,
-            reserved_iteration,
+            lease: CounterLease::from_persisted_ceiling(reserved_iteration),
         })
     }
 
     /// Flag an outbound chain advance; cleared by the store layer once it
     /// owns the durability gate.
     pub fn mark_wire_gated(&mut self) {
-        self.wire_gated = true;
+        self.lease.set_pending_flush(true);
     }
 
     pub fn is_wire_gated(&self) -> bool {
-        self.wire_gated
+        self.lease.is_pending_flush()
     }
 
     pub fn clear_wire_gated(&mut self) {
-        self.wire_gated = false;
+        self.lease.set_pending_flush(false);
     }
 
     pub fn sender_key_state(&self) -> Result<&SenderKeyState, InvalidSenderKeySessionError> {
@@ -747,7 +886,7 @@ impl SenderKeyRecord {
         // the sending record only reaches here on first creation (reservation
         // already 0, warm sends reuse the record without re-adding), and receiver
         // records never carry a reservation.
-        self.reserved_iteration = 0;
+        self.lease.clear_reservation();
         Ok(())
     }
 
@@ -802,9 +941,10 @@ impl SenderKeyRecord {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
         let mut buf = waproto::codec::sender_key_record_to_vec(&self.as_protobuf());
-        let incarnation = incarnation.filter(|_| self.reserved_iteration > 0);
-        let reservation_len = if self.reserved_iteration > 0 {
-            2 + varint_len(self.reserved_iteration as u64)
+        let reserved_iteration = self.lease.ceiling();
+        let incarnation = incarnation.filter(|_| reserved_iteration > 0);
+        let reservation_len = if reserved_iteration > 0 {
+            2 + varint_len(reserved_iteration as u64)
         } else {
             0
         };
@@ -815,9 +955,9 @@ impl SenderKeyRecord {
         // Append the local-only reservation as a top-level field the generated
         // decoder skips. Emitted only when non-zero, so legacy/unreserved records
         // stay byte-identical. Mirrors SessionRecord::serialize_into.
-        if self.reserved_iteration > 0 {
+        if reserved_iteration > 0 {
             Tag::new(RESERVED_ITERATION_FIELD, WireType::Varint).encode(&mut buf);
-            encode_varint(self.reserved_iteration as u64, &mut buf);
+            encode_varint(reserved_iteration as u64, &mut buf);
         }
         if let Some(incarnation) = incarnation {
             super::local_field::encode_store_incarnation(&mut buf, incarnation);
@@ -825,29 +965,294 @@ impl SenderKeyRecord {
         Ok(buf)
     }
 
-    /// Estimated in-memory footprint proxy: encoded size of each state's
-    /// structure plus the out-of-order message-key backlog (held outside the
-    /// protobuf in memory). Size computation only — nothing is cloned or
-    /// encoded. Used by per-session memory reports.
+    /// Retained in-memory bytes of every state this record holds.
+    ///
+    /// Walks the live structures rather than asking for their protobuf-encoded
+    /// size, which is what this used to report — the encoded form omits the
+    /// `Option` slots and `Vec` capacity that memory actually pays for. Size
+    /// computation only: nothing is cloned or encoded.
+    ///
+    /// Each container's inline slots are charged once, here, and the walker
+    /// below adds only what hangs off them. `sender_key_id`, `sender_chain`
+    /// and the signing-key slot live inline in `SenderKeyState`, so they are
+    /// already inside the capacity term; adding their `size_of` again would
+    /// make the figure grow faster than the memory it describes.
+    ///
+    /// Not counted: the lazily built signing/verifying key memos. They are
+    /// fixed-size, shared behind an `Arc` between every clone of a state, and
+    /// bounded by the number of cached states the report already lists as
+    /// entries — so charging them per owner would over-count sharing to
+    /// describe a constant.
     pub fn estimated_size(&self) -> usize {
-        let mut cache = buffa::SizeCache::new();
-        self.states
-            .iter()
-            .map(|s| {
-                s.state.compute_size(&mut cache) as usize
-                    + s.message_keys.len() * std::mem::size_of::<StoredMessageKey>()
-                    + s.sender_chain
-                        .map_or(0, |_| std::mem::size_of::<SenderChainKey>())
-            })
-            .sum()
+        size_of::<Self>()
+            + self.states.capacity() * size_of::<SenderKeyState>()
+            + self
+                .states
+                .iter()
+                .map(|s| {
+                    signing_key_pointed_bytes(&s.sender_signing_key)
+                        // The `Arc` owns a `Vec` header plus its buffer.
+                        + size_of::<Vec<StoredMessageKey>>()
+                        + s.message_keys.capacity() * size_of::<StoredMessageKey>()
+                })
+                .sum::<usize>()
     }
+}
+
+/// Heap bytes one sender-key state's signing key points at, excluding the
+/// `MessageField` slot itself — it lives inline in `SenderKeyState`.
+///
+/// The chain key and the skipped-key backlog are not walked here: this state
+/// keeps them in `SenderChainKey` and [`StoredMessageKey`] (36 bytes each,
+/// seeds inline) rather than in the protobuf's heap-allocated `Bytes`, and
+/// `estimated_size` counts them there.
+fn signing_key_pointed_bytes(
+    signing_key: &MessageField<sender_key_state_structure::SenderSigningKey>,
+) -> usize {
+    fn bytes_field(field: &Option<bytes::Bytes>) -> usize {
+        field.as_ref().map_or(0, |b| b.len())
+    }
+
+    // `MessageField` is an `Option<Box<T>>`, so a set one owns its `T`.
+    signing_key.as_option().map_or(0, |signing| {
+        size_of::<sender_key_state_structure::SenderSigningKey>()
+            + bytes_field(&signing.public)
+            + bytes_field(&signing.private)
+    })
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    /// The cached zero-key extract must stay byte-identical to
+    /// `Hkdf::new(None, seed)`, or every group message key would desync
+    /// from the peer.
+    #[test]
+    fn sender_message_key_matches_plain_hkdf() {
+        for i in 0..16u8 {
+            let seed = [i.wrapping_mul(31).wrapping_add(7); 32];
+            let key = SenderMessageKey::new(u32::from(i), seed);
+
+            let mut derived = [0u8; 48];
+            hkdf::Hkdf::<Sha256>::new(None, &seed)
+                .expand(b"WhisperGroup", &mut derived)
+                .expect("valid output length");
+
+            assert_eq!(key.iv(), &derived[0..16]);
+            assert_eq!(key.cipher_key(), &derived[16..48]);
+            assert_eq!(key.iteration(), u32::from(i));
+        }
+    }
+
     use super::*;
+    // The protobuf encode helpers are only needed to build fixtures here; the
+    // module itself no longer encodes anything.
     use crate::protocol::KeyPair;
+    use buffa::Message;
+
+    /// An injected derivation has to be indistinguishable from the one the
+    /// state would have produced, or the API trades correctness for speed.
+    #[test]
+    fn a_prewarmed_state_signs_and_verifies_exactly_like_a_cold_one() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let private_bytes = *signing.private_key.serialize();
+        let fresh = || {
+            let key = PrivateKey::deserialize(&private_bytes).expect("key");
+            let state = SenderKeyState::new(3, 1, 0, &[7u8; 32], signing.public_key, Some(key))
+                .expect("valid inputs");
+            SenderKeyState::from_protobuf(state.as_protobuf())
+        };
+
+        // Cold: derives for itself on first use.
+        let lazy = fresh();
+        assert!(!lazy.signing_key_memo_initialized());
+
+        // Prewarmed: same key, derived outside and handed in.
+        let prewarmed = fresh();
+        let derived = PrivateKey::deserialize(&private_bytes).expect("key");
+        derived.precompute_signing_cache();
+        prewarmed
+            .prewarm_signing_key(derived)
+            .expect("own key is accepted");
+        assert!(prewarmed.signing_key_memo_initialized());
+        prewarmed
+            .prewarm_verifying_key(crate::core::curve::PreparedVerifyingKey::new(
+                &signing.public_key,
+            ))
+            .expect("own verifier is accepted");
+
+        let message = b"skmsg";
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let from_lazy = lazy
+            .signing_key_private()
+            .expect("lazy key")
+            .calculate_signature(message, &mut rng)
+            .expect("sign");
+        let from_prewarmed = prewarmed
+            .signing_key_private()
+            .expect("prewarmed key")
+            .calculate_signature(message, &mut rng)
+            .expect("sign");
+
+        // Signatures are randomized, so each verifier checks both.
+        for signature in [&from_lazy, &from_prewarmed] {
+            assert!(
+                lazy.signing_key_verifier()
+                    .expect("lazy verifier")
+                    .verify_signature(message, signature)
+            );
+            assert!(
+                prewarmed
+                    .signing_key_verifier()
+                    .expect("prewarmed verifier")
+                    .verify_signature(message, signature)
+            );
+        }
+    }
+
+    /// Accepting a cold key as passed would be worse than not injecting at all:
+    /// every read of the memo hands out a clone, and clones of a cold key each
+    /// re-derive, so the caller would pay a derivation per message instead of
+    /// none. The setter warms what it is given.
+    #[test]
+    fn prewarming_with_cold_material_still_leaves_the_memos_warm() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let private_bytes = *signing.private_key.serialize();
+        let state = SenderKeyState::new(
+            3,
+            1,
+            0,
+            &[7u8; 32],
+            signing.public_key,
+            Some(PrivateKey::deserialize(&private_bytes).expect("key")),
+        )
+        .expect("valid inputs");
+        let state = SenderKeyState::from_protobuf(state.as_protobuf());
+
+        // Deliberately not precomputed, the way a caller reconstructing from
+        // stored bytes would hand it over.
+        let cold = PrivateKey::deserialize(&private_bytes).expect("key");
+        assert!(!cold.has_warm_signing_cache());
+        state.prewarm_signing_key(cold).expect("own key");
+
+        assert!(
+            state
+                .signing_key_private()
+                .expect("memo key")
+                .has_warm_signing_cache(),
+            "a clone taken from the memo must carry the warm cache"
+        );
+
+        // The verifier is cheaper to get wrong, since clones share its entries,
+        // but the contract is the same: warm on the way out.
+        let cold = crate::core::curve::PreparedVerifyingKey::new(&signing.public_key);
+        assert!(!cold.is_precomputed());
+        state.prewarm_verifying_key(cold).expect("own verifier");
+        assert!(
+            state
+                .signing_key_verifier()
+                .expect("memo verifier")
+                .is_precomputed(),
+            "the memoized verifier must have its entries derived"
+        );
+    }
+
+    /// Material from another key must not be installed, and refusing it must
+    /// leave the state able to derive for itself.
+    #[test]
+    fn prewarming_with_another_states_material_is_refused() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mine = KeyPair::generate(&mut rng);
+        let theirs = KeyPair::generate(&mut rng);
+        let mine_bytes = *mine.private_key.serialize();
+        let state = SenderKeyState::new(
+            3,
+            1,
+            0,
+            &[7u8; 32],
+            mine.public_key,
+            Some(PrivateKey::deserialize(&mine_bytes).expect("key")),
+        )
+        .expect("valid inputs");
+        let state = SenderKeyState::from_protobuf(state.as_protobuf());
+
+        assert!(state.prewarm_signing_key(theirs.private_key).is_err());
+        assert!(
+            state
+                .prewarm_verifying_key(crate::core::curve::PreparedVerifyingKey::new(
+                    &theirs.public_key
+                ))
+                .is_err()
+        );
+
+        // Still cold, and still able to get there on its own.
+        assert!(!state.signing_key_memo_initialized());
+        assert_eq!(
+            *state.signing_key_private().expect("own key").serialize(),
+            mine_bytes
+        );
+        assert!(
+            state
+                .signing_key_verifier()
+                .expect("own verifier")
+                .is_for(&mine.public_key)
+        );
+    }
+
+    /// Injecting over a memo that already warmed by use is a no-op: the value
+    /// in place is the same derivation.
+    #[test]
+    fn prewarming_an_already_warm_state_is_inert() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let private_bytes = *signing.private_key.serialize();
+        let state = SenderKeyState::new(
+            3,
+            1,
+            0,
+            &[7u8; 32],
+            signing.public_key,
+            Some(PrivateKey::deserialize(&private_bytes).expect("key")),
+        )
+        .expect("valid inputs");
+        let state = SenderKeyState::from_protobuf(state.as_protobuf());
+
+        // Warm it the lazy way first. The lazy verifier is installed without
+        // its entries derived, so the inert path still has to leave the
+        // retained one warm.
+        let _ = state.signing_key_private().expect("lazy warm");
+        assert!(
+            !state
+                .signing_key_verifier()
+                .expect("lazy verifier")
+                .is_precomputed()
+        );
+
+        let derived = PrivateKey::deserialize(&private_bytes).expect("key");
+        derived.precompute_signing_cache();
+        state
+            .prewarm_signing_key(derived)
+            .expect("no-op, not error");
+        state
+            .prewarm_verifying_key(crate::core::curve::PreparedVerifyingKey::new(
+                &signing.public_key,
+            ))
+            .expect("no-op, not error");
+
+        assert!(
+            state
+                .signing_key_verifier()
+                .expect("verifier")
+                .is_precomputed(),
+            "the retained verifier must be warm even when the set was inert"
+        );
+        assert_eq!(
+            *state.signing_key_private().expect("key").serialize(),
+            private_bytes
+        );
+    }
 
     /// Test SenderMessageKey derivation is deterministic
     #[test]
@@ -990,7 +1395,7 @@ mod tests {
     #[test]
     fn signing_key_memo_warms_on_first_use_and_survives_clone() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let signing = crate::core::curve::KeyPair::generate(&mut rng);
+        let signing = KeyPair::generate(&mut rng);
         let chain_key = [7u8; 32];
         let state = SenderKeyState::new(
             3,
@@ -1179,21 +1584,139 @@ mod tests {
             for i in 0..5u32 {
                 state.add_sender_message_key(&SenderMessageKey::new(i, [i as u8; 32]));
             }
-            // The protobuf copy must stay empty in memory.
-            assert!(state.state.sender_message_keys.is_empty());
+            // Serialization reassembles the backlog into the protobuf.
+            assert_eq!(state.as_protobuf().sender_message_keys.len(), 5);
         }
 
         let serialized = record.serialize().expect("serialize");
         let mut deserialized = SenderKeyRecord::deserialize(&serialized).expect("deserialize");
 
         let state = deserialized.sender_key_state_mut().expect("state exists");
-        // After a cold load the backlog lives in the Arc, the protobuf stays empty.
-        assert!(state.state.sender_message_keys.is_empty());
+        // After a cold load the backlog still serializes back to the same keys.
+        assert_eq!(state.as_protobuf().sender_message_keys.len(), 5);
         for i in 0..5u32 {
             let smk = state
                 .remove_sender_message_key(i)
                 .unwrap_or_else(|| panic!("key {i} should survive the roundtrip"));
             assert_eq!(smk.iteration(), i);
+        }
+    }
+
+    /// The slim state keeps only the id and the signing message. Dropping the
+    /// always-empty protobuf `Vec` (three words) and `MessageField` (one word)
+    /// saves exactly those four words off the inline struct on every target.
+    #[test]
+    fn sender_key_state_layout_dropped_the_protobuf_copies() {
+        // Width-independent: narrower pointers on 32-bit targets shrink the
+        // saving, so only its composition is asserted here.
+        assert_eq!(
+            size_of::<Vec<sender_key_state_structure::SenderMessageKey>>()
+                + size_of::<MessageField<sender_key_state_structure::SenderChainKey>>(),
+            4 * size_of::<usize>()
+        );
+        // Budget, not contract: the total floats with the protobuf runtime
+        // layout, so only growth fails. Rebaseline per
+        // [layout asserts](../../../../agent_docs/layout_asserts.md).
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(
+                size_of::<SenderKeyState>() <= 224,
+                "SenderKeyState grew to {} B (budget 224)",
+                size_of::<SenderKeyState>()
+            );
+            assert!(
+                size_of::<SenderKeyStateStructure>() <= 48,
+                "SenderKeyStateStructure grew to {} B (budget 48)",
+                size_of::<SenderKeyStateStructure>()
+            );
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            assert!(
+                size_of::<SenderKeyState>() <= 204,
+                "SenderKeyState grew to {} B (budget 204)",
+                size_of::<SenderKeyState>()
+            );
+            assert!(
+                size_of::<SenderKeyStateStructure>() <= 28,
+                "SenderKeyStateStructure grew to {} B (budget 28)",
+                size_of::<SenderKeyStateStructure>()
+            );
+        }
+    }
+
+    /// States decoded from structurally incomplete records (missing id,
+    /// signing key, or chain) must encode back byte-identical: the slim
+    /// state preserves absence instead of normalizing it to a default.
+    #[test]
+    fn slim_state_round_trips_absent_fields_byte_identical() {
+        use bytes::Bytes;
+
+        fn state_with(
+            id: Option<u32>,
+            chain: bool,
+            signing_public: Option<&[u8]>,
+        ) -> SenderKeyStateStructure {
+            SenderKeyStateStructure {
+                sender_key_id: id,
+                sender_chain_key: if chain {
+                    MessageField::some(sender_key_state_structure::SenderChainKey {
+                        iteration: Some(4),
+                        seed: Some(Bytes::copy_from_slice(&[0x11; 32])),
+                    })
+                } else {
+                    MessageField::none()
+                },
+                sender_signing_key: signing_public.map_or_else(MessageField::none, |public| {
+                    MessageField::some(sender_key_state_structure::SenderSigningKey {
+                        public: Some(Bytes::copy_from_slice(public)),
+                        private: None,
+                    })
+                }),
+                sender_message_keys: vec![sender_key_state_structure::SenderMessageKey {
+                    iteration: Some(2),
+                    seed: Some(Bytes::copy_from_slice(&[0x33; 32])),
+                }],
+            }
+        }
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let signing_public = signing.public_key.serialize();
+        for (id, chain, signing) in [
+            (Some(9), true, true),
+            (None, true, true),
+            (Some(9), true, false),
+            (Some(9), false, true),
+            (None, false, false),
+        ] {
+            let public = signing.then_some(signing_public.as_ref());
+            let expected = state_with(id, chain, public).encode_to_vec();
+            let state = SenderKeyState::from_protobuf(state_with(id, chain, public));
+            assert_eq!(state.chain_id(), id.unwrap_or_default());
+            assert_eq!(state.sender_chain_key().is_some(), chain);
+            assert_eq!(state.signing_key_public().is_ok(), signing);
+            assert!(state.signing_key_private().is_err());
+            if chain {
+                assert_eq!(state.sender_chain_key().expect("chain").iteration(), 4);
+            }
+            assert_eq!(
+                state.as_protobuf().encode_to_vec(),
+                expected,
+                "id={id:?} chain={chain} signing={signing}"
+            );
+
+            let record_bytes = SenderKeyRecordStructure {
+                sender_key_states: vec![state_with(id, chain, public)],
+            }
+            .encode_to_vec();
+            let record =
+                SenderKeyRecord::deserialize(&record_bytes).expect("structurally valid record");
+            assert_eq!(
+                record.serialize().expect("serialize"),
+                record_bytes,
+                "id={id:?} chain={chain} signing={signing}"
+            );
         }
     }
 
@@ -1613,7 +2136,6 @@ mod tests {
             next_chain_combined.iteration()
         );
     }
-
     /// Test step_with_message_key over multiple iterations
     #[test]
     fn test_step_with_message_key_chain() {

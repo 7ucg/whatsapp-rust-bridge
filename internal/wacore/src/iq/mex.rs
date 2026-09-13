@@ -15,6 +15,40 @@
 //!   <result>{"data":{...},"errors":[...]}</result>
 //! </iq>
 //! ```
+//!
+//! # Variables are all-or-nothing
+//!
+//! The server binds a persisted query's variables by name and answers a bare
+//! `400 Bad Request` when it cannot bind one, so a call site has to decide every
+//! variable the document declares. That is why a generated `Variables` is not
+//! `Default`, and it is the compiler that enforces it:
+//!
+//! ```compile_fail
+//! use wacore::iq::mex_operations::fetch_newsletter;
+//!
+//! // Names one variable and inherits six. `Variables` has no `Default`, so
+//! // this does not compile.
+//! let _ = fetch_newsletter::Variables {
+//!     fetch_full_image: Some(true),
+//!     ..Default::default()
+//! };
+//! ```
+//!
+//! Writing every field out compiles, and `VARIABLE_KEYS` is the same list for
+//! anything that has to check a payload it did not build from the type:
+//!
+//! ```
+//! use wacore::iq::mex_operations::fetch_all_newsletters_metadata as op;
+//!
+//! let variables = op::Variables {
+//!     fetch_status_metadata: Some(false),
+//!     fetch_wamo_sub: Some(false),
+//! };
+//! let payload = serde_json::to_value(&variables).expect("variables serialize");
+//! for key in op::VARIABLE_KEYS {
+//!     assert!(payload.get(key).is_some(), "{key} is missing");
+//! }
+//! ```
 
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
@@ -69,6 +103,21 @@ impl MexGraphQLError {
     pub fn has_error_code(&self) -> bool {
         self.error_code().is_some()
     }
+}
+
+/// Code reported for a fatal MEX error whose payload carried none.
+const DEFAULT_MEX_ERROR_CODE: i32 = 500;
+
+/// A GraphQL error the server marked fatal, raised as a typed error so the
+/// code survives the trip: the IQ layer wraps this in `IqError::ParseError`,
+/// which keeps the source, and a caller that cares about a particular code
+/// (a MEX 404 is how the server says "nothing here") downcasts to it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("MEX fatal error (query={query}, code={code}): {message}")]
+pub struct MexFatalError {
+    pub query: &'static str,
+    pub code: i32,
+    pub message: String,
 }
 
 /// MEX GraphQL response.
@@ -176,7 +225,7 @@ impl IqSpec for MexQuerySpec {
             .ok_or_else(|| anyhow!("Missing <result> node in MEX response"))?;
 
         // Handle both binary and string content from the server
-        let mex_response: MexResponse = match result_node.content.as_deref() {
+        let mex_response: MexResponse = match result_node.content.as_ref() {
             Some(NodeContentRef::Bytes(bytes)) => serde_json::from_slice(bytes)?,
             Some(NodeContentRef::String(s)) => serde_json::from_str(s)?,
             _ => return Err(anyhow!("MEX result node content is not binary or string")),
@@ -191,13 +240,12 @@ impl IqSpec for MexQuerySpec {
                     self.doc.name, self.doc.id, fatal.message
                 );
             }
-            let code = fatal.error_code().unwrap_or(500);
-            return Err(anyhow!(
-                "MEX fatal error (query={}, code={}): {}",
-                self.doc.name,
-                code,
-                fatal.message
-            ));
+            return Err(MexFatalError {
+                query: self.doc.name,
+                code: fatal.error_code().unwrap_or(DEFAULT_MEX_ERROR_CODE),
+                message: fatal.message.clone(),
+            }
+            .into());
         }
 
         Ok(mex_response)
@@ -329,5 +377,36 @@ mod tests {
         assert!(!looks_like_stale_persisted_query(&mk(
             "Group does not exist"
         )));
+    }
+
+    /// The whole point of the typed error: a fatal GraphQL code has to survive
+    /// `parse_response`, because the IQ layer erases everything else about it
+    /// and a caller reads a MEX 404 as "nothing here" rather than as a failure.
+    #[test]
+    fn a_fatal_graphql_code_survives_parse_response() {
+        let spec = MexQuerySpec::new(TEST_DOC, &json!({})).expect("serialize test variables");
+        let payload = json!({
+            "data": null,
+            "errors": [{
+                "message": "no username",
+                "extensions": {"error_code": 404, "is_retryable": false, "severity": "CRITICAL"}
+            }]
+        })
+        .to_string();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("result")
+                .bytes(payload.into_bytes())
+                .build()])
+            .build();
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a fatal error must fail the parse");
+        let fatal = error
+            .downcast_ref::<MexFatalError>()
+            .expect("the fatal error keeps its type");
+        assert_eq!(fatal.code, 404);
+        assert_eq!(fatal.query, TEST_DOC.name);
     }
 }

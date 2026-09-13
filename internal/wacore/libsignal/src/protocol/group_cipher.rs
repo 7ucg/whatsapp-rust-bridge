@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use bytes::Bytes;
 use std::cell::RefCell;
 
 use rand::{CryptoRng, Rng, RngExt};
@@ -17,8 +18,8 @@ use crate::protocol::{
 };
 use crate::store::sender_key_name::SenderKeyName;
 
-/// Reusable buffer for cryptographic operations (encryption and decryption).
-/// Named generically since it's used for both ENCRYPTION_BUFFER and DECRYPTION_BUFFER.
+/// Reusable encrypt scratch: the ciphertext is copied out right-sized, so the
+/// buffer stays on the thread for the next message.
 struct CryptoBuffer {
     buffer: Vec<u8>,
 }
@@ -44,12 +45,6 @@ impl CryptoBuffer {
         &mut self.buffer
     }
 
-    /// Takes ownership of the buffer contents, replacing with a fresh pre-allocated buffer.
-    /// More efficient than `mem::take` + `reserve` since we swap with an already-allocated buffer.
-    fn take_buffer(&mut self) -> Vec<u8> {
-        std::mem::replace(&mut self.buffer, Vec::with_capacity(Self::INITIAL_CAPACITY))
-    }
-
     /// Copy the written bytes into a right-sized box, keeping the buffer for the
     /// next (small) message instead of handing away its capacity. A one-off
     /// large message's capacity is released here so it is not retained on this
@@ -65,7 +60,6 @@ impl CryptoBuffer {
 
 thread_local! {
     static ENCRYPTION_BUFFER: RefCell<CryptoBuffer> = RefCell::new(CryptoBuffer::new());
-    static DECRYPTION_BUFFER: RefCell<CryptoBuffer> = RefCell::new(CryptoBuffer::new());
 }
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
@@ -142,12 +136,10 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
     // sends ride the coalesced write-behind; only the send that reaches the
     // ceiling re-reserves and gates the ciphertext on a synchronous flush (which
     // fast-forwards past the reservation after any reload). Decrypt-side advances
-    // stay ungated (they re-derive forward). Mirrors the DM counter lease in
-    // SessionRecord.
-    let spent_iteration = message_keys.iteration();
-    if spent_iteration >= record.reserved_iteration() {
-        record.reserve_iterations(spent_iteration);
-    }
+    // stay ungated (they re-derive forward). A consumer that waived the lease
+    // persists before the wire and reserves nothing. Mirrors the DM counter
+    // lease in SessionRecord.
+    record.reserve_iterations(message_keys.iteration());
 
     sender_key_store
         .store_sender_key(sender_key_name, record)
@@ -189,9 +181,14 @@ fn get_sender_key(state: &mut SenderKeyState, iteration: u32) -> Result<SenderMe
 
     let mut sender_chain_key = sender_chain_key;
 
+    // Only the seed is buffered, and only the seed is what a later out-of-order
+    // message re-derives its key from, so the skipped iterations skip the HKDF
+    // expansion entirely: a catch-up over `jump` messages ran `jump` expansions
+    // whose IV and cipher key were dropped on the next turn of this loop.
     while sender_chain_key.iteration() < iteration {
-        let (message_key, next_chain) = sender_chain_key.step_with_message_key()?;
-        state.add_sender_message_key(&message_key);
+        let skipped_iteration = sender_chain_key.iteration();
+        let (seed, next_chain) = sender_chain_key.step_seed_only()?;
+        state.add_skipped_message_key(skipped_iteration, seed);
         sender_chain_key = next_chain;
     }
 
@@ -204,6 +201,22 @@ fn get_sender_key(state: &mut SenderKeyState, iteration: u32) -> Result<SenderMe
 /// a concurrent SKDM cannot overwrite the ratchet advance and skipped keys.
 pub async fn group_decrypt(
     skm_bytes: &[u8],
+    sender_key_store: &mut dyn SenderKeyStore,
+    sender_key_name: &SenderKeyName,
+) -> Result<Vec<u8>> {
+    group_decrypt_shared(
+        Bytes::copy_from_slice(skm_bytes),
+        sender_key_store,
+        sender_key_name,
+    )
+    .await
+}
+
+/// [`group_decrypt`] for a caller that already holds the skmsg as `Bytes`
+/// (the receive path slices it out of the frame buffer): the message is
+/// parsed in place, so the whole skmsg is never copied.
+pub async fn group_decrypt_shared(
+    skm_bytes: Bytes,
     sender_key_store: &mut dyn SenderKeyStore,
     sender_key_name: &SenderKeyName,
 ) -> Result<Vec<u8>> {
@@ -258,36 +271,40 @@ pub async fn group_decrypt(
 
     let sender_key = get_sender_key(sender_key_state, skm.iteration())?;
 
-    let plaintext = DECRYPTION_BUFFER.with(|buffer| {
-        let mut buf_wrapper = buffer.borrow_mut();
-        let buf = buf_wrapper.get_buffer();
-        let ciphertext = skm.ciphertext()?;
-        if let Err(e) = aes_256_cbc_decrypt_into(
-            ciphertext,
-            sender_key.cipher_key(),
-            sender_key.iv(),
-            buf,
-        ) {
-            match e {
-                DecryptionErrorCrypto::BadKeyOrIv => {
-                    log::error!(
-                        "incoming sender key state corrupt for group {} sender {} (chain ID {chain_id})",
-                        sender_key_name.group_id(),
-                        sender_key_name.sender_id()
-                    );
-                    return Err(SignalProtocolError::InvalidSenderKeySession);
-                }
-                DecryptionErrorCrypto::BadCiphertext(msg) => {
-                    log::error!("sender key decryption failed: {msg}");
-                    return Err(SignalProtocolError::InvalidMessage(
-                        CiphertextMessageType::SenderKey,
-                        "decryption failed",
-                    ));
-                }
+    // Decrypt straight into the plaintext the caller keeps. CBC output is never
+    // longer than its input, so one exact reservation covers it. The
+    // thread-local scratch used here before handed its buffer away on every
+    // message and replaced it with a fresh 1 KiB allocation — one allocation
+    // per message either way, but the handed-away buffer also carried whatever
+    // capacity an earlier large message had grown it to, and the plaintext
+    // becomes the `Bytes` the message is dispatched and committed as, so that
+    // slack stayed pinned for the message's whole lifetime.
+    let ciphertext = skm.ciphertext()?;
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
+    if let Err(e) = aes_256_cbc_decrypt_into(
+        ciphertext,
+        sender_key.cipher_key(),
+        sender_key.iv(),
+        &mut plaintext,
+    ) {
+        match e {
+            DecryptionErrorCrypto::BadKeyOrIv => {
+                log::error!(
+                    "incoming sender key state corrupt for group {} sender {} (chain ID {chain_id})",
+                    sender_key_name.group_id(),
+                    sender_key_name.sender_id()
+                );
+                return Err(SignalProtocolError::InvalidSenderKeySession);
+            }
+            DecryptionErrorCrypto::BadCiphertext(msg) => {
+                log::error!("sender key decryption failed: {msg}");
+                return Err(SignalProtocolError::InvalidMessage(
+                    CiphertextMessageType::SenderKey,
+                    "decryption failed",
+                ));
             }
         }
-        Ok::<Vec<u8>, SignalProtocolError>(buf_wrapper.take_buffer())
-    })?;
+    }
 
     sender_key_store
         .store_sender_key(sender_key_name, record)
@@ -453,7 +470,7 @@ mod tests {
             keys: HashMap::new(),
         };
 
-        let skdm = futures::executor::block_on(create_sender_key_distribution_message(
+        let skdm = block_on(create_sender_key_distribution_message(
             &name,
             &mut alice_store,
             &mut rng,
@@ -473,8 +490,7 @@ mod tests {
         )
         .expect("build skm");
 
-        let result =
-            futures::executor::block_on(group_decrypt(skm.serialized(), &mut alice_store, &name));
+        let result = block_on(group_decrypt(skm.serialized(), &mut alice_store, &name));
 
         match result {
             Err(SignalProtocolError::NoSenderKeyState(msg)) => {
@@ -489,6 +505,93 @@ mod tests {
 
     use crate::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
     use futures::executor::block_on;
+
+    /// Repeated forward jumps, then every skipped message delivered late.
+    ///
+    /// The catch-up loop buffers a skipped iteration from its chain seed alone
+    /// and only expands the seed into a full key when the late message arrives,
+    /// so a wrong seed (or a seed filed under the wrong iteration) would show up
+    /// here as a decrypt failure or a swapped plaintext, not as a chain that
+    /// merely ends up at the wrong index.
+    #[test]
+    fn forward_jumps_buffer_keys_that_still_decrypt_in_any_order() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "alice.0".to_string());
+        let mut alice = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        let skdm = block_on(create_sender_key_distribution_message(
+            &name, &mut alice, &mut rng,
+        ))
+        .expect("alice creates her distribution message");
+        let mut bob = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(process_sender_key_distribution_message(
+            &name, &skdm, &mut bob,
+        ))
+        .expect("bob processes alice's distribution message");
+
+        const TOTAL: usize = 40;
+        let ciphertexts: Vec<Vec<u8>> = (0..TOTAL)
+            .map(|i| {
+                block_on(group_encrypt(
+                    &mut alice,
+                    &name,
+                    format!("msg {i}").as_bytes(),
+                    &mut rng,
+                ))
+                .expect("alice encrypts")
+                .serialized()
+                .to_vec()
+            })
+            .collect();
+
+        // Three jumps of different sizes, so the loop runs with 12, 14 and 11
+        // skipped iterations rather than one uniform gap.
+        let jump_targets = [12usize, 27, 39];
+        for &target in &jump_targets {
+            let plaintext = block_on(group_decrypt(&ciphertexts[target], &mut bob, &name))
+                .expect("bob decrypts the message he jumped to");
+            assert_eq!(plaintext, format!("msg {target}").as_bytes());
+        }
+
+        // Now every message the jumps skipped, delivered late. The order
+        // alternates between the tail and the head of the backlog rather than
+        // running oldest-first: the backlog is a vector searched by a linear
+        // scan, so ascending delivery would remove the front entry every time
+        // and never look past index 0. Alternating makes the first lookup scan
+        // the whole buffer and leaves the later ones landing in its middle.
+        let buffered: Vec<usize> = (0..TOTAL).filter(|i| !jump_targets.contains(i)).collect();
+        let mut delivery_order = Vec::with_capacity(buffered.len());
+        let (mut head, mut tail) = (0usize, buffered.len());
+        while head < tail {
+            tail -= 1;
+            delivery_order.push(buffered[tail]);
+            if head < tail {
+                delivery_order.push(buffered[head]);
+                head += 1;
+            }
+        }
+
+        for &i in &delivery_order {
+            let plaintext = block_on(group_decrypt(&ciphertexts[i], &mut bob, &name))
+                .unwrap_or_else(|e| panic!("skipped message {i} must still decrypt: {e:?}"));
+            assert_eq!(plaintext, format!("msg {i}").as_bytes());
+        }
+
+        // Every buffered key is consumed exactly once: a replay is a duplicate,
+        // never a second successful decrypt.
+        for &i in &delivery_order {
+            assert!(
+                matches!(
+                    block_on(group_decrypt(&ciphertexts[i], &mut bob, &name)),
+                    Err(SignalProtocolError::DuplicatedMessage(..))
+                ),
+                "replay of message {i} must be reported as a duplicate"
+            );
+        }
+    }
 
     /// THE crash-safety invariant: a reload mid-lease must never re-derive an
     /// iteration that a lost send may already have put on the wire, and a peer
@@ -558,6 +661,165 @@ mod tests {
             block_on(group_decrypt(after.serialized(), &mut alice, &name))
                 .expect("alice decrypts across the fast-forwarded iteration gap"),
             b"after"
+        );
+    }
+
+    /// A store whose persistence is a component export, the group counterpart
+    /// of the DM case in `tests/counter_lease.rs`: it rebuilds the record from
+    /// components on every load, which is exactly what materializes a
+    /// reservation and burns the batch.
+    struct ComponentStore {
+        states: HashMap<SenderKeyName, crate::protocol::SenderKeyRecordComponents>,
+        waive: bool,
+    }
+    #[async_trait]
+    impl SenderKeyStore for ComponentStore {
+        async fn store_sender_key(
+            &mut self,
+            name: &SenderKeyName,
+            record: SenderKeyRecord,
+        ) -> Result<()> {
+            self.states.insert(name.clone(), record.into_components()?);
+            Ok(())
+        }
+        async fn load_sender_key(&self, name: &SenderKeyName) -> Result<Option<SenderKeyRecord>> {
+            let Some(components) = self.states.get(name) else {
+                return Ok(None);
+            };
+            let mut record = SenderKeyRecord::from_components(components.clone())?;
+            if self.waive {
+                record.waive_counter_lease()?;
+            }
+            Ok(Some(record))
+        }
+    }
+
+    /// Iterations the group sender put on the wire over `count` sends, and the
+    /// skipped keys the receiver had to buffer for them.
+    fn exported_group_run(count: usize, waive: bool) -> (Vec<u32>, usize) {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = ComponentStore {
+            states: HashMap::new(),
+            waive,
+        };
+        let skdm = block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("bob creates his distribution message");
+        let mut alice = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(process_sender_key_distribution_message(
+            &name, &skdm, &mut alice,
+        ))
+        .expect("alice processes it");
+
+        let iterations = (0..count)
+            .map(|_| {
+                let msg =
+                    block_on(group_encrypt(&mut bob, &name, b"m", &mut rng)).expect("bob encrypts");
+                let iteration = msg.iteration();
+                block_on(group_decrypt(msg.serialized(), &mut alice, &name))
+                    .expect("alice decrypts");
+                iteration
+            })
+            .collect();
+
+        let skipped = alice
+            .keys
+            .remove(&name)
+            .expect("alice has a record")
+            .into_components()
+            .expect("components")
+            .states
+            .iter()
+            .map(|state| state.message_keys.len())
+            .sum();
+        (iterations, skipped)
+    }
+
+    /// The group symptom, and its fix: exporting components burns a batch per
+    /// send, so iterations stride by 64 and the receiver buffers the gap.
+    #[test]
+    fn a_waived_lease_keeps_group_iterations_consecutive() {
+        let (iterations, skipped) = exported_group_run(8, true);
+
+        assert_eq!(iterations, (0..8).collect::<Vec<u32>>());
+        assert_eq!(skipped, 0);
+    }
+
+    /// The default is untouched: same run, same batch stride, same backlog.
+    #[test]
+    fn the_default_group_lease_still_burns_a_batch_per_export() {
+        let (iterations, skipped) = exported_group_run(8, false);
+
+        let expected: Vec<u32> = (0..8)
+            .map(|i| i as u32 * SENDER_CHAIN_RESERVATION_BATCH)
+            .collect();
+        assert_eq!(iterations, expected);
+        assert!(
+            skipped > 0,
+            "the leased run must leave the receiver with skipped keys"
+        );
+    }
+
+    /// A record written under the lease may already have published iterations
+    /// below its ceiling; waiving materializes that ceiling once, then runs
+    /// consecutively.
+    #[test]
+    fn waiving_materializes_a_previously_reserved_group_ceiling_once() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("distribution message");
+        block_on(group_encrypt(&mut bob, &name, b"m0", &mut rng)).expect("first send reserves");
+
+        let record = bob.keys.get_mut(&name).expect("record");
+        let ceiling = record.reserved_iteration();
+        assert_eq!(ceiling, SENDER_CHAIN_RESERVATION_BATCH);
+        record
+            .waive_counter_lease()
+            .expect("waive materializes once");
+        assert_eq!(record.reserved_iteration(), 0);
+
+        let first = block_on(group_encrypt(&mut bob, &name, b"after", &mut rng))
+            .expect("send after waiving");
+        assert_eq!(first.iteration(), ceiling);
+        let second =
+            block_on(group_encrypt(&mut bob, &name, b"next", &mut rng)).expect("the next send");
+        assert_eq!(second.iteration(), ceiling + 1);
+    }
+
+    /// A ceiling too far ahead to advance past must leave the record on its
+    /// lease: dropping it there would free the record to reissue exactly the
+    /// iterations the ceiling says may already be on the wire.
+    #[test]
+    fn a_waiver_that_cannot_materialize_keeps_the_lease() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "bob.0".to_string());
+        let mut bob = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(create_sender_key_distribution_message(
+            &name, &mut bob, &mut rng,
+        ))
+        .expect("distribution message");
+
+        let record = bob.keys.get_mut(&name).expect("record");
+        record.reserve_iterations(consts::MAX_RESERVATION_FAST_FORWARD + 1);
+        let ceiling = record.reserved_iteration();
+
+        assert!(record.waive_counter_lease().is_err());
+        assert_eq!(
+            record.reserved_iteration(),
+            ceiling,
+            "a failed waiver must not drop the ceiling"
         );
     }
 

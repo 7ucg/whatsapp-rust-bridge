@@ -8,11 +8,11 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use wacore_libsignal::protocol::{
-    message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage, Direction,
-    GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair,
-    PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, SessionRecord,
-    SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
-    Timestamp, UsePQRatchet,
+    CiphertextMessage, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
+    IdentityKeyPair, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore,
+    ProtocolAddress, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId,
+    SignedPreKeyRecord, SignedPreKeyStore, Timestamp, UsePQRatchet, message_decrypt,
+    message_encrypt, process_prekey_bundle,
 };
 
 // ---- in-memory store impls (clones of the bench fixtures, kept local
@@ -213,7 +213,7 @@ impl Peer {
         });
 
         Self {
-            address: ProtocolAddress::new(name.to_string(), device_id.into()),
+            address: ProtocolAddress::new(name, device_id.into()),
             identity_store,
             prekey_store,
             signed_prekey_store,
@@ -314,6 +314,7 @@ fn receive(
             UsePQRatchet::No,
         )
         .await
+        .map(|d| d.plaintext)
     })
 }
 
@@ -501,8 +502,8 @@ fn alice_delete_then_rebuild_loses_old_chain() {
 
 #[test]
 fn pkmsg_reset_does_not_fix_peer_outbound_if_delivered_to_wrong_store_key() {
-    let bob_lid = ProtocolAddress::new("100000000000001@lid".to_string(), 0.into());
-    let bob_pn = ProtocolAddress::new("15550001000@c.us".to_string(), 0.into());
+    let bob_lid = ProtocolAddress::new("100000000000001@lid", 0.into());
+    let bob_pn = ProtocolAddress::new("15550001000@c.us", 0.into());
 
     let mut alice = Peer::new("alice", 1);
     let mut bob = Peer::new("100000000000001@lid", 0);
@@ -799,8 +800,6 @@ fn pkmsg_decrypt_failure_does_not_persist_promoted_session() {
         *pkmsg.base_key(),
         *pkmsg.identity_key(),
         tampered_inner,
-        None,
-        None,
     )
     .expect("reconstructed pkmsg with tampered inner");
     let tampered = CiphertextMessage::PreKeySignalMessage(tampered_pkmsg);
@@ -826,5 +825,177 @@ fn pkmsg_decrypt_failure_does_not_persist_promoted_session() {
         "BadMac on pkmsg must NOT persist the promoted session — an attacker \
          who can craft pkmsg headers with valid prekeys could otherwise force \
          the receiver into a session only they can write to."
+    );
+}
+
+// ---- a replay is not a session failure ---------------------------------------
+
+/// Buffers the levels this crate announced, so a test can assert that an
+/// expected outcome was not announced as a failure.
+///
+/// `log`'s global logger is install-once per process. This is an integration
+/// test binary, so the slot is this file's — but its tests still run
+/// concurrently, and several of them fail decryption for real. Records are
+/// therefore matched on the asserting test's own peer name, which no other
+/// scenario in this file uses.
+mod announced {
+    use std::sync::{LazyLock, Mutex, OnceLock};
+
+    struct Capture {
+        records: Mutex<Vec<(log::Level, String)>>,
+    }
+
+    impl log::Log for Capture {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.target().starts_with("wacore_libsignal")
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            self.records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((record.level(), record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: LazyLock<Capture> = LazyLock::new(|| Capture {
+        records: Mutex::new(Vec::new()),
+    });
+
+    /// Idempotent per process; the verdict is cached so concurrent tests do not
+    /// race for the slot.
+    pub fn install() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            if log::set_logger(&*CAPTURE).is_ok() {
+                log::set_max_level(log::LevelFilter::Trace);
+            }
+        });
+    }
+
+    /// Every buffered record whose message names `peer`.
+    pub fn about(peer: &str) -> Vec<(log::Level, String)> {
+        CAPTURE
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, message)| message.contains(peer))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Alice and Bob past the pkmsg handshake, plus one Whisper message Bob has
+/// already decrypted — the state a server redelivery arrives into.
+///
+/// The session has to leave its pending-prekey state before the replay: a
+/// duplicate PreKey message returns from the current-state arm and never
+/// reaches the classification under test, while a duplicate Whisper keeps
+/// searching and does. Bob's reply is what moves it, so it is part of the
+/// fixture rather than of any one test.
+fn delivered_once(sender: &str, receiver: &str) -> (Peer, Peer, CiphertextMessage) {
+    let mut alice = Peer::new(sender, 1);
+    let mut bob = Peer::new(receiver, 1);
+    establish(&mut alice, &mut bob);
+
+    let reply = send(&mut bob, &alice.address, b"hi alice");
+    assert_eq!(
+        receive(&mut alice, &bob.address, &reply).expect("reply decrypts"),
+        b"hi alice"
+    );
+
+    let ct = send(&mut alice, &bob.address, b"delivered once");
+    assert!(
+        matches!(ct, CiphertextMessage::SignalMessage(_)),
+        "the replayed stanza must be a Whisper, like the `<enc type=\"msg\">` on the wire"
+    );
+    assert_eq!(
+        receive(&mut bob, &alice.address, &ct).expect("first delivery decrypts"),
+        b"delivered once"
+    );
+
+    (alice, bob, ct)
+}
+
+/// The redelivery the server makes when it never saw an ack.
+fn replay(bob: &mut Peer, from: &ProtocolAddress, ct: &CiphertextMessage) -> SignalProtocolError {
+    receive(bob, from, ct).expect_err("a consumed counter cannot decrypt twice")
+}
+
+/// A replayed message is an expected outcome, not a session failure.
+///
+/// The server redelivers anything it has not seen acked, so a reconnect can
+/// hand this client a message whose counter it already consumed — which is
+/// exactly what a companion sees on startup when the previous run exited
+/// before its ack was flushed.
+///
+/// What this pins: the verdict is `DuplicatedMessage` and nothing about it is
+/// announced at error level. Why the protocol wants that is stated once, at the
+/// classification in `decrypt_message_with_record`.
+#[test]
+fn a_replayed_message_is_not_announced_as_a_session_failure() {
+    const PEER: &str = "replayed-peer";
+    announced::install();
+
+    let (alice, mut bob, ct) = delivered_once(PEER, "replay-receiver");
+
+    let verdict = replay(&mut bob, &alice.address, &ct);
+    assert!(
+        matches!(verdict, SignalProtocolError::DuplicatedMessage(_, _)),
+        "a replay must classify as a duplicate, not as a decryption failure: {verdict:?}"
+    );
+
+    let failures: Vec<_> = announced::about(PEER)
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Error)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "a replay must not be announced as an error; got {failures:?}"
+    );
+}
+
+/// The same guarantee when the replay has to be recognized across more than one
+/// candidate session.
+///
+/// A rebuild archives the state that consumed the counter and installs a fresh
+/// one, so the replay now fails the current session before the archived one
+/// recognizes it. The duplicate verdict still has to win, and still has to keep
+/// the failure logging quiet — that ordering is what this pins.
+#[test]
+fn a_replay_stays_quiet_when_a_sibling_candidate_session_fails_first() {
+    const PEER: &str = "replayed-peer-archived";
+    announced::install();
+
+    let (mut alice, mut bob, ct) = delivered_once(PEER, "replay-archive-receiver");
+
+    // Bob rebuilds toward Alice: the state that just consumed the counter is
+    // archived and a fresh current session takes its place.
+    alice.rotate_one_time_prekey();
+    let bundle = alice.bundle();
+    process_bundle(&mut bob, &alice.address, &bundle);
+
+    let verdict = replay(&mut bob, &alice.address, &ct);
+    assert!(
+        matches!(verdict, SignalProtocolError::DuplicatedMessage(_, _)),
+        "the archived state's duplicate must outrank the current state's failure: {verdict:?}"
+    );
+
+    let records = announced::about(PEER);
+    // The current session really did fail on its own terms first — without this
+    // the test could pass on a single-candidate path and prove nothing new.
+    assert!(
+        records.iter().any(|(level, _)| *level == log::Level::Warn),
+        "expected a candidate-failure warning from the fresh session; got {records:?}"
+    );
+    assert!(
+        records.iter().all(|(level, _)| *level > log::Level::Error),
+        "a replay must stay out of the error log even when a sibling candidate fails; got {records:?}"
     );
 }

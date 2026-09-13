@@ -273,6 +273,15 @@ pub(crate) struct RtpReceptionStats {
     expected_prior: u32,
     received_prior: u32,
     transit: Option<u32>,
+    /// The last RTP timestamp seen, so consecutive packets can be differenced.
+    ///
+    /// The difference is the peer's own statement of how much audio each packet carries, in the
+    /// negotiated clock, and it is the only such statement that does not pass through a codec.
+    /// [`Self::frame_span`] is what turns two colliding payload grammars into one decidable
+    /// question; see `crate::voip::opus_packet`.
+    last_rtp_timestamp: Option<u32>,
+    /// Difference between the last two RTP timestamps of the CURRENT stream.
+    frame_span: Option<u32>,
     jitter_q4: u64,
     last_sender_report: u32,
     last_sender_report_at_ms: Option<u64>,
@@ -287,6 +296,9 @@ impl RtpReceptionStats {
         arrival_ms: u64,
         clock_rate: u32,
     ) {
+        // Whether this packet is the newest of the stream, which decides below whether it may move
+        // the timestamp baseline. A fresh stream's first packet is newest by definition.
+        let is_newest;
         if self.ssrc != Some(ssrc) {
             *self = Self {
                 ssrc: Some(ssrc),
@@ -295,9 +307,11 @@ impl RtpReceptionStats {
                 received: 1,
                 ..Self::default()
             };
+            is_newest = true;
         } else {
             let delta = sequence.wrapping_sub(self.max_sequence);
-            if delta != 0 && delta < 0x8000 {
+            is_newest = delta != 0 && delta < 0x8000;
+            if is_newest {
                 if sequence < self.max_sequence {
                     self.sequence_cycles = self.sequence_cycles.wrapping_add(1 << 16);
                 }
@@ -318,6 +332,51 @@ impl RtpReceptionStats {
                 .saturating_sub(decay);
         }
         self.transit = Some(transit);
+
+        // The baseline tracks the NEWEST packet, not the last one to arrive. Advancing it on a
+        // reordered packet would poison the following measurement as well as its own: given
+        // 1/1000, 3/2920, 2/1960, 4/3880, leaving the baseline at 1960 makes packet 4 read a step of
+        // 1920 rather than the 960 the peer is actually pacing at, and the codec probe would go on
+        // refusing a stream that agrees with itself.
+        //
+        // Only forward steps within a second of audio count: a retransmission or a wrap would
+        // otherwise produce an absurd difference, and one bad sample must not move a codec decision.
+        //
+        // A step that does not qualify CLEARS the span rather than leaving the last good one in
+        // place. The codec probe reads this as the current packet's own statement about its pacing,
+        // so a stale value would let packets that say nothing about their cadence -- a repeated or
+        // backward timestamp on a newer sequence number -- borrow the agreement of packets that
+        // did, and three of those are enough to switch the call's codec for good.
+        if is_newest {
+            if let Some(previous) = self.last_rtp_timestamp {
+                let delta = rtp_timestamp.wrapping_sub(previous);
+                self.frame_span = (delta > 0 && delta <= clock_rate).then_some(delta);
+            }
+            self.last_rtp_timestamp = Some(rtp_timestamp);
+        } else {
+            // The same rule as above, for the same reason: this packet arrived out of order, so the
+            // difference between it and the newest one is not a statement about the peer's pacing.
+            // Left set, the previous packet's span would be lent to it, and a reordered packet that
+            // happens to parse as Opus could supply the third agreement the probe requires -- a
+            // permanent codec switch on two packets that stated the cadence and one that did not.
+            // The baseline is deliberately NOT touched: it still tracks the newest packet.
+            self.frame_span = None;
+        }
+    }
+
+    /// The SSRC of the stream currently being tracked, if any.
+    pub(crate) fn ssrc(&self) -> Option<u32> {
+        self.ssrc
+    }
+
+    /// Samples between the last two packets of this stream, per the peer's own RTP timestamps.
+    ///
+    /// `None` until two consecutive in-order packets have been seen, cleared again by a newest
+    /// packet whose step is unusable (zero, backward, or over a second), and reset with the stream
+    /// when the SSRC changes, because a renumbered stream is a new statement and not a
+    /// continuation.
+    pub(crate) fn frame_span(&self) -> Option<u32> {
+        self.frame_span
     }
 
     pub(crate) fn observe_sender_report(
@@ -436,6 +495,61 @@ pub fn build_compact_rtcp_209(local_ssrc: u32) -> [u8; 8] {
     buf[3] = 1; // (1+1)*4 = 8 bytes
     buf[4..8].copy_from_slice(&local_ssrc.to_be_bytes());
     buf
+}
+
+/// 12-byte Picture Loss Indication (PT 206, FMT=1), RFC 4585 s6.3.1.
+///
+/// WhatsApp ships two PLI builders and picks between them on a per-stream
+/// feature bit: this one, and a 16-byte form carrying a monotonic sequence
+/// number so the receiver can coalesce repeats. **We deliberately send the
+/// short one, and the reason is in the peer's deduplicator rather than in the
+/// RFC.**
+///
+/// That deduplicator accepts a sequence only when `stored < seq`, or when
+/// `seq < 400` and `stored` is near the wrap; a rejected one does not advance
+/// `stored`. Its initial value is the same sentinel it substitutes for a PLI
+/// that carries no sequence at all. So a sender whose counter has passed 400
+/// and then meets a receiver whose state is fresh -- a peer that rebuilt its
+/// video stream, or an answering device after a rekey -- has every request
+/// dropped, silently, for the rest of the call, with no path back. The
+/// sentinel is special-cased to "not a duplicate" instead, so a PLI with no
+/// sequence is honoured unconditionally and forever.
+///
+/// What the short form costs is the peer's own coalescing, which our throttle
+/// already provides on this side, and a log line about the mismatch. What it
+/// buys is that the request cannot stop working.
+pub(crate) fn build_picture_loss_indication(sender_ssrc: u32, media_ssrc: u32) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    buf[0] = 0x81; // V=2, P=0, FMT=1 (PLI)
+    buf[1] = RTCP_PT_PSFB;
+    buf[2] = 0;
+    buf[3] = 2; // (2+1)*4 = 12 bytes
+    buf[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+    buf[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+    buf
+}
+
+/// A PLI on the native video profile, which sets bit 4 beside the FMT.
+///
+/// Not an extension invented here to match a capture: the peer's transport
+/// recognises a video PLI by `packet_type == 206 && byte0 & 0x1F == 0x11`, so
+/// the bit is required rather than tolerated, and the same bit is already on
+/// this pipeline's SDES and sender report. It costs nothing to read, because
+/// the FMT is masked with `& 0x0F` on both sides -- `summarize_rtcp` included.
+///
+/// A receiver following RFC 4585 to the letter reads FMT 17 and must discard
+/// the packet. That is the correct trade only because this transport carries
+/// WhatsApp peers and nothing else.
+pub(crate) fn build_whatsapp_picture_loss_indication(
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    profile_extension: bool,
+) -> [u8; 12] {
+    let mut packet = build_picture_loss_indication(sender_ssrc, media_ssrc);
+    if profile_extension {
+        packet[0] |= 0x10;
+    }
+    packet
 }
 
 /// 28-byte Sender Report (PT 200, RC=0). `now_ms` is the wall clock in milliseconds.
@@ -581,6 +695,122 @@ pub(crate) fn build_whatsapp_sender_report_with_sdes(
     let sdes = build_whatsapp_source_description(local_ssrc, cname, profile_extension);
     sender_report.extend_from_slice(&sdes);
     sender_report
+}
+
+#[cfg(test)]
+mod frame_span_tests {
+    use super::*;
+
+    const CLOCK: u32 = 16_000;
+    const SSRC: u32 = 0x5741_0001;
+
+    fn observe(stats: &mut RtpReceptionStats, seq: u16, timestamp: u32, ssrc: u32) {
+        stats.observe(ssrc, seq, timestamp, u64::from(seq) * 60, CLOCK);
+    }
+
+    // The number the whole codec decision rests on. `codec_probe` compares the duration a packet's
+    // Opus header declares against this, and the arithmetic that makes a false promotion impossible
+    // assumes it is the negotiated 960. Nothing exercised the producer.
+    #[test]
+    fn two_consecutive_packets_yield_the_step_between_them() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        assert_eq!(
+            stats.frame_span(),
+            None,
+            "one packet is not a difference yet"
+        );
+        observe(&mut stats, 2, 1_960, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+        observe(&mut stats, 3, 2_920, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+    }
+
+    // A newest packet whose timestamp goes backwards states nothing about its own cadence, so the
+    // span reports nothing rather than the previous packet's. The consumer is the codec probe,
+    // which reads the span as THIS packet's statement and abstains without penalty when there is
+    // none: holding the old value instead would let packets that say nothing about their pacing
+    // borrow the agreement of packets that did, and three borrowed agreements switch the call's
+    // codec permanently.
+    #[test]
+    fn a_backwards_timestamp_leaves_no_cadence_to_borrow() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 2, 1_960, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+        observe(&mut stats, 3, 1_000, SSRC);
+        assert_eq!(
+            stats.frame_span(),
+            None,
+            "a backwards timestamp is not a cadence, and not the last one either"
+        );
+        // And the stream recovering re-states it.
+        observe(&mut stats, 4, 1_960, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+    }
+
+    // The reordered packet must not poison the NEXT one either. Leaving the baseline on an old
+    // packet makes the packet after it measure a step that spans the gap, so the span reads 1920 on
+    // a stream pacing at 960 and the codec probe refuses a stream that agrees with itself.
+    #[test]
+    fn the_packet_after_a_reordered_one_still_measures_the_real_cadence() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 3, 2_920, SSRC);
+        observe(&mut stats, 2, 1_960, SSRC); // late
+        observe(&mut stats, 4, 3_880, SSRC);
+        assert_eq!(
+            stats.frame_span(),
+            Some(960),
+            "the baseline must follow the newest packet, not the last to arrive"
+        );
+    }
+
+    // A difference larger than a second of audio is not a frame duration, whatever caused it -- and
+    // like a backwards step, it leaves no cadence rather than the previous packet's.
+    #[test]
+    fn an_absurd_forward_jump_states_no_cadence() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 2, 1_960, SSRC);
+        observe(&mut stats, 3, 1_960 + CLOCK + 1, SSRC);
+        assert_eq!(stats.frame_span(), None);
+    }
+
+    // A renumbered stream restarts the timestamp sequence, so differences across the change are not
+    // comparable and the span must not carry over.
+    #[test]
+    fn a_new_ssrc_resets_the_span() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 2, 1_960, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+        observe(&mut stats, 3, 5_000, 0xDEAD_BEEF);
+        assert_eq!(
+            stats.frame_span(),
+            None,
+            "a new stream has no difference yet"
+        );
+    }
+
+    // The 16-bit RTP timestamp space wraps; the difference across a wrap is still the step.
+    #[test]
+    fn the_span_survives_a_timestamp_wrap() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, u32::MAX - 400, SSRC);
+        observe(&mut stats, 2, 559, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+    }
+
+    // A peer repeating a timestamp is not advancing, and a zero step would make the probe compare
+    // against nothing.
+    #[test]
+    fn a_repeated_timestamp_does_not_produce_a_zero_span() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 2, 1_000, SSRC);
+        assert_eq!(stats.frame_span(), None);
+    }
 }
 
 #[cfg(test)]
@@ -898,6 +1128,50 @@ mod tests {
         assert!(summary.uses_whatsapp_profile_extension);
         assert_eq!(summary.feedback[0].fmt, 1);
         assert_eq!(summary.referenced_ssrcs, [video]);
+    }
+
+    /// Both builders, byte for byte, and back through the parser that reads a
+    /// peer's. They differ in one bit, which the profile flag decides.
+    #[test]
+    fn picture_loss_indications_match_the_wire_layout() {
+        let sender = 0x1111_2222u32;
+        let video = 0x5555_6666u32;
+
+        let plain = build_picture_loss_indication(sender, video);
+        assert_eq!(&plain[..4], &[0x81, RTCP_PT_PSFB, 0, 2]);
+        assert_eq!(&plain[4..8], &sender.to_be_bytes());
+        assert_eq!(&plain[8..12], &video.to_be_bytes());
+        // No FCI: a sequence number is what the 16-byte form adds, and the
+        // builder's doc says why we do not send it.
+        assert_eq!(plain.len(), 12);
+
+        assert_eq!(
+            build_whatsapp_picture_loss_indication(sender, video, false),
+            plain,
+            "off the profile, the WhatsApp spelling is the RFC one"
+        );
+        let profile = build_whatsapp_picture_loss_indication(sender, video, true);
+        assert_eq!(profile[0], 0x91);
+        assert_eq!(&profile[1..], &plain[1..]);
+
+        for packet in [plain, profile] {
+            let summary = summarize_rtcp(&packet).expect("a PLI parses as one");
+            assert_eq!(summary.feedback[0].fmt, 1);
+            assert_eq!(summary.feedback[0].media_ssrc, video);
+            assert!(summary.feedback[0].fci.is_empty());
+            assert_eq!(summary.referenced_ssrcs, [video]);
+        }
+        // The bit is the only difference the parser sees, in both directions.
+        assert!(
+            summarize_rtcp(&profile)
+                .expect("a PLI parses as one")
+                .uses_whatsapp_profile_extension
+        );
+        assert!(
+            !summarize_rtcp(&plain)
+                .expect("a PLI parses as one")
+                .uses_whatsapp_profile_extension
+        );
     }
 
     #[test]

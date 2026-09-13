@@ -112,14 +112,14 @@ fn parse_registration_id(bytes: &[u8]) -> Option<u32> {
 /// Helper to extract registration ID from a node (4 bytes big-endian).
 ///
 /// Looks for a `<registration>` child node and parses its bytes content
-/// as a big-endian `u32`. See [`parse_registration_id`] for the parse rules.
+/// as a big-endian `u32`. See `parse_registration_id` for the parse rules.
 pub fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
     let registration_node = node.get_optional_child("registration")?;
     parse_registration_id(get_bytes_content(registration_node)?)
 }
 
 /// `NodeRef` counterpart of [`extract_registration_id_from_node`]; shares the
-/// same parse rules via [`parse_registration_id`].
+/// same parse rules via `parse_registration_id`.
 pub fn extract_registration_id_from_node_ref(node: &NodeRef<'_>) -> Option<u32> {
     let registration_node = node.get_optional_child("registration")?;
     parse_registration_id(registration_node.content_bytes()?)
@@ -159,6 +159,26 @@ pub fn should_include_keys_with_policy(
 /// way. Only drop when there is no bundle to recover from.
 pub fn should_drop_unknown_device_retry(keys_present: bool, device_known: bool) -> bool {
     !keys_present && !device_known
+}
+
+/// The `HID_FAILED_DECRYPT` bit of a receipt's `<meta mode>` bitmask.
+///
+/// It says the failure that prompted the receipt came from an
+/// `<enc decrypt-fail="hide">`, so the sender knows the receiver showed the
+/// user nothing for it. The catalog stores bit *positions* rather than values,
+/// and the generated constant is already shifted, so nothing here repeats it.
+///
+/// The other two positions the catalog defines (`ORPHAN`, `NO_CHECKMARK_UX`)
+/// name states this client does not model, so it never sets them.
+pub use crate::types::wire_enums::RECEIPT_MODE_HID_FAILED_DECRYPT;
+
+/// The `<meta mode="…">` child of a receipt, or `None` when no bit is set.
+///
+/// An all-zero bitmask carries nothing the server does not already assume, and
+/// WA Web omits the node rather than sending a zero, so the empty case is
+/// `None` instead of `<meta mode="0"/>`.
+pub fn build_receipt_meta_node(mode: u32) -> Option<Node> {
+    (mode != 0).then(|| NodeBuilder::new("meta").attr("mode", mode).build())
 }
 
 /// Builds the `<keys>` bundle embedded in a retry receipt (type, identity, one-time prekey,
@@ -356,6 +376,39 @@ mod tests {
     #[test]
     fn should_include_keys_for_stateless_recipient() {
         assert!(should_include_keys_with_policy(1, false, true));
+    }
+
+    // The stateless escape hatch is the only input that can carry a bundle on a
+    // first retry without an explicit force. It is a destination category, not a
+    // chat kind: everything else has to earn the bundle by reaching the count
+    // threshold, which needs the same message id to come back.
+    #[test]
+    fn stateless_early_inclusion_covers_only_hosted_destinations() {
+        use wacore_binary::{Jid, JidExt as _};
+
+        for (raw, is_stateless) in [
+            ("5511999887766:99@s.whatsapp.net", true),
+            ("5511999887766:7@hosted", true),
+            ("100000012345678:7@hosted.lid", true),
+            ("status@broadcast", false),
+            ("120363021033254949@g.us", false),
+            ("5511999887766:7@s.whatsapp.net", false),
+            ("100000012345678:7@lid", false),
+        ] {
+            let jid: Jid = raw.parse().expect("test JID should be valid");
+            assert_eq!(jid.is_hosted(), is_stateless, "is_hosted() for {raw}");
+            assert_eq!(
+                should_include_keys_with_policy(1, false, jid.is_hosted()),
+                is_stateless,
+                "first-retry key inclusion for {raw}"
+            );
+            // Past the threshold every destination carries the bundle.
+            assert!(should_include_keys_with_policy(
+                MIN_RETRY_COUNT_FOR_KEYS,
+                false,
+                jid.is_hosted()
+            ));
+        }
     }
 
     #[test]

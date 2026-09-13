@@ -33,14 +33,22 @@ use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
 /// Derive macro for implementing `ProtocolNode` on structs with attributes.
 ///
+/// Child fields are intentionally not accepted by this derive. Child
+/// cardinality and duplicate handling differ across protocol responses, so
+/// child-bearing nodes use an explicit implementation, optionally reusing the
+/// shared parsing helpers, instead of hiding those decisions in generated code.
+///
 /// # Attributes
 ///
 /// - `#[protocol(tag = "tagname")]` - Required. Specifies the XML tag name.
-/// - `#[attr(name = "attrname")]` - Marks a String field as an XML attribute.
+/// - `#[attr(name = "attrname")]` - Marks a text field as an XML attribute. The
+///   field is built with `Into`, so any type a `Cow<str>` and a `&str` literal
+///   convert into works: `String`, or `CompactString` for the short attributes
+///   (up to 24 bytes) that would otherwise take a heap allocation each.
 /// - `#[attr(name = "attrname", default = "value")]` - Attribute with default value.
-///   For `Option<String>` fields, a default always yields `Some(default)`.
+///   For optional text fields, a default always yields `Some(default)`.
 /// - `#[attr(name = "attrname", jid)]` - Marks a Jid field as a JID attribute (required).
-/// - `#[attr(name = "attrname", jid, optional)]` - Marks an Option<Jid> field as optional.
+/// - `#[attr(name = "attrname", jid, optional)]` - Marks an `Option<Jid>` field as optional.
 /// - `#[attr(name = "attrname", string_enum)]` - Marks a field whose type derives `WireEnum` in unit-string mode (uses `as_str()`/`TryFrom`).
 /// - `#[attr(name = "attrname", u64)]` - Marks a u64 numeric attribute.
 /// - `#[attr(name = "attrname", u32)]` - Marks a u32 numeric attribute.
@@ -196,25 +204,26 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
                 (AttrType::String, false, Some(default)) => {
                     quote! {
                         #field_ident: node.attrs().optional_string(#attr_name)
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| #default.to_string())
+                            .map(::core::convert::Into::into)
+                            .unwrap_or_else(|| #default.into())
                     }
                 }
                 (AttrType::String, false, None) => {
                     quote! {
-                        #field_ident: node.attrs().required_string(#attr_name)?.to_string()
+                        #field_ident: node.attrs().required_string(#attr_name)?.into()
                     }
                 }
                 (AttrType::String, true, Some(default)) => {
                     quote! {
                         #field_ident: node.attrs().optional_string(#attr_name)
-                            .map(|s| s.to_string())
-                            .or_else(|| Some(#default.to_string()))
+                            .map(::core::convert::Into::into)
+                            .or_else(|| Some(#default.into()))
                     }
                 }
                 (AttrType::String, true, None) => {
                     quote! {
-                        #field_ident: node.attrs().optional_string(#attr_name).map(|s| s.to_string())
+                        #field_ident: node.attrs().optional_string(#attr_name)
+                            .map(::core::convert::Into::into)
                     }
                 }
                 // StringEnum: parse using the `parse_string_enum` helper which tries TryFrom then From.
@@ -284,10 +293,10 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
             .map(|info| {
                 let field_ident = &info.field_ident;
                 match (&info.attr_type, info.optional, &info.default) {
-                    (_, true, Some(default)) => quote! { #field_ident: Some(#default.to_string()) },
+                    (_, true, Some(default)) => quote! { #field_ident: Some(#default.into()) },
                     (_, true, None) => quote! { #field_ident: None },
                     (AttrType::String, false, Some(default)) => {
-                        quote! { #field_ident: #default.to_string() }
+                        quote! { #field_ident: #default.into() }
                     }
                     (AttrType::StringEnum, false, Some(default)) => {
                         quote! { #field_ident: ::wacore::protocol::parse_string_enum(#default)
@@ -545,7 +554,7 @@ fn is_option_type(ty: &syn::Type) -> bool {
 //      variant; optional #[wire_alias = "..."] adds parser-side aliases;
 //      #[wire(skip)] on a field excludes it from JSON; #[wire_fallback] with
 //      { tag: String } catches unknown tags.
-//      Emits: wire_tag(), impl Serialize (SerializeMap), and a sibling
+//      Emits: wire_tag(), impl Serialize (SerializeStruct), and a sibling
 //             <Name>Tag unit enum (unit-string WireEnum) for parser dispatch.
 //      Adding `content = "data"` selects Serde's adjacent representation,
 //      supports tuple payloads, and emits both Serialize and Deserialize.
@@ -553,7 +562,8 @@ fn is_option_type(ty: &syn::Type) -> bool {
 //   3. int          (enum has #[wire(kind = "int")])
 //      Unit variants + optional #[wire_fallback] tuple with i32. Each variant
 //      has #[wire = NUM].
-//      Emits: code(), From<i32>, Serialize (as i32), Deserialize (from i32).
+//      Emits: code(), Serialize (as i32), Deserialize (from i32), and either
+//             From<i32> with a fallback or strict TryFrom<i32> without one.
 //
 // The wire string/number lives exactly once per variant, in the #[wire = ...]
 // attribute. Everything else is derived.
@@ -671,7 +681,7 @@ enum VariantWire {
 
 struct VariantInfo {
     ident: syn::Ident,
-    fields: syn::Fields,
+    fields: Fields,
     wire: Option<VariantWire>,
     aliases: Vec<String>,
     is_default: bool,
@@ -798,7 +808,7 @@ fn expand_wire_enum_unit(
                 .to_compile_error();
             }
             match &info.fields {
-                syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {}
+                Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {}
                 _ => {
                     return syn::Error::new_spanned(
                         &info.ident,
@@ -820,7 +830,7 @@ fn expand_wire_enum_unit(
             }
             continue;
         }
-        if !matches!(info.fields, syn::Fields::Unit) {
+        if !matches!(info.fields, Fields::Unit) {
             return syn::Error::new_spanned(
                 &info.ident,
                 "unit-string WireEnum only supports unit variants (use #[wire_fallback] for a catch-all)",
@@ -1126,7 +1136,7 @@ fn expand_wire_enum_int(
                 .to_compile_error();
             }
             match &info.fields {
-                syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {}
+                Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {}
                 _ => {
                     return syn::Error::new_spanned(
                         &info.ident,
@@ -1138,7 +1148,7 @@ fn expand_wire_enum_int(
             fallback = Some(info);
             continue;
         }
-        if !matches!(info.fields, syn::Fields::Unit) {
+        if !matches!(info.fields, Fields::Unit) {
             return syn::Error::new_spanned(
                 &info.ident,
                 "int-mode WireEnum variants must be unit variants (except the #[wire_fallback])",
@@ -1158,21 +1168,12 @@ fn expand_wire_enum_int(
         }
     }
 
-    let Some(fb) = fallback else {
-        return syn::Error::new_spanned(
-            name,
-            "int-mode WireEnum requires a #[wire_fallback] variant like Unknown(i32)",
-        )
-        .to_compile_error();
-    };
-    let fb_ident = &fb.ident;
-
     let code_arms: Vec<_> = infos
         .iter()
         .filter(|i| !i.is_fallback)
         .map(|i| {
             let id = &i.ident;
-            let VariantWire::Int(n) = i.wire.as_ref().unwrap() else {
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
                 unreachable!()
             };
             let lit = proc_macro2::Literal::i32_suffixed(*n);
@@ -1185,7 +1186,7 @@ fn expand_wire_enum_int(
         .filter(|i| !i.is_fallback)
         .map(|i| {
             let id = &i.ident;
-            let VariantWire::Int(n) = i.wire.as_ref().unwrap() else {
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
                 unreachable!()
             };
             let lit = proc_macro2::Literal::i32_suffixed(*n);
@@ -1193,25 +1194,78 @@ fn expand_wire_enum_int(
         })
         .collect();
 
+    let strict_from_arms: Vec<_> = infos
+        .iter()
+        .filter(|i| !i.is_fallback)
+        .map(|i| {
+            let id = &i.ident;
+            let Some(VariantWire::Int(n)) = i.wire.as_ref() else {
+                unreachable!()
+            };
+            let lit = proc_macro2::Literal::i32_suffixed(*n);
+            quote! { #lit => ::core::result::Result::Ok(#name::#id) }
+        })
+        .collect();
+
+    let conversion = if let Some(fallback) = fallback {
+        let fallback_ident = &fallback.ident;
+        quote! {
+            impl ::core::convert::From<i32> for #name {
+                fn from(code: i32) -> Self {
+                    match code {
+                        #(#from_arms,)*
+                        other => #name::#fallback_ident(other),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl ::core::convert::TryFrom<i32> for #name {
+                type Error = i32;
+
+                fn try_from(code: i32) -> ::core::result::Result<Self, Self::Error> {
+                    match code {
+                        #(#strict_from_arms,)*
+                        other => ::core::result::Result::Err(other),
+                    }
+                }
+            }
+        }
+    };
+
+    let fallback_code_arm = fallback.map(|fallback| {
+        let fallback_ident = &fallback.ident;
+        quote! { #name::#fallback_ident(n) => *n, }
+    });
+
+    let deserialize = if fallback.is_some() {
+        quote! {
+            ::core::result::Result::Ok(<Self as ::core::convert::From<i32>>::from(n))
+        }
+    } else {
+        quote! {
+            <Self as ::core::convert::TryFrom<i32>>::try_from(n).map_err(|unknown| {
+                <D::Error as ::serde::de::Error>::custom(::core::format_args!(
+                    "unknown numeric wire code {unknown} for {}",
+                    ::core::stringify!(#name),
+                ))
+            })
+        }
+    };
+
     quote! {
         impl #name {
             /// Numeric wire code for this variant (single source of truth).
             pub fn code(&self) -> i32 {
                 match self {
                     #(#code_arms,)*
-                    #name::#fb_ident(n) => *n,
+                    #fallback_code_arm
                 }
             }
         }
 
-        impl ::core::convert::From<i32> for #name {
-            fn from(code: i32) -> Self {
-                match code {
-                    #(#from_arms,)*
-                    other => #name::#fb_ident(other),
-                }
-            }
-        }
+        #conversion
 
         impl ::serde::Serialize for #name {
             fn serialize<S: ::serde::Serializer>(
@@ -1227,7 +1281,7 @@ fn expand_wire_enum_int(
                 deserializer: D,
             ) -> ::core::result::Result<Self, D::Error> {
                 let n = <i32 as ::serde::Deserialize>::deserialize(deserializer)?;
-                ::core::result::Result::Ok(<Self as ::core::convert::From<i32>>::from(n))
+                #deserialize
             }
         }
     }
@@ -1264,7 +1318,7 @@ fn expand_wire_enum_tagged(
             // Must be { tag: String }
             let ok = matches!(
                 &info.fields,
-                syn::Fields::Named(n)
+                Fields::Named(n)
                     if n.named.len() == 1
                         && n.named
                             .first()
@@ -1325,9 +1379,9 @@ fn expand_wire_enum_tagged(
         }
         for info in &infos {
             let fields = match &info.fields {
-                syn::Fields::Named(fields) => &fields.named,
-                syn::Fields::Unnamed(fields) => &fields.unnamed,
-                syn::Fields::Unit => continue,
+                Fields::Named(fields) => &fields.named,
+                Fields::Unnamed(fields) => &fields.unnamed,
+                Fields::Unit => continue,
             };
             if let Some(field) = fields
                 .iter()
@@ -1356,9 +1410,9 @@ fn expand_wire_enum_tagged(
                     unreachable!()
                 };
                 match &info.fields {
-                    syn::Fields::Unit => quote! { #name::#id => #s },
-                    syn::Fields::Named(_) => quote! { #name::#id { .. } => #s },
-                    syn::Fields::Unnamed(_) => quote! { #name::#id(..) => #s },
+                    Fields::Unit => quote! { #name::#id => #s },
+                    Fields::Named(_) => quote! { #name::#id { .. } => #s },
+                    Fields::Unnamed(_) => quote! { #name::#id(..) => #s },
                 }
             }
         })
@@ -1388,8 +1442,8 @@ fn expand_wire_enum_tagged(
                     .iter()
                     .map(|alias| quote! { #[serde(alias = #alias)] });
                 let fields = match &info.fields {
-                    syn::Fields::Unit => quote! {},
-                    syn::Fields::Named(fields) => {
+                    Fields::Unit => quote! {},
+                    Fields::Named(fields) => {
                         let declarations = fields.named.iter().map(|field| {
                             let field_id = field.ident.as_ref().unwrap();
                             let ty = &field.ty;
@@ -1397,7 +1451,7 @@ fn expand_wire_enum_tagged(
                         });
                         quote! { { #(#declarations),* } }
                     }
-                    syn::Fields::Unnamed(fields) => {
+                    Fields::Unnamed(fields) => {
                         let declarations = fields.unnamed.iter().map(|field| {
                             let ty = &field.ty;
                             quote! { &'__wire #ty }
@@ -1425,8 +1479,8 @@ fn expand_wire_enum_tagged(
                     .iter()
                     .map(|alias| quote! { #[serde(alias = #alias)] });
                 let fields = match &info.fields {
-                    syn::Fields::Unit => quote! {},
-                    syn::Fields::Named(fields) => {
+                    Fields::Unit => quote! {},
+                    Fields::Named(fields) => {
                         let declarations = fields.named.iter().map(|field| {
                             let field_id = field.ident.as_ref().unwrap();
                             let ty = &field.ty;
@@ -1434,7 +1488,7 @@ fn expand_wire_enum_tagged(
                         });
                         quote! { { #(#declarations),* } }
                     }
-                    syn::Fields::Unnamed(fields) => {
+                    Fields::Unnamed(fields) => {
                         let declarations = fields.unnamed.iter().map(|field| {
                             let ty = &field.ty;
                             quote! { #ty }
@@ -1455,10 +1509,10 @@ fn expand_wire_enum_tagged(
             .map(|info| {
                 let id = &info.ident;
                 match &info.fields {
-                    syn::Fields::Unit => {
+                    Fields::Unit => {
                         quote! { #name::#id => #borrowed_ident::#id }
                     }
-                    syn::Fields::Named(fields) => {
+                    Fields::Named(fields) => {
                         let bindings = fields
                             .named
                             .iter()
@@ -1469,7 +1523,7 @@ fn expand_wire_enum_tagged(
                                 #borrowed_ident::#id { #(#values),* }
                         }
                     }
-                    syn::Fields::Unnamed(fields) => {
+                    Fields::Unnamed(fields) => {
                         let bindings: Vec<_> = (0..fields.unnamed.len())
                             .map(|index| quote::format_ident!("__field_{index}"))
                             .collect();
@@ -1488,8 +1542,8 @@ fn expand_wire_enum_tagged(
             .map(|info| {
                 let id = &info.ident;
                 match &info.fields {
-                    syn::Fields::Unit => quote! { #owned_ident::#id => #name::#id },
-                    syn::Fields::Named(fields) => {
+                    Fields::Unit => quote! { #owned_ident::#id => #name::#id },
+                    Fields::Named(fields) => {
                         let bindings = fields
                             .named
                             .iter()
@@ -1500,7 +1554,7 @@ fn expand_wire_enum_tagged(
                                 #name::#id { #(#values),* }
                         }
                     }
-                    syn::Fields::Unnamed(fields) => {
+                    Fields::Unnamed(fields) => {
                         let bindings: Vec<_> = (0..fields.unnamed.len())
                             .map(|index| quote::format_ident!("__field_{index}"))
                             .collect();
@@ -1553,16 +1607,44 @@ fn expand_wire_enum_tagged(
             }
         }
     } else {
+        let struct_name_lit = name.to_string();
+        // Struct-field path, not map keys: serializers that intern struct keys
+        // cannot intern a name that arrives as a value.
         let serialize_arms: Vec<_> = infos
             .iter()
             .map(|info| {
                 let id = &info.ident;
+                let emit_arm = |pattern: proc_macro2::TokenStream,
+                                len_prelude: proc_macro2::TokenStream,
+                                entries: Vec<proc_macro2::TokenStream>| {
+                    quote! {
+                        #pattern => {
+                            #len_prelude
+                            let mut __state = ::serde::Serializer::serialize_struct(
+                                serializer, #struct_name_lit, __len
+                            )?;
+                            ::serde::ser::SerializeStruct::serialize_field(
+                                &mut __state, #discriminator_lit, self.wire_tag()
+                            )?;
+                            #(#entries)*
+                            ::serde::ser::SerializeStruct::end(__state)
+                        }
+                    }
+                };
                 if info.is_fallback {
-                    quote! { #name::#id { tag: _ } => {} }
+                    emit_arm(
+                        quote! { #name::#id { tag: _ } },
+                        quote! { let __len = 1usize; },
+                        Vec::new(),
+                    )
                 } else {
                     match &info.fields {
-                        syn::Fields::Unit => quote! { #name::#id => {} },
-                        syn::Fields::Named(named) => {
+                        Fields::Unit => emit_arm(
+                            quote! { #name::#id },
+                            quote! { let __len = 1usize; },
+                            Vec::new(),
+                        ),
+                        Fields::Named(named) => {
                             let bindings: Vec<proc_macro2::TokenStream> = named
                                 .named
                                 .iter()
@@ -1575,38 +1657,67 @@ fn expand_wire_enum_tagged(
                                     }
                                 })
                                 .collect();
-                            let entries: Vec<proc_macro2::TokenStream> = named
+                            let serialized: Vec<&syn::Field> = named
                                 .named
                                 .iter()
                                 .filter(|field| !field_has_wire_skip(&field.attrs))
+                                .collect();
+                            let optional: Vec<&syn::Field> = serialized
+                                .iter()
+                                .copied()
+                                .filter(|field| is_option_type(&field.ty))
+                                .collect();
+                            // Exact, not an upper bound: length-prefixed formats
+                            // encode this count.
+                            let constant_count = serialized.len() - optional.len() + 1;
+                            let len_prelude = if optional.is_empty() {
+                                quote! { let __len = #constant_count; }
+                            } else {
+                                let increments = optional.iter().map(|field| {
+                                    let id = field.ident.as_ref().unwrap();
+                                    quote! {
+                                        if ::core::option::Option::is_some(#id) {
+                                            __len += 1;
+                                        }
+                                    }
+                                });
+                                quote! {
+                                    let mut __len = #constant_count;
+                                    #(#increments)*
+                                }
+                            };
+                            let entries: Vec<proc_macro2::TokenStream> = serialized
+                                .iter()
                                 .map(|field| {
                                     let id = field.ident.as_ref().unwrap();
                                     let key = id.to_string();
                                     if is_option_type(&field.ty) {
                                         quote! {
                                             if let ::core::option::Option::Some(__v) = #id {
-                                                ::serde::ser::SerializeMap::serialize_entry(
-                                                    &mut map, #key, __v
+                                                ::serde::ser::SerializeStruct::serialize_field(
+                                                    &mut __state, #key, __v
                                                 )?;
                                             }
                                         }
                                     } else {
                                         quote! {
-                                            ::serde::ser::SerializeMap::serialize_entry(
-                                                &mut map, #key, #id
+                                            ::serde::ser::SerializeStruct::serialize_field(
+                                                &mut __state, #key, #id
                                             )?;
                                         }
                                     }
                                 })
                                 .collect();
-                            quote! {
-                                #name::#id { #(#bindings),* } => {
-                                    #(#entries)*
-                                }
-                            }
+                            emit_arm(
+                                quote! { #name::#id { #(#bindings),* } },
+                                len_prelude,
+                                entries,
+                            )
                         }
-                        syn::Fields::Unnamed(_) => quote! {
-                            compile_error!("tagged WireEnum tuple variants require #[wire(content = \"...\")]");
+                        // Scoped to the offending variant so it cannot shadow
+                        // the arms that follow it.
+                        Fields::Unnamed(_) => quote! {
+                            #name::#id(..) => compile_error!("tagged WireEnum tuple variants require #[wire(content = \"...\")]")
                         },
                     }
                 }
@@ -1619,15 +1730,9 @@ fn expand_wire_enum_tagged(
                     &self,
                     serializer: S,
                 ) -> ::core::result::Result<S::Ok, S::Error> {
-                    use ::serde::ser::SerializeMap;
-                    let mut map = serializer.serialize_map(None)?;
-                    ::serde::ser::SerializeMap::serialize_entry(
-                        &mut map, #discriminator_lit, self.wire_tag()
-                    )?;
                     match self {
                         #(#serialize_arms,)*
                     }
-                    ::serde::ser::SerializeMap::end(map)
                 }
             }
         }

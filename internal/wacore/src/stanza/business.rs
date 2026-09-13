@@ -48,6 +48,18 @@ pub struct VerifiedName {
     pub certificate: Option<Vec<u8>>,
 }
 
+impl crate::stats::HeapSize for VerifiedName {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        [&self.name, &self.serial, &self.issuer]
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .map(HeapSize::heap_bytes)
+            .sum::<usize>()
+            + self.certificate.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
+}
+
 impl VerifiedName {
     pub fn try_from_node(node: &NodeRef<'_>) -> Result<Self> {
         use wacore_binary::NodeContentRef;
@@ -57,7 +69,7 @@ impl VerifiedName {
             .map(|s| s.into_owned())
             .or_else(|| {
                 node.get_optional_child_by_tag(&["name"])
-                    .and_then(|n| match n.content.as_deref() {
+                    .and_then(|n| match n.content.as_ref() {
                         Some(NodeContentRef::String(s)) => Some(s.to_string()),
                         _ => None,
                     })
@@ -72,7 +84,7 @@ impl VerifiedName {
             .attrs()
             .optional_string("issuer")
             .map(|s| s.into_owned());
-        let certificate = match node.content.as_deref() {
+        let certificate = match node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
             _ => None,
         };
@@ -279,7 +291,7 @@ impl BusinessNotification {
             for child in children {
                 if child.tag == "product"
                     && let Some(id_node) = child.get_optional_child_by_tag(&["id"])
-                    && let Some(NodeContentRef::String(id)) = id_node.content.as_deref()
+                    && let Some(NodeContentRef::String(id)) = id_node.content.as_ref()
                 {
                     product_ids.push(id.to_string());
                 } else if child.tag == "collection"
@@ -322,7 +334,7 @@ impl BusinessNotification {
                         child.attrs().optional_string("status"),
                     ) {
                         subscriptions.push(BusinessSubscription {
-                            id: id.to_string(),
+                            id: id.into(),
                             status: status.to_string(),
                             expiration_date: child
                                 .attrs()

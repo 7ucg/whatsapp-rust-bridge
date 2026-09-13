@@ -86,8 +86,8 @@ pub const fn companion_browser_name(ct: CompanionWebClientType) -> &'static str 
 pub const fn companion_web_client_type_for_platform(
     pt: wa::device_props::PlatformType,
 ) -> CompanionWebClientType {
-    use CompanionWebClientType as C;
     use wa::device_props::PlatformType as P;
+    use CompanionWebClientType as C;
     match pt {
         P::CHROME => C::Chrome,
         P::FIREFOX => C::Firefox,
@@ -111,7 +111,10 @@ pub const fn companion_web_client_type_for_platform(
         | P::AR_DEVICE
         | P::VR
         | P::CLOUD_API
-        | P::SMARTGLASSES => C::OtherWebClient,
+        | P::SMARTGLASSES
+        | P::WAIL
+        | P::WASS
+        | P::BUSINESS_BACK_OFFICE => C::OtherWebClient,
     }
 }
 
@@ -276,8 +279,8 @@ mod tests {
 
     #[test]
     fn browser_and_desktop_platform_types_map_to_their_variants() {
-        use CompanionWebClientType as C;
         use wa::device_props::PlatformType as P;
+        use CompanionWebClientType as C;
         for (pt, expected) in [
             (P::CHROME, C::Chrome),
             (P::FIREFOX, C::Firefox),
@@ -298,8 +301,8 @@ mod tests {
 
     #[test]
     fn android_platform_types_map_to_chrome() {
-        use CompanionWebClientType as C;
         use wa::device_props::PlatformType as P;
+        use CompanionWebClientType as C;
         for pt in [P::ANDROID_PHONE, P::ANDROID_TABLET, P::ANDROID_AMBIGUOUS] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),
@@ -311,8 +314,8 @@ mod tests {
 
     #[test]
     fn unconfirmed_platform_types_collapse_to_other() {
-        use CompanionWebClientType as C;
         use wa::device_props::PlatformType as P;
+        use CompanionWebClientType as C;
         for pt in [
             P::IPAD,
             P::IOS_PHONE,
@@ -327,6 +330,7 @@ mod tests {
             P::TCL_TV,
             P::CLOUD_API,
             P::SMARTGLASSES,
+            P::WAIL,
         ] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),
@@ -338,8 +342,8 @@ mod tests {
 
     #[test]
     fn proto_unknown_collapses_to_other_web_client() {
-        use CompanionWebClientType as C;
         use wa::device_props::PlatformType as P;
+        use CompanionWebClientType as C;
         assert_eq!(
             companion_web_client_type_for_platform(P::UNKNOWN),
             C::OtherWebClient,

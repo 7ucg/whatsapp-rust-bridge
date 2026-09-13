@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use zlib_rs::{Inflate, InflateError, InflateFlush, Status};
 
 /// zlib inflate wants a zlib header and the 32 KB LZ77 window.
@@ -7,16 +8,100 @@ const ZLIB_HEADER: bool = true;
 const WINDOW_BITS: u8 = 15;
 
 thread_local! {
-    static DECOMPRESSOR: RefCell<(Inflate, Vec<u8>)> = RefCell::new((
-        Inflate::new(ZLIB_HEADER, WINDOW_BITS),
-        Vec::with_capacity(4096),
-    ));
+    // Free-list of inflate state, shared by every inflate on this thread: the
+    // one-shot [`decompress_zlib_pooled`] and the streaming [`InflateReader`].
+    // zlib-rs allocates the state and its 32 KB window as one block of roughly
+    // 47.5 KB, so a thread that ran both paths used to retain two of them for
+    // the life of the process; one list means one.
+    //
+    // The output window is deliberately not part of the entry. It is the larger
+    // allocation of the two and costs one malloc to recreate, where zlib state
+    // costs an order of magnitude more, so retaining it bought little and left
+    // 64 KB alive per thread for the process's lifetime after a single sync.
+    static INFLATE_POOL: RefCell<Vec<Inflate>> = const { RefCell::new(Vec::new()) };
+}
 
-    // Free-list of streaming-reader state (inflate state ~48 KB + 64 KB buf). A
-    // connection's bootstrap history sync decompresses several blobs sequentially,
-    // each via a fresh `InflateReader`; reusing the state avoids re-initializing
-    // zlib and re-allocating the buffer per blob.
-    static INFLATE_POOL: RefCell<Vec<(Inflate, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+/// How many inflate states a thread parks between uses; see [`set_pool_retention`].
+static POOL_RETENTION: AtomicUsize = AtomicUsize::new(DEFAULT_POOL_RETENTION);
+
+/// One parked state per thread. Sequential inflates are the norm (a bootstrap
+/// history sync inflates its blobs one after another, a connection its
+/// compressed frames one at a time) and one parked entry is all that case ever
+/// checks out, so a deeper pool only retains another ~47.5 KB per slot, per
+/// thread that ever inflated anything, for the life of the process. Nested
+/// readers still work; they just build their state instead of finding it parked.
+const DEFAULT_POOL_RETENTION: usize = 1;
+
+/// Set how many inflate states each thread keeps parked between uses.
+///
+/// Every inflate on a thread first checks its pool and, finding it empty,
+/// builds a fresh state: one allocation of roughly 47.5 KB (zlib-rs allocates
+/// the state and its 32 KB window together). The default of one keeps that
+/// allocation resident on every thread that ever inflated anything, which is
+/// what a host with memory to spare wants. A client whose whole heap is a few
+/// hundred KB may prefer `0`: every inflate then pays the allocation and
+/// releases it, so the ~47.5 KB is only ever held while something is actually
+/// being inflated, at the cost of one large malloc per compressed frame.
+///
+/// Process-wide; takes effect on the next park. Lowering it does not evict
+/// states already parked, see [`drain_pool`].
+pub fn set_pool_retention(states_per_thread: usize) {
+    POOL_RETENTION.store(states_per_thread, Ordering::Relaxed);
+}
+
+/// Build this thread's inflate state ahead of its first compressed payload.
+///
+/// The state is one ~47.5 KB allocation, and a heap that fragments as a
+/// connection comes up may no longer have a hole that size by the time the
+/// first large compressed frame is already sitting in it. Calling this on the
+/// thread that will run the read loop, while the heap is still fresh, moves
+/// that allocation to a moment it is known to succeed; the pool then hands the
+/// same state to every inflate on this thread. A no-op when a state is already
+/// parked, or when [`set_pool_retention`] is zero, since nothing would keep it.
+pub fn warm_pool() {
+    if POOL_RETENTION.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let parked = INFLATE_POOL.with(|p| !p.borrow().is_empty());
+    if !parked {
+        park(Inflate::new(ZLIB_HEADER, WINDOW_BITS));
+    }
+}
+
+/// Release the inflate states this thread has parked, returning their memory.
+///
+/// The pool refills on the next inflate; this only matters on a target that
+/// needs the ~47.5 KB back between connections.
+pub fn drain_pool() {
+    INFLATE_POOL.with(|p| p.borrow_mut().clear());
+}
+
+/// Number of inflate states this thread currently keeps parked.
+pub fn parked_states() -> usize {
+    INFLATE_POOL.with(|p| p.borrow().len())
+}
+
+/// A reset inflate state: the thread's parked one when there is one, built
+/// otherwise. `reset` on checkout makes any prior stream state (including an
+/// error the last user hit) moot.
+fn checkout() -> Inflate {
+    INFLATE_POOL.with(|p| p.borrow_mut().pop()).map_or_else(
+        || Inflate::new(ZLIB_HEADER, WINDOW_BITS),
+        |mut decomp| {
+            decomp.reset(ZLIB_HEADER);
+            decomp
+        },
+    )
+}
+
+/// Return a state to this thread's pool, or drop it once the pool is full.
+fn park(decomp: Inflate) {
+    INFLATE_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < POOL_RETENTION.load(Ordering::Relaxed) {
+            pool.push(decomp);
+        }
+    });
 }
 
 /// Inflate straight into the vector's spare capacity, then extend its length by
@@ -54,6 +139,7 @@ pub struct InflateReader<'a> {
     decomp: Option<Inflate>,
     buf: Vec<u8>,
     cursor: usize,
+    chunk: usize,
     total_out: u64,
     max: u64,
     eof: bool,
@@ -61,36 +147,35 @@ pub struct InflateReader<'a> {
 }
 
 impl<'a> InflateReader<'a> {
-    /// Output decompress window per pump; also the compaction threshold.
-    const CHUNK: usize = 64 * 1024;
-    /// Keep one output window between sequential streams. The pump compacts a
-    /// consumed prefix before inflating, so a second window is only needed when
-    /// one individual record genuinely exceeds `CHUNK`.
-    const RETAINED_CAPACITY: usize = Self::CHUNK;
-    /// Cap on retained free-list entries, so concurrently-alive readers on one
-    /// thread don't grow the pool unbounded.
-    const POOL_MAX: usize = 4;
+    /// Output decompress window per pump; also the compaction threshold. One
+    /// window is the steady state: the pump compacts a consumed prefix before
+    /// inflating, so the buffer only grows past the chunk when one individual
+    /// record genuinely exceeds it. Allocated per reader, never retained.
+    ///
+    /// 64 KB suits the multi-megabyte history-sync blobs this reader was built
+    /// for, where each pump's fixed cost is worth amortizing; a reader over a
+    /// protocol frame on a small heap picks its own with [`Self::with_chunk`].
+    pub const CHUNK: usize = 64 * 1024;
 
     pub fn new(input: &'a [u8], max: u64) -> Self {
-        let (decomp, buf) = INFLATE_POOL.with(|p| p.borrow_mut().pop()).map_or_else(
-            || {
-                (
-                    Inflate::new(ZLIB_HEADER, WINDOW_BITS),
-                    Vec::with_capacity(Self::CHUNK),
-                )
-            },
-            |(mut decomp, mut buf)| {
-                decomp.reset(ZLIB_HEADER);
-                buf.clear();
-                (decomp, buf)
-            },
-        );
+        Self::with_chunk(input, max, Self::CHUNK)
+    }
+
+    /// A reader whose output window is `chunk` bytes instead of [`Self::CHUNK`].
+    ///
+    /// The window is the reader's one allocation of its own, so it is the
+    /// reader's whole footprint beyond the pooled zlib state: a 4 KB chunk
+    /// keeps a stream of small records inside 4 KB however long the stream
+    /// is. A record larger than the chunk still grows the window to fit it.
+    pub fn with_chunk(input: &'a [u8], max: u64, chunk: usize) -> Self {
+        let chunk = chunk.max(1);
         Self {
             input,
             in_pos: 0,
-            decomp: Some(decomp),
-            buf,
+            decomp: Some(checkout()),
+            buf: Vec::with_capacity(chunk),
             cursor: 0,
+            chunk,
             total_out: 0,
             max,
             eof: false,
@@ -171,7 +256,7 @@ impl<'a> InflateReader<'a> {
         // extend_from_slice would copy every decompressed byte a second time
         // (~10% of a history-sync extraction).
         if self.buf.len() == self.buf.capacity() {
-            self.buf.reserve(Self::CHUNK);
+            self.buf.reserve(self.chunk);
         }
         let prev_in = decomp.total_in();
         let prev_out = decomp.total_out();
@@ -221,26 +306,55 @@ impl<'a> InflateReader<'a> {
     }
 }
 
+impl InflateReader<'_> {
+    /// Inflate the rest of the stream into the window without consuming any of
+    /// it, then hand the window over: every decompressed byte from the first
+    /// one not yet consumed to the end of the stream, in one `Vec`.
+    ///
+    /// This is the one-shot [`decompress_zlib_pooled`] result reached from a
+    /// reader that has already looked at the head of the stream. The window is
+    /// grown by the expansion ratio observed so far rather than by doubling, as
+    /// the one-shot path does, so the prefix already inflated is what sizes the
+    /// rest. A stream that ends without its terminator is an error here, as it
+    /// is there: a caller draining to the end wants the whole payload or none.
+    pub fn read_to_end(mut self) -> io::Result<Vec<u8>> {
+        while !self.eof {
+            if self.buf.len() == self.buf.capacity() {
+                let cap = (self.max as usize).saturating_add(1);
+                if self.buf.len() >= cap {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("decompressed payload exceeds {} bytes", self.max),
+                    ));
+                }
+                let decomp = self
+                    .decomp
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("InflateReader used after pool return"))?;
+                grow_by_observed_ratio(&mut self.buf, decomp, self.input.len(), cap);
+            }
+            self.pump()?;
+        }
+        if !self.stream_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zlib stream truncated (no terminator)",
+            ));
+        }
+        let mut buf = std::mem::take(&mut self.buf);
+        if self.cursor != 0 {
+            buf.drain(..self.cursor);
+        }
+        Ok(buf)
+    }
+}
+
 impl Drop for InflateReader<'_> {
     fn drop(&mut self) {
-        // Return the decompressor + buffer to the per-thread free-list for reuse.
-        // `reset` on the next checkout makes prior stream state (incl. errors) moot.
+        // Return the decompressor to the per-thread free-list for reuse; the
+        // window goes back to the allocator with the rest of the reader.
         if let Some(decomp) = self.decomp.take() {
-            let mut buf = std::mem::take(&mut self.buf);
-            // A large top-level record (e.g. a big conversation, up to `max`) can
-            // grow `buf` to many MB; don't retain that allocation in the pool for
-            // the thread's lifetime. Keep the one-window steady-state used by
-            // framed streams, but shrink genuinely oversized records.
-            buf.clear();
-            if buf.capacity() > Self::RETAINED_CAPACITY {
-                buf.shrink_to(Self::RETAINED_CAPACITY);
-            }
-            INFLATE_POOL.with(|p| {
-                let mut pool = p.borrow_mut();
-                if pool.len() < Self::POOL_MAX {
-                    pool.push((decomp, buf));
-                }
-            });
+            park(decomp);
         }
     }
 }
@@ -279,90 +393,127 @@ fn grow_by_observed_ratio(
 
 /// Decompress zlib data using a pooled decompressor.
 ///
-/// Reuses the per-thread `zlib_rs::Inflate` internal state (~48 KB) across
-/// calls. The output buffer is taken by the caller (zero-copy), so it is sized
-/// up-front from the compressed length to avoid repeated doubling reallocations
-/// while it grows to the decompressed size.
+/// Reuses the per-thread `zlib_rs::Inflate` state (~47.5 KB) across calls; see
+/// [`set_pool_retention`]. The output buffer is returned to the caller
+/// (zero-copy), so it is sized up-front from the compressed length to avoid
+/// repeated doubling reallocations while it grows to the decompressed size.
 pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Vec<u8>> {
-    DECOMPRESSOR.with(|cell| {
-        let (decompressor, scratch) = &mut *cell.borrow_mut();
-        decompressor.reset(ZLIB_HEADER);
-        scratch.clear();
+    let mut decompressor = checkout();
+    let result = decompress_with(&mut decompressor, compressed, max_size);
+    park(decompressor);
+    result
+}
 
-        // Cap output growth to max_size + 1 so we detect oversized payloads
-        // without allocating unbounded memory from a compressed bomb.
-        let cap = (max_size as usize).saturating_add(1);
+fn decompress_with(
+    decompressor: &mut Inflate,
+    compressed: &[u8],
+    max_size: u64,
+) -> io::Result<Vec<u8>> {
+    // Cap output growth to max_size + 1 so we detect oversized payloads
+    // without allocating unbounded memory from a compressed bomb.
+    let cap = (max_size as usize).saturating_add(1);
 
-        // Pre-size the output near the likely decompressed size to avoid the
-        // repeated doubling reallocations the old 64 KB upper clamp forced for
-        // every multi-MB history-sync chunk. 2x the compressed length is a
-        // conservative first guess (zlib here compresses ~2-5x): it rarely
-        // overshoots the real size, so it cuts reallocations without inflating
-        // peak memory. Bounded by `cap` so a bad guess can't exceed the limit;
-        // the floor also bows to `cap` because callers now pass exact (possibly
-        // tiny) decompressed sizes as the limit, where a fixed 4096 floor would
-        // invert the clamp and panic.
-        let floor = 4096.min(cap);
-        let estimated = compressed.len().saturating_mul(2).clamp(floor, cap);
-        if scratch.capacity() < estimated {
-            scratch.reserve(estimated - scratch.capacity());
+    // Pre-size the output near the likely decompressed size to avoid the
+    // repeated doubling reallocations the old 64 KB upper clamp forced for
+    // every multi-MB history-sync chunk. 2x the compressed length is a
+    // conservative first guess (zlib here compresses ~2-5x): it rarely
+    // overshoots the real size, so it cuts reallocations without inflating
+    // peak memory. Bounded by `cap` so a bad guess can't exceed the limit;
+    // the floor also bows to `cap` because callers now pass exact (possibly
+    // tiny) decompressed sizes as the limit, where a fixed 4096 floor would
+    // invert the clamp and panic.
+    let floor = 4096.min(cap);
+    let estimated = compressed.len().saturating_mul(2).clamp(floor, cap);
+    let mut scratch = Vec::with_capacity(estimated);
+
+    let mut input_offset = 0;
+    loop {
+        // Enforce cap before we grow the buffer for the next inflate call
+        if scratch.len() >= cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("decompressed payload exceeds {max_size} bytes"),
+            ));
         }
 
-        let mut input_offset = 0;
-        loop {
-            // Enforce cap before we grow the buffer for the next inflate call
-            if scratch.len() >= cap {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("decompressed payload exceeds {max_size} bytes"),
-                ));
-            }
+        let prev_in = decompressor.total_in();
+        let prev_out = decompressor.total_out();
 
-            let prev_in = decompressor.total_in();
-            let prev_out = decompressor.total_out();
+        let status = inflate_into_spare(
+            decompressor,
+            &compressed[input_offset..],
+            &mut scratch,
+            InflateFlush::Finish,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.as_str()))?;
 
-            let status = inflate_into_spare(
-                decompressor,
-                &compressed[input_offset..],
-                scratch,
-                InflateFlush::Finish,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.as_str()))?;
+        input_offset = decompressor.total_in() as usize;
 
-            input_offset = decompressor.total_in() as usize;
-
-            if scratch.len() as u64 > max_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("decompressed payload exceeds {max_size} bytes"),
-                ));
-            }
-
-            match status {
-                Status::StreamEnd => break,
-                Status::Ok => {
-                    grow_by_observed_ratio(scratch, decompressor, compressed.len(), cap);
-                }
-                Status::BufError => {
-                    if decompressor.total_in() == prev_in && decompressor.total_out() == prev_out {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "zlib stream truncated (no progress)",
-                        ));
-                    }
-                    grow_by_observed_ratio(scratch, decompressor, compressed.len(), cap);
-                }
-            }
+        if scratch.len() as u64 > max_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("decompressed payload exceeds {max_size} bytes"),
+            ));
         }
 
-        // Move the Vec out (zero-copy), then restore scratch with fresh capacity.
-        // Callers (unpack_bytes, history_sync) wrap in Bytes::from() which takes
-        // ownership of the Vec's allocation, so no extra copy occurs.
-        let result = std::mem::take(scratch);
-        // Pre-allocate for next call so the first decompress_vec doesn't start at 0
-        scratch.reserve(4096);
-        Ok(result)
-    })
+        match status {
+            Status::StreamEnd => break,
+            Status::Ok => {
+                grow_by_observed_ratio(&mut scratch, decompressor, compressed.len(), cap);
+            }
+            Status::BufError => {
+                if decompressor.total_in() == prev_in && decompressor.total_out() == prev_out {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "zlib stream truncated (no progress)",
+                    ));
+                }
+                grow_by_observed_ratio(&mut scratch, decompressor, compressed.len(), cap);
+            }
+        }
+    }
+
+    Ok(scratch)
+}
+
+/// Fixture support shared by this crate's test modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A zlib stream carrying `data` verbatim in stored (uncompressed) deflate
+    /// blocks, hand-built so the fixture costs no compressor.
+    ///
+    /// A real compressor cannot be used under Miri: zlib-rs's *deflate* state
+    /// frees its buffers from `deflate::end` while a `&mut` into them is still
+    /// protected, which Miri rejects. That is the compression half, which this
+    /// crate never runs (inflate is the whole production path), so the fixture
+    /// side steps around it rather than the tests being dropped from the
+    /// Miri gate. Blocks are 64 KB at most, so longer data spans several.
+    pub(crate) fn stored_zlib(data: &[u8]) -> Vec<u8> {
+        // 0x78 0x01: deflate, 32 KB window, and (0x78 << 8 | 0x01) % 31 == 0 as
+        // the header check requires.
+        let mut out = vec![0x78, 0x01];
+        let mut blocks = data.chunks(u16::MAX as usize).peekable();
+        if blocks.peek().is_none() {
+            out.extend_from_slice(&[0x01, 0, 0, 0xff, 0xff]);
+        }
+        while let Some(block) = blocks.next() {
+            let len = block.len() as u16;
+            // BFINAL on the last block, BTYPE=00 (stored), then the
+            // byte-aligned LEN/!LEN pair.
+            out.push(u8::from(blocks.peek().is_none()));
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(block);
+        }
+
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend_from_slice(&(((b << 16) | a).to_be_bytes()));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -390,7 +541,26 @@ mod tests {
             .collect()
     }
 
+    use super::test_support::stored_zlib;
+
+    // Tests sized in hundreds of KB to MB reach window refill and the growth
+    // projection, which puts a full inflate cycle hours out of reach of Miri's
+    // interpreter, so those are `#[cfg_attr(miri, ignore)]`. This one and the
+    // truncated/corrupt pair keep the `set_len` in `inflate_into_spare` under
+    // Miri on fixtures it can finish.
     #[test]
+    fn pooled_roundtrip_small_input() {
+        let original = varied(1024);
+        let compressed = stored_zlib(&original);
+        assert_eq!(
+            decompress_zlib_pooled(&compressed, 64 * 1024).unwrap(),
+            original
+        );
+        assert_eq!(drain_reader(&compressed, original.len()), original);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_roundtrip_across_chunks() {
         // >128 KB so the stream spans multiple 64 KB decompress windows, and read
         // it back in tiny odd steps to exercise refill + compaction.
@@ -408,6 +578,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_ensure_larger_than_chunk() {
         // A single record bigger than the 64 KB window must be fully buffered.
         let original: Vec<u8> = (0..150 * 1024).map(|i| (i % 256) as u8).collect();
@@ -418,8 +589,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_keeps_one_window_for_smaller_records() {
-        INFLATE_POOL.with(|p| p.borrow_mut().clear());
         const RECORD: usize = 30 * 1024;
         let original = varied(RECORD * 8);
         let compressed = zlib(&original);
@@ -440,6 +611,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_enforces_max() {
         let original = vec![0u8; 1024 * 1024];
         let compressed = zlib(&original);
@@ -448,6 +620,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn pooled_high_ratio_stream_roundtrips() {
         // ~50x expansion: the 2x up-front guess undershoots badly, so this
         // exercises the ratio-projected growth path end to end.
@@ -470,6 +643,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn pooled_oneshot_matches_streaming() {
         let original = varied(100_000);
         let compressed = zlib(&original);
@@ -490,6 +664,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_reuses_pool_state_correctly() {
         // Back-to-back readers each checkout the pooled Decompress and reset it, so
         // no state may carry over between streams. Verify several sizes in sequence.
@@ -500,6 +675,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_reader_reuse_after_error() {
         // A reader aborted mid-stream (max exceeded) returns partial zlib state to
         // the pool; the next checkout must reset it and decompress a full stream.
@@ -513,11 +689,11 @@ mod tests {
     }
 
     #[test]
-    fn drop_shrinks_oversized_buffer_before_pooling() {
-        // Buffering a large record grows `buf` to many MB; on return to the pool it
-        // must be shrunk back toward the bounded steady-state capacity, not parked
-        // at full size for the thread.
-        INFLATE_POOL.with(|p| p.borrow_mut().clear());
+    #[cfg_attr(miri, ignore)]
+    fn oversized_window_is_not_retained_for_the_thread() {
+        // Buffering a large record grows `buf` to many MB. The window is not part
+        // of a pool entry, so the next reader starts back at one window instead of
+        // inheriting the grown allocation.
         let big = varied(2 * 1024 * 1024);
         let compressed = zlib(&big);
         {
@@ -525,10 +701,191 @@ mod tests {
             assert!(r.ensure(big.len()).unwrap());
             assert!(r.buf.capacity() >= big.len(), "buf should grow while alive");
         }
-        let pooled = INFLATE_POOL.with(|p| p.borrow().last().map(|(_, b)| b.capacity()));
+        let next = InflateReader::new(&compressed, 64 * 1024 * 1024);
         assert!(
-            matches!(pooled, Some(cap) if cap <= InflateReader::RETAINED_CAPACITY),
-            "pooled buffer not shrunk: {pooled:?}"
+            next.buf.capacity() <= InflateReader::CHUNK,
+            "fresh reader inherited a {} byte window",
+            next.buf.capacity()
         );
+    }
+
+    /// Truncation is reported as EOF without a terminator, not as an error, and
+    /// the reader that picks the pooled state up next still decodes a full stream.
+    #[test]
+    fn truncated_stream_reports_missing_terminator() {
+        let original = varied(1024);
+        let compressed = stored_zlib(&original);
+        let truncated = &compressed[..compressed.len() - 300];
+
+        let mut r = InflateReader::new(truncated, 64 * 1024);
+        while r.ensure(1).unwrap() {
+            let n = r.available().len();
+            r.consume(n);
+        }
+        assert!(!r.stream_ended(), "truncated input reported a terminator");
+        assert!(r.is_done());
+        drop(r);
+
+        assert_eq!(drain_reader(&compressed, original.len()), original);
+    }
+
+    /// A corrupt stream fails with `InvalidData` and returns its half-used state
+    /// to the pool; the next checkout must reset it rather than inherit the fault.
+    #[test]
+    fn corrupt_stream_errors_without_poisoning_the_pool() {
+        let original = varied(1024);
+        let mut compressed = stored_zlib(&original);
+        // Break the stored block's LEN/!LEN complement pair, which inflate
+        // rejects outright rather than mis-decoding.
+        compressed[5] ^= 0xff;
+
+        let mut r = InflateReader::new(&compressed, 64 * 1024);
+        let err = r.ensure(1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        drop(r);
+
+        let good = stored_zlib(&original);
+        assert_eq!(drain_reader(&good, original.len()), original);
+    }
+
+    /// The pool is thread-local but its retention is process-wide, so the tests
+    /// that observe either take this lock: `cargo test` runs them on threads.
+    static POOL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// One parked state serves both inflate paths on a thread. A thread that
+    /// ran both used to hold two ~47.5 KB states for the life of the process.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn one_shot_and_streaming_inflate_share_one_parked_state() {
+        let _guard = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_pool();
+        let original = varied(50_000);
+        let compressed = zlib(&original);
+
+        assert_eq!(
+            decompress_zlib_pooled(&compressed, 1 << 20).unwrap(),
+            original
+        );
+        assert_eq!(parked_states(), 1);
+        assert_eq!(drain_reader(&compressed, original.len()), original);
+        assert_eq!(parked_states(), 1);
+        assert_eq!(
+            decompress_zlib_pooled(&compressed, 1 << 20).unwrap(),
+            original
+        );
+        assert_eq!(
+            parked_states(),
+            1,
+            "a second path must not park a second state"
+        );
+    }
+
+    /// Retention zero: nothing is parked, `warm_pool` has nothing to do, and
+    /// both paths still inflate correctly on a fresh state each time.
+    ///
+    /// Not under Miri: this is the one test that drops an `Inflate`, and
+    /// zlib-rs 0.6.7's `inflate::end` frees the state from behind a `&mut`
+    /// into it, the same shape as the deflate half `stored_zlib` exists to
+    /// avoid. Every other test parks its state instead.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn retention_zero_parks_nothing() {
+        let _guard = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_pool();
+        set_pool_retention(0);
+        let original = varied(1024);
+        let compressed = stored_zlib(&original);
+
+        warm_pool();
+        assert_eq!(parked_states(), 0);
+        assert_eq!(
+            decompress_zlib_pooled(&compressed, 64 * 1024).unwrap(),
+            original
+        );
+        assert_eq!(parked_states(), 0);
+        assert_eq!(drain_reader(&compressed, original.len()), original);
+        assert_eq!(parked_states(), 0);
+
+        set_pool_retention(DEFAULT_POOL_RETENTION);
+        warm_pool();
+        assert_eq!(parked_states(), 1);
+        warm_pool();
+        assert_eq!(parked_states(), 1, "warming twice must not park twice");
+        drain_pool();
+        assert_eq!(parked_states(), 0);
+    }
+
+    /// A reader that looked at the head of a stream can still hand over the
+    /// whole payload, and it is the same payload the one-shot path produces.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn read_to_end_after_a_peek_matches_the_one_shot_result() {
+        let original = varied(300_000);
+        let compressed = zlib(&original);
+
+        let mut r = InflateReader::with_chunk(&compressed, 1 << 24, 4096);
+        assert!(r.ensure(100).unwrap());
+        assert_eq!(&r.available()[..100], &original[..100]);
+        let whole = r.read_to_end().unwrap();
+        assert_eq!(whole, original);
+        assert_eq!(whole, decompress_zlib_pooled(&compressed, 1 << 24).unwrap());
+        assert!(
+            whole.capacity() < original.len() * 2,
+            "drain grew by doubling ({}) instead of by the observed ratio",
+            whole.capacity()
+        );
+
+        // A consumed prefix is not part of what comes back.
+        let mut r = InflateReader::with_chunk(&compressed, 1 << 24, 4096);
+        assert!(r.ensure(100).unwrap());
+        r.consume(100);
+        assert_eq!(r.read_to_end().unwrap(), &original[100..]);
+    }
+
+    #[test]
+    fn read_to_end_rejects_a_truncated_stream_and_the_max() {
+        let original = varied(1024);
+        let compressed = stored_zlib(&original);
+        let truncated = &compressed[..compressed.len() - 300];
+        let err = InflateReader::with_chunk(truncated, 64 * 1024, 256)
+            .read_to_end()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let err = InflateReader::with_chunk(&compressed, 512, 256)
+            .read_to_end()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        assert_eq!(
+            InflateReader::with_chunk(&compressed, 64 * 1024, 256)
+                .read_to_end()
+                .unwrap(),
+            original
+        );
+    }
+
+    /// A small chunk bounds the window for a stream of small records: the
+    /// footprint of streaming a frame on a small heap is the chunk, not the
+    /// decompressed size.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_small_chunk_keeps_small_records_within_the_chunk() {
+        const RECORD: usize = 100;
+        const CHUNK: usize = 4096;
+        let original = varied(RECORD * 2000);
+        let compressed = zlib(&original);
+        let mut r = InflateReader::with_chunk(&compressed, 1 << 24, CHUNK);
+        for expected in original.chunks(RECORD) {
+            assert!(r.ensure(expected.len()).unwrap());
+            assert_eq!(&r.available()[..expected.len()], expected);
+            r.consume(expected.len());
+            assert!(
+                r.buf.capacity() <= CHUNK,
+                "window grew to {}",
+                r.buf.capacity()
+            );
+        }
+        assert!(!r.ensure(1).unwrap());
     }
 }

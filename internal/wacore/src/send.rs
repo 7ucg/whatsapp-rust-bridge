@@ -11,7 +11,7 @@ use crate::reporting_token::{
 };
 use crate::runtime::{AbortHandle, Runtime};
 use crate::types::jid::JidExt;
-use crate::types::jid::make_sender_key_name;
+use crate::types::jid::make_sender_key_name_for_jid;
 use crate::types::message::PeerMessageOptions;
 use anyhow::{Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -76,7 +76,7 @@ pub use dm::*;
 pub use encrypt::*;
 pub use group::*;
 pub use peer::*;
-pub use resolved_devices::ResolvedGroupDevices;
+pub use resolved_devices::{DmSignalAddressing, ResolvedDmDevices, ResolvedGroupDevices};
 pub use status::*;
 
 #[cfg(test)]

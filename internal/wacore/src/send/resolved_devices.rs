@@ -1,4 +1,5 @@
-//! Resolved group device set with its lazily memoized phash.
+//! Resolved device sets (group fan-out and DM fan-out) with their lazily
+//! memoized phash.
 
 use crate::messages::MessageUtils;
 use std::sync::OnceLock;
@@ -18,7 +19,11 @@ use wacore_binary::jid::Jid;
 /// A phash is 10 bytes ("2:" + 8 base64 chars), inline in `CompactString`:
 /// serving a warm send costs a pointer-free copy, no allocation.
 pub struct ResolvedGroupDevices {
-    devices: Vec<Jid>,
+    /// Frozen at construction: the set never changes afterwards (a topology
+    /// change produces a new memo entry, not a mutation), so the boxed slice
+    /// hands back the growth capacity the fan-out build over-reserved instead
+    /// of parking it for the life of the group.
+    devices: Box<[Jid]>,
     /// `(sending jid, phash)`. The jid pins the only other input, so a
     /// change of sending identity (PN/LID mode flip, re-pair) can never be
     /// served a stale hash; it recomputes without overwriting.
@@ -27,7 +32,7 @@ pub struct ResolvedGroupDevices {
 
 impl crate::stats::HeapSize for ResolvedGroupDevices {
     fn heap_bytes(&self) -> usize {
-        self.devices.capacity() * size_of::<Jid>()
+        self.devices.len() * size_of::<Jid>()
             + self.devices.iter().map(|j| j.heap_bytes()).sum::<usize>()
             + self
                 .phash
@@ -39,7 +44,7 @@ impl crate::stats::HeapSize for ResolvedGroupDevices {
 impl ResolvedGroupDevices {
     pub fn new(devices: Vec<Jid>) -> Self {
         Self {
-            devices,
+            devices: devices.into_boxed_slice(),
             phash: OnceLock::new(),
         }
     }
@@ -69,12 +74,168 @@ impl ResolvedGroupDevices {
     fn compute(devices: &[Jid], own_sending_jid: &Jid) -> Option<CompactString> {
         let set = super::group::build_group_phash_set(devices, own_sending_jid);
         match MessageUtils::participant_list_hash(&set) {
-            Ok(phash) => Some(CompactString::from(phash)),
+            Ok(phash) => Some(phash),
             Err(e) => {
                 log::warn!("Failed to compute group phash: {e:?}");
                 None
             }
         }
+    }
+}
+
+/// The resolved DM fan-out: the recipient's devices plus our own companion
+/// devices, already partitioned for encryption, bundled with a memo of the
+/// `phash` derived from them.
+///
+/// Unlike [`ResolvedGroupDevices`] the phash needs no key: the sending
+/// identity is the only other input to both the partition and the hash, and
+/// the per-recipient memo entry that owns this struct pins it (a re-pair or a
+/// newly known own LID produces a new entry, and so a new cold instance). The
+/// stored set is already sender-excluded, so the hash is a pure function of
+/// the stored devices.
+pub struct ResolvedDmDevices {
+    partitioned: super::dm::PartitionedDmDevices,
+    phash: OnceLock<CompactString>,
+    /// Resolved once per memo entry, like the phash, and under the same
+    /// contract: a PN→LID mapping learned for any member of this fan-out
+    /// bumps the topology generation the entry is stamped with, so the entry
+    /// (and this cell with it) is rebuilt rather than served stale.
+    signal: OnceLock<DmSignalAddressing>,
+}
+
+/// The Signal addresses of one DM fan-out.
+///
+/// A device is encrypted to under its LID whenever the mapping is known (WA
+/// Web's `SignalAddress.toString()`), and a warm send resolved that mapping
+/// three times per device on its way to the wire: once for the session
+/// pre-check, once for the lock keys, once in the encrypt fan-out. Each was a
+/// cache lookup plus a `Jid` clone. Resolving once and memoizing beside the
+/// device set removes the repeats and the per-send sort of the lock keys.
+pub struct DmSignalAddressing {
+    /// Parallel to [`ResolvedDmDevices::devices`]: the address device `i`
+    /// encrypts under, which is the device itself when no upgrade applies.
+    encryption: Box<[Jid]>,
+    /// [`Self::encryption`] sorted and deduplicated in lock order, the one
+    /// order every session-lock acquisition must use.
+    lock_keys: Box<[Jid]>,
+}
+
+impl DmSignalAddressing {
+    /// `encryption` must be parallel to the device set this is memoized on;
+    /// [`ResolvedDmDevices::signal_addressing_or_init`] refuses any other
+    /// length, and a consumer treats one as "not memoized".
+    pub fn new(encryption: Vec<Jid>, lock_keys: Vec<Jid>) -> Self {
+        Self {
+            encryption: encryption.into_boxed_slice(),
+            lock_keys: lock_keys.into_boxed_slice(),
+        }
+    }
+
+    pub fn encryption(&self) -> &[Jid] {
+        &self.encryption
+    }
+
+    pub fn lock_keys(&self) -> &[Jid] {
+        &self.lock_keys
+    }
+}
+
+impl crate::stats::HeapSize for DmSignalAddressing {
+    fn heap_bytes(&self) -> usize {
+        (self.encryption.len() + self.lock_keys.len()) * size_of::<Jid>()
+            + self
+                .encryption
+                .iter()
+                .chain(self.lock_keys.iter())
+                .map(|j| j.heap_bytes())
+                .sum::<usize>()
+    }
+}
+
+impl crate::stats::HeapSize for ResolvedDmDevices {
+    fn heap_bytes(&self) -> usize {
+        self.partitioned.heap_bytes()
+            + self.phash.get().map_or(0, |p| p.heap_bytes())
+            + self.signal.get().map_or(0, |s| s.heap_bytes())
+    }
+}
+
+impl ResolvedDmDevices {
+    /// Partition `all_devices` into recipient devices and own companions,
+    /// dropping the sending device itself. `all_devices` must already be the
+    /// hosted-filtered, deduplicated fan-out set.
+    pub fn new(all_devices: Vec<Jid>, own_jid: &Jid, own_lid: Option<&Jid>) -> Self {
+        Self {
+            partitioned: super::dm::partition_dm_devices(all_devices, own_jid, own_lid),
+            phash: OnceLock::new(),
+            signal: OnceLock::new(),
+        }
+    }
+
+    /// The memoized Signal addressing, if a send has resolved it.
+    pub fn signal_addressing(&self) -> Option<&DmSignalAddressing> {
+        self.signal.get()
+    }
+
+    /// Memoize `addressing`, or return what an earlier send memoized. The
+    /// caller resolved it from this same immutable device set, so whichever
+    /// racer wins the cell holds the same answer.
+    ///
+    /// Refused, and handed back, when `addressing` does not carry one address
+    /// per device: such a list cannot be indexed by device, and a memo entry
+    /// lives across sends, so a malformed one must never be installed. The
+    /// caller may still use the returned value for its own send.
+    pub fn signal_addressing_or_init(
+        &self,
+        addressing: DmSignalAddressing,
+    ) -> Result<&DmSignalAddressing, DmSignalAddressing> {
+        if addressing.encryption().len() != self.devices().len() {
+            return Err(addressing);
+        }
+        Ok(self.signal.get_or_init(|| addressing))
+    }
+
+    /// Every device the stanza encrypts for, in partition order.
+    pub fn devices(&self) -> &[Jid] {
+        self.partitioned.valid_devices()
+    }
+
+    /// The recipient partition, preceding own companions in [`Self::devices`].
+    pub fn recipient_devices(&self) -> &[Jid] {
+        self.partitioned.recipient_devices()
+    }
+
+    /// Our PN/LID companions, excluding the sending device itself.
+    pub fn own_other_devices(&self) -> &[Jid] {
+        self.partitioned.own_other_devices()
+    }
+
+    /// The DM phash over the sent device set: a memo hit is an inline copy.
+    pub fn phash(&self) -> Option<CompactString> {
+        if let Some(hash) = self.phash.get() {
+            return Some(hash.clone());
+        }
+        let hash = match MessageUtils::participant_list_hash(self.devices()) {
+            Ok(phash) => phash,
+            Err(e) => {
+                log::warn!("Failed to compute DM phash: {e:?}");
+                return None;
+            }
+        };
+        // Benign race: both racers computed the same value from the same
+        // immutable set, so whichever wins the cell is the right one.
+        let _ = self.phash.set(hash.clone());
+        Some(hash)
+    }
+}
+
+impl std::fmt::Debug for ResolvedDmDevices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedDmDevices")
+            .field("devices", &self.devices().len())
+            .field("recipients", &self.recipient_devices().len())
+            .field("phash_warm", &self.phash.get().is_some())
+            .finish()
     }
 }
 

@@ -1,23 +1,70 @@
 use crate::error::{BinaryError, Result};
-use crate::jid::{JidRef, push_jid_to_compact};
+use crate::jid::{JidRef, jid_ref_to_compact};
 use crate::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef};
 use crate::token;
 use compact_str::CompactString;
 use std::borrow::Cow;
-#[cfg(feature = "simd")]
-use std::simd::{Simd, prelude::*, u8x16};
 
-/// Format a JidRef directly into CompactString using direct push operations,
-/// bypassing `fmt::Display` and `dyn Write` dispatch entirely.
-fn jid_ref_to_compact(j: &JidRef<'_>) -> CompactString {
-    let mut s = CompactString::with_capacity(j.user.len() + 20);
-    push_jid_to_compact(&j.user, j.server, j.agent, j.device, &mut s);
-    s
-}
+/// Each byte's two output characters, so unpacking is one load and one 2-byte
+/// store per input byte instead of two shifts, two lookups and two bounds
+/// checks. Packed values on the wire (a 13-digit phone number, a 20-character
+/// id) are shorter than the SIMD chunk above, so this is the path that runs.
+static HEX_PAIRS: [[u8; 2]; 256] = {
+    const HEX: [u8; 16] = *b"0123456789ABCDEF";
+    let mut table = [[0u8; 2]; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = [HEX[i >> 4], HEX[i & 0x0F]];
+        i += 1;
+    }
+    table
+};
+
+/// Nibble values 12, 13 and 14 encode nothing, so they are marked and the byte
+/// carrying one falls back to the scalar path, which reports which half was
+/// bad. `NIBBLE_INVALID` cannot collide with an output character.
+const NIBBLE_INVALID: u8 = 0xFF;
+static NIBBLE_PAIRS: [[u8; 2]; 256] = {
+    const fn glyph(nibble: usize) -> u8 {
+        match nibble {
+            0..=9 => b'0' + nibble as u8,
+            10 => b'-',
+            11 => b'.',
+            15 => 0,
+            _ => NIBBLE_INVALID,
+        }
+    }
+    let mut table = [[0u8; 2]; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = [glyph(i >> 4), glyph(i & 0x0F)];
+        i += 1;
+    }
+    table
+};
 
 /// Node-nesting cap rejecting deep-`LIST` frames that would overflow the stack via
 /// unbounded `read_node_ref` recursion (real WA trees are well under 20 levels).
-const MAX_NODE_DEPTH: usize = 128;
+pub(crate) const MAX_NODE_DEPTH: usize = 128;
+
+/// A node's head as [`Decoder::read_node_open`] decodes it, its children left
+/// in the input.
+pub(crate) struct NodeOpen<'a> {
+    pub(crate) tag: NodeStr<'a>,
+    pub(crate) attrs: AttrsRef<'a>,
+    pub(crate) content: OpenContent<'a>,
+}
+
+/// What follows a node's attributes on the wire.
+#[derive(Debug, PartialEq)]
+pub enum OpenContent<'a> {
+    /// Nothing, or an empty list.
+    None,
+    /// A list of this many child nodes, each still to be decoded.
+    Children(usize),
+    /// A string or a byte payload: decoded whole, since it has no parts.
+    Scalar(NodeContentRef<'a>),
+}
 
 pub(crate) struct Decoder<'a> {
     data: &'a [u8],
@@ -166,7 +213,13 @@ impl<'a> Decoder<'a> {
         Ok(JidRef {
             user,
             server,
-            agent,
+            // The domain byte is not an agent — it is `server` in wire form, and
+            // `write_jid_*` re-derives it from `server` on the way out. Keeping a
+            // second copy here put a field in the derived `PartialEq`/`Hash` that
+            // only wire-decoded JIDs ever carry, so the same JID compared unequal
+            // depending on whether it came off the wire or out of the store (which
+            // holds JIDs as text, where `Display` suppresses the agent anyway).
+            agent: 0,
             device,
             integrator: 0,
         })
@@ -322,101 +375,54 @@ impl<'a> Decoder<'a> {
             pos -= 1;
         }
 
-        // All output bytes are ASCII, so from_utf8 cannot fail.
-        let s = std::str::from_utf8(&buf[..pos]).expect("packed decode produced non-ASCII");
+        // Unlike `read_string`, which validates bytes that came off the wire,
+        // this validates bytes the tables above just wrote, so it can never
+        // fail. Keeping a check at all is cheap insurance against a future
+        // table edit; smoothutf8 is the same validator the wire path uses.
+        let s = smoothutf8::from_utf8(&buf[..pos]).expect("packed decode produced non-ASCII");
         Ok(CompactString::from(s))
     }
 
+    // Deliberately scalar. A vectorised version of this loop lived here until
+    // it was measured against the table: `HEX_PAIRS[byte]` is one 2-byte load
+    // per input byte, and a shuffle/interleave/store sequence does not beat
+    // that. Under callgrind the SIMD path cost 4.5% more instructions on a
+    // 20-character id and 9.7% more on a 32-character one, and enabling real
+    // `pshufb` (`-Ctarget-cpu=x86-64-v2`) only narrowed the loss to 7.0%.
+    // Packed payloads are ids and phone numbers, so the loop also needed a
+    // 31-character string before it engaged at all.
     #[inline]
     fn decode_packed_hex(packed_data: &[u8], out: &mut [u8], pos: &mut usize) {
-        #[cfg(feature = "simd")]
-        let packed_data = {
-            const HEX_LOOKUP: [u8; 16] = *b"0123456789ABCDEF";
-            let lookup_table = Simd::from_array(HEX_LOOKUP);
-            let low_mask = Simd::splat(0x0F);
-
-            let (chunks, remainder) = packed_data.as_chunks::<16>();
-            for chunk in chunks {
-                let data = u8x16::from_array(*chunk);
-                let high_nibbles = (data >> 4) & low_mask;
-                let low_nibbles = data & low_mask;
-                let high_chars = lookup_table.swizzle_dyn(high_nibbles);
-                let low_chars = lookup_table.swizzle_dyn(low_nibbles);
-                let (lo, hi) = Simd::interleave(high_chars, low_chars);
-                out[*pos..*pos + 16].copy_from_slice(lo.as_array());
-                *pos += 16;
-                out[*pos..*pos + 16].copy_from_slice(hi.as_array());
-                *pos += 16;
-            }
-            remainder
-        };
-
-        for &byte in packed_data {
-            let high = (byte & 0xF0) >> 4;
-            let low = byte & 0x0F;
-            out[*pos] = Self::unpack_hex(high);
-            *pos += 1;
-            out[*pos] = Self::unpack_hex(low);
-            *pos += 1;
+        let written = packed_data.len() * 2;
+        for (slot, &byte) in out[*pos..*pos + written]
+            .chunks_exact_mut(2)
+            .zip(packed_data)
+        {
+            slot.copy_from_slice(&HEX_PAIRS[byte as usize]);
         }
+        *pos += written;
     }
 
+    // Scalar for the same reason as `decode_packed_hex`, and more so: the
+    // vector version had to validate every lane against the two legal
+    // out-of-range nibbles before it could shuffle, then fall back to this
+    // loop anyway whenever a lane failed.
     #[inline]
     fn decode_packed_nibble(packed_data: &[u8], out: &mut [u8], pos: &mut usize) -> Result<()> {
-        #[cfg(feature = "simd")]
-        let packed_data = {
-            const NIBBLE_LOOKUP: [u8; 16] = *b"0123456789-.\x00\x00\x00\x00";
-            let lookup_table = Simd::from_array(NIBBLE_LOOKUP);
-            let low_mask = Simd::splat(0x0F);
-            let le11 = Simd::splat(11);
-            let f15 = Simd::splat(15);
-
-            let (chunks, remainder) = packed_data.as_chunks::<16>();
-            for chunk in chunks {
-                let data = u8x16::from_array(*chunk);
-
-                let high_nibbles = (data >> 4) & low_mask;
-                let low_nibbles = data & low_mask;
-
-                let hi_valid = high_nibbles.simd_le(le11) | high_nibbles.simd_eq(f15);
-                let lo_valid = low_nibbles.simd_le(le11) | low_nibbles.simd_eq(f15);
-                if !(hi_valid & lo_valid).all() {
-                    for byte in *chunk {
-                        let high = (byte & 0xF0) >> 4;
-                        let low = byte & 0x0F;
-                        Self::unpack_nibble(high)?;
-                        Self::unpack_nibble(low)?;
-                    }
-                    for byte in *chunk {
-                        let high = (byte & 0xF0) >> 4;
-                        let low = byte & 0x0F;
-                        out[*pos] = Self::unpack_nibble(high)?;
-                        *pos += 1;
-                        out[*pos] = Self::unpack_nibble(low)?;
-                        *pos += 1;
-                    }
-                    continue;
-                }
-
-                let high_chars = lookup_table.swizzle_dyn(high_nibbles);
-                let low_chars = lookup_table.swizzle_dyn(low_nibbles);
-                let (lo, hi) = Simd::interleave(high_chars, low_chars);
-                out[*pos..*pos + 16].copy_from_slice(lo.as_array());
-                *pos += 16;
-                out[*pos..*pos + 16].copy_from_slice(hi.as_array());
-                *pos += 16;
+        let written = packed_data.len() * 2;
+        for (slot, &byte) in out[*pos..*pos + written]
+            .chunks_exact_mut(2)
+            .zip(packed_data)
+        {
+            let pair = NIBBLE_PAIRS[byte as usize];
+            if pair[0] == NIBBLE_INVALID || pair[1] == NIBBLE_INVALID {
+                // Report the bad half in the order the byte carries it.
+                Self::unpack_nibble((byte & 0xF0) >> 4)?;
+                Self::unpack_nibble(byte & 0x0F)?;
             }
-            remainder
-        };
-
-        for &byte in packed_data {
-            let high = (byte & 0xF0) >> 4;
-            let low = byte & 0x0F;
-            out[*pos] = Self::unpack_nibble(high)?;
-            *pos += 1;
-            out[*pos] = Self::unpack_nibble(low)?;
-            *pos += 1;
+            slot.copy_from_slice(&pair);
         }
+        *pos += written;
 
         Ok(())
     }
@@ -429,15 +435,6 @@ impl<'a> Decoder<'a> {
             11 => Ok(b'.'),
             15 => Ok(0),
             _ => Err(BinaryError::InvalidToken(value)),
-        }
-    }
-
-    #[inline(always)]
-    fn unpack_hex(value: u8) -> u8 {
-        match value {
-            0..=9 => b'0' + value,
-            10..=15 => b'A' + value - 10,
-            _ => unreachable!("hex nibble validated by 4-bit mask"),
         }
     }
 
@@ -457,11 +454,6 @@ impl<'a> Decoder<'a> {
             v.push((key, value));
         }
         Ok(AttrsRef::from_vec(v))
-    }
-
-    fn read_content(&mut self, depth: usize) -> Result<Option<NodeContentRef<'a>>> {
-        let tag = self.read_u8()?;
-        self.read_content_from_tag(tag, depth)
     }
 
     #[inline(always)]
@@ -513,12 +505,18 @@ impl<'a> Decoder<'a> {
         self.read_node_ref_at(0)
     }
 
-    fn read_node_ref_at(&mut self, depth: usize) -> Result<NodeRef<'a>> {
-        // Reject before recursing, so a hostile deep-LIST frame errors instead of
-        // aborting the process on a stack overflow.
-        if depth >= MAX_NODE_DEPTH {
-            return Err(BinaryError::MaxDepthExceeded);
-        }
+    /// Bytes consumed so far: what a caller feeding this decoder from a larger
+    /// buffer has to drop once it is done with what was decoded.
+    #[inline]
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Decode a node's head only: tag, attributes and what its content is,
+    /// leaving any child nodes unread for the caller to decode one at a time.
+    /// The counterpart of [`Self::read_node_ref_at`] for a node too large to
+    /// hold as a tree; it reads exactly the bytes that precede the first child.
+    pub(crate) fn read_node_open(&mut self) -> Result<NodeOpen<'a>> {
         let tag = self.read_u8()?;
         let list_size = self.read_list_size(tag)?;
         if list_size == 0 {
@@ -534,14 +532,187 @@ impl<'a> Decoder<'a> {
 
         let attrs = self.read_attributes(attr_count)?;
         let content = if has_content {
-            self.read_content(depth)?.map(Box::new)
+            let content_tag = self.read_u8()?;
+            match content_tag {
+                token::LIST_EMPTY => OpenContent::None,
+                token::LIST_8 | token::LIST_16 => {
+                    OpenContent::Children(self.read_list_size(content_tag)?)
+                }
+                // Depth 0 is fine: a scalar never recurses.
+                _ => match self.read_content_from_tag(content_tag, 0)? {
+                    Some(scalar) => OpenContent::Scalar(scalar),
+                    None => OpenContent::None,
+                },
+            }
         } else {
-            None
+            OpenContent::None
+        };
+
+        Ok(NodeOpen {
+            tag,
+            attrs,
+            content,
+        })
+    }
+
+    /// Walk past one value token without building anything: the measuring
+    /// pass of a streaming decode, which has to learn how many bytes a node
+    /// takes before it can decode it from a buffer it may still have to grow.
+    ///
+    /// Mirrors [`Self::read_value`] token for token, validation included: a
+    /// string that is not UTF-8 or a packed nibble outside its alphabet is an
+    /// error here as it is there, so a node the stream skips unread is held
+    /// to what the tree decoder would have rejected. The JID forms reuse the
+    /// readers because their layout is validation, not just length.
+    fn skip_value(&mut self) -> Result<()> {
+        let tag = self.read_u8()?;
+        self.skip_value_from_tag(tag)
+    }
+
+    fn skip_value_from_tag(&mut self, tag: u8) -> Result<()> {
+        match tag {
+            token::LIST_EMPTY => Ok(()),
+            token::BINARY_8 => {
+                let size = self.read_u8()? as usize;
+                self.read_string(size).map(drop)
+            }
+            token::BINARY_20 => {
+                let size = self.read_u20_be()? as usize;
+                self.read_string(size).map(drop)
+            }
+            token::BINARY_32 => {
+                let size = self.read_u32_be()? as usize;
+                self.read_string(size).map(drop)
+            }
+            token::JID_PAIR => self.read_jid_pair().map(drop),
+            token::AD_JID => self.read_ad_jid().map(drop),
+            token::INTEROP_JID => self.read_interop_jid().map(drop),
+            token::FB_JID => self.read_fb_jid().map(drop),
+            token::NIBBLE_8 | token::HEX_8 => {
+                let len = (self.read_u8()? & 0x7F) as usize;
+                let packed = self.read_bytes(len)?;
+                // Every byte is a valid hex pair; only nibbles have holes.
+                if tag == token::NIBBLE_8
+                    && let Some(&byte) = packed.iter().find(|&&byte| {
+                        let pair = NIBBLE_PAIRS[byte as usize];
+                        pair[0] == NIBBLE_INVALID || pair[1] == NIBBLE_INVALID
+                    })
+                {
+                    Self::unpack_nibble((byte & 0xF0) >> 4)?;
+                    Self::unpack_nibble(byte & 0x0F)?;
+                }
+                Ok(())
+            }
+            tag @ token::DICTIONARY_0..=token::DICTIONARY_3 => {
+                let index = self.read_u8()?;
+                token::get_double_token(tag - token::DICTIONARY_0, index)
+                    .map(drop)
+                    .ok_or(BinaryError::InvalidToken(tag))
+            }
+            _ => token::get_single_token(tag)
+                .map(drop)
+                .ok_or(BinaryError::InvalidToken(tag)),
+        }
+    }
+
+    /// Walk past a node's scalar content, whose tag has been read. Binary
+    /// content is opaque to [`Self::read_content_from_tag`] too, so only its
+    /// length is checked; anything else is a string value and validated as one.
+    fn skip_scalar_content(&mut self, tag: u8) -> Result<()> {
+        match tag {
+            token::BINARY_8 => {
+                let len = self.read_u8()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            token::BINARY_20 => {
+                let len = self.read_u20_be()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            token::BINARY_32 => {
+                let len = self.read_u32_be()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            _ => self.skip_value_from_tag(tag),
+        }
+    }
+
+    /// Walk past a node's head (through the child count, when it has one) and
+    /// report how many children were announced. The measuring twin of
+    /// [`Self::read_node_open`].
+    pub(crate) fn skip_node_open(&mut self) -> Result<usize> {
+        let tag = self.read_u8()?;
+        let list_size = self.read_list_size(tag)?;
+        if list_size == 0 {
+            return Err(BinaryError::InvalidNode);
+        }
+        // The same two shapes `read_node_open` refuses: a node with no tag,
+        // and an attribute whose key is not a string.
+        let tag_token = self.read_u8()?;
+        if tag_token == token::LIST_EMPTY {
+            return Err(BinaryError::InvalidNode);
+        }
+        self.skip_value_from_tag(tag_token)?;
+        let attr_count = (list_size - 1) / 2;
+        for _ in 0..attr_count {
+            let key_token = self.read_u8()?;
+            if key_token == token::LIST_EMPTY {
+                return Err(BinaryError::NonStringKey);
+            }
+            self.skip_value_from_tag(key_token)?;
+            self.skip_value()?;
+        }
+        if !list_size.is_multiple_of(2) {
+            return Ok(0);
+        }
+        let content_tag = self.read_u8()?;
+        match content_tag {
+            token::LIST_EMPTY => Ok(0),
+            token::LIST_8 | token::LIST_16 => self.read_list_size(content_tag),
+            _ => {
+                self.skip_scalar_content(content_tag)?;
+                Ok(0)
+            }
+        }
+    }
+
+    /// Walk past a whole node, subtree included. The measuring twin of
+    /// [`Self::read_node_ref_at`], with the same depth cap.
+    pub(crate) fn skip_node_at(&mut self, depth: usize) -> Result<()> {
+        if depth >= MAX_NODE_DEPTH {
+            return Err(BinaryError::MaxDepthExceeded);
+        }
+        let children = self.skip_node_open()?;
+        for _ in 0..children {
+            self.skip_node_at(depth + 1)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_node_ref_at(&mut self, depth: usize) -> Result<NodeRef<'a>> {
+        // Reject before recursing, so a hostile deep-LIST frame errors instead of
+        // aborting the process on a stack overflow.
+        if depth >= MAX_NODE_DEPTH {
+            return Err(BinaryError::MaxDepthExceeded);
+        }
+        // One head reader for both decoders: the tree is the head plus its
+        // children read whole, which is also what keeps the two in agreement
+        // on what a malformed head is.
+        let head = self.read_node_open()?;
+        let content = match head.content {
+            OpenContent::None => None,
+            OpenContent::Scalar(scalar) => Some(scalar),
+            OpenContent::Children(count) => {
+                let mut nodes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    nodes.push(self.read_node_ref_at(depth + 1)?);
+                }
+                Some(NodeContentRef::Nodes(nodes.into_boxed_slice()))
+            }
         };
 
         Ok(NodeRef {
-            tag,
-            attrs,
+            tag: head.tag,
+            attrs: head.attrs,
             content,
         })
     }
@@ -552,7 +723,7 @@ mod tests {
     use super::*;
     use crate::node::{Attrs, Node};
 
-    type TestResult = crate::error::Result<()>;
+    type TestResult = Result<()>;
 
     #[test]
     fn test_decode_node() -> TestResult {
@@ -574,8 +745,8 @@ mod tests {
         assert_eq!(decoded.tag, "message");
         assert!(decoded.attrs.is_empty());
         match &decoded.content {
-            Some(content) => match &**content {
-                crate::node::NodeContentRef::String(s) => assert_eq!(s, "receipt"),
+            Some(content) => match content {
+                NodeContentRef::String(s) => assert_eq!(s, "receipt"),
                 _ => panic!("Expected string content"),
             },
             None => panic!("Expected content"),
@@ -604,8 +775,8 @@ mod tests {
         assert_eq!(decoded.tag, "test");
         assert!(decoded.attrs.is_empty());
         match &decoded.content {
-            Some(content) => match &**content {
-                crate::node::NodeContentRef::String(s) => assert_eq!(s, test_str),
+            Some(content) => match content {
+                NodeContentRef::String(s) => assert_eq!(s, test_str),
                 _ => panic!("Expected string content"),
             },
             None => panic!("Expected content"),
@@ -703,6 +874,48 @@ mod tests {
         let mut decoder = Decoder::new(&data);
         let result = decoder.read_node_ref();
         assert!(result.is_err());
+    }
+
+    /// Attribute storage capacity must not change how a broken attribute list
+    /// is rejected: a truncated pair, a non-string key and a declared count the
+    /// frame cannot back all fail the same way they did before.
+    #[test]
+    fn malformed_attribute_lists_keep_their_errors() {
+        // <message> claiming one attribute, cut off after the key.
+        let truncated = [
+            token::LIST_8,
+            3,
+            token::DICTIONARY_0,
+            0,
+            token::BINARY_8,
+            2,
+            b'i',
+            b'd',
+        ];
+        assert!(matches!(
+            Decoder::new(&truncated).read_node_ref(),
+            Err(BinaryError::UnexpectedEof)
+        ));
+
+        // An empty list where a string key is required.
+        let non_string_key = [token::LIST_8, 3, token::DICTIONARY_0, 0, token::LIST_EMPTY];
+        assert!(matches!(
+            Decoder::new(&non_string_key).read_node_ref(),
+            Err(BinaryError::NonStringKey)
+        ));
+
+        // Declares 4 attributes, carries none.
+        let overlong_count = [token::LIST_8, 9, token::DICTIONARY_0, 0];
+        assert!(matches!(
+            Decoder::new(&overlong_count).read_node_ref(),
+            Err(BinaryError::UnexpectedEof)
+        ));
+
+        // A list size of zero has no room even for the tag.
+        assert!(matches!(
+            Decoder::new(&[token::LIST_EMPTY]).read_node_ref(),
+            Err(BinaryError::InvalidNode)
+        ));
     }
 
     /// Test invalid token value

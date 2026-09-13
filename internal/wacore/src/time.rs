@@ -20,6 +20,71 @@
 
 use std::sync::OnceLock;
 
+/// Test-only clock-read accounting, so a budget over the hot path can be
+/// asserted instead of estimated.
+///
+/// Counting sits at the abstraction boundary, not inside a provider:
+/// [`set_time_provider`] is a `OnceLock` that the process's first `now_millis()`
+/// fills with the default, so a suite sharing one process cannot install an
+/// instrumented provider per test. Counting here also covers the defaults.
+#[cfg(feature = "test-util")]
+pub mod clock_reads {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static WALL: Cell<u64> = const { Cell::new(0) };
+        static MONOTONIC: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reads counted on one thread.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Reads {
+        /// Reads of the wall clock ([`super::now_millis`] and everything built
+        /// on it).
+        pub wall: u64,
+        /// Reads of the monotonic clock ([`super::Instant::now`],
+        /// [`super::Instant::elapsed`]).
+        pub monotonic: u64,
+    }
+
+    impl Reads {
+        pub fn total(&self) -> u64 {
+            self.wall + self.monotonic
+        }
+    }
+
+    #[inline]
+    pub(super) fn bump_wall() {
+        WALL.with(|c| c.set(c.get().saturating_add(1)));
+    }
+
+    #[inline]
+    pub(super) fn bump_monotonic() {
+        MONOTONIC.with(|c| c.set(c.get().saturating_add(1)));
+    }
+
+    /// Counters for the calling thread.
+    ///
+    /// Per thread, not process-wide, so a measurement stays exact while the
+    /// rest of the suite runs in parallel. Work handed to a blocking pool (the
+    /// storage backend) is counted on that thread and stays invisible here.
+    pub fn snapshot() -> Reads {
+        Reads {
+            wall: WALL.with(Cell::get),
+            monotonic: MONOTONIC.with(Cell::get),
+        }
+    }
+
+    /// Reads made on this thread since `base`.
+    pub fn since(base: Reads) -> Reads {
+        let now = snapshot();
+        Reads {
+            wall: now.wall.saturating_sub(base.wall),
+            monotonic: now.monotonic.saturating_sub(base.monotonic),
+        }
+    }
+}
+
 /// Wall-clock provider. Returns the current Unix time. May move backwards
 /// across calls when the system clock is adjusted.
 pub trait TimeProvider: Send + Sync + 'static {
@@ -84,6 +149,8 @@ pub fn set_time_provider(provider: impl TimeProvider) -> Result<(), &'static str
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub fn now_millis() -> i64 {
+    #[cfg(feature = "test-util")]
+    clock_reads::bump_wall();
     TIME_PROVIDER
         .get_or_init(default_time_provider)
         .now_millis()
@@ -95,6 +162,8 @@ pub fn now_millis() -> i64 {
 #[cfg(target_arch = "wasm32")]
 #[inline]
 pub fn now_millis() -> i64 {
+    #[cfg(feature = "test-util")]
+    clock_reads::bump_wall();
     match TIME_PROVIDER.get() {
         Some(provider) => provider.now_millis(),
         None => UnsetWasmTimeProvider.now_millis(),
@@ -224,6 +293,21 @@ impl WallDerivedMonotonicProvider {
 impl MonotonicProvider for WallDerivedMonotonicProvider {
     fn now_nanos(&self) -> u64 {
         use std::sync::atomic::Ordering;
+        // Warn once: a caller on this fallback is measuring timeouts against a
+        // clock that still follows the wall clock forward, so a system-clock
+        // correction can fire the dead-socket watchdog on a healthy socket.
+        // The clamp below only rules out the backwards half of that.
+        {
+            use std::sync::atomic::AtomicBool;
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "wacore::time: no monotonic provider set on wasm32; deriving from the \
+                     wall clock, so a forward clock adjustment reads as elapsed time. \
+                     Call set_monotonic_provider() with performance.now() before the first timeout."
+                );
+            }
+        }
         let raw = (now_millis().max(0) as u64).saturating_mul(1_000_000);
         let mut last = self.last.load(Ordering::Relaxed);
         loop {
@@ -251,6 +335,8 @@ pub fn set_monotonic_provider(provider: impl MonotonicProvider) -> Result<(), &'
 
 #[inline]
 fn now_nanos() -> u64 {
+    #[cfg(feature = "test-util")]
+    clock_reads::bump_monotonic();
     MONOTONIC_PROVIDER
         .get_or_init(default_monotonic_provider)
         .now_nanos()
@@ -288,7 +374,7 @@ impl Instant {
     }
 
     /// Duration elapsed since this instant was captured. Returns
-    /// [`Duration::ZERO`] if the clock somehow reported a smaller value
+    /// [`Duration::ZERO`](std::time::Duration::ZERO) if the clock somehow reported a smaller value
     /// than at capture time — which a well-behaved monotonic provider
     /// must never do, but we saturate defensively.
     #[inline]
@@ -297,7 +383,7 @@ impl Instant {
         std::time::Duration::from_nanos(now.saturating_sub(self.0))
     }
 
-    /// Duration from `earlier` to `self`. Returns [`Duration::ZERO`] if
+    /// Duration from `earlier` to `self`. Returns [`Duration::ZERO`](std::time::Duration::ZERO) if
     /// `earlier` is after `self`.
     #[inline]
     pub fn saturating_duration_since(&self, earlier: Instant) -> std::time::Duration {
@@ -328,9 +414,132 @@ impl std::ops::Sub<Instant> for Instant {
     }
 }
 
+/// A shared [`Instant`] slot that can also be "unset", for anchors several
+/// tasks stamp and clear.
+///
+/// Exists because the anchors it holds are read on the wire path: storing an
+/// `Instant` behind a mutex would put a lock on every frame written, and the
+/// alternative of a plain `AtomicU64` of milliseconds is what the dead-socket
+/// watchdog used to be, back when a clock adjustment could fire it.
+///
+/// The encoding keeps "unset" distinct from "captured at the clock's origin",
+/// which a bare zero cannot: on `wasm32` with no wall-clock provider the
+/// fallback monotonic source answers 0 forever, so a zero sentinel would read
+/// every fresh stamp as unset.
+#[derive(Debug, Default)]
+pub struct AtomicInstant(portable_atomic::AtomicU64);
+
+impl AtomicInstant {
+    /// Encoded as nanos + 1 so that 0 means unset, which reserves the top
+    /// nanosecond: `u64::MAX` and `u64::MAX - 1` both encode to `u64::MAX`.
+    /// That ceiling is inherited, not introduced -- [`StdMonotonicProvider`]
+    /// already saturates there, 584 years past any process start.
+    fn encode(instant: Instant) -> u64 {
+        instant.0.saturating_add(1)
+    }
+
+    fn decode(raw: u64) -> Option<Instant> {
+        raw.checked_sub(1).map(Instant)
+    }
+
+    /// A slot holding no instant.
+    pub const fn unset() -> Self {
+        Self(portable_atomic::AtomicU64::new(0))
+    }
+
+    /// The stored instant, or `None` while unset.
+    #[inline]
+    pub fn load(&self) -> Option<Instant> {
+        Self::decode(self.0.load(portable_atomic::Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn store(&self, instant: Instant) {
+        self.0
+            .store(Self::encode(instant), portable_atomic::Ordering::Relaxed);
+    }
+
+    /// Back to unset.
+    #[inline]
+    pub fn clear(&self) {
+        self.0.store(0, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// Read and unset in one step.
+    #[inline]
+    pub fn take(&self) -> Option<Instant> {
+        Self::decode(self.0.swap(0, portable_atomic::Ordering::Relaxed))
+    }
+
+    /// Store `instant` only while `should_replace` still accepts the value
+    /// actually in the slot, retrying on a racing write. Returns whether the
+    /// store landed.
+    #[inline]
+    pub fn store_if(
+        &self,
+        instant: Instant,
+        mut should_replace: impl FnMut(Option<Instant>) -> bool,
+    ) -> bool {
+        self.0
+            .fetch_update(
+                portable_atomic::Ordering::Relaxed,
+                portable_atomic::Ordering::Relaxed,
+                |current| should_replace(Self::decode(current)).then(|| Self::encode(instant)),
+            )
+            .is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AtomicInstant ────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_atomic_instant_round_trips_and_clears() {
+        let slot = AtomicInstant::unset();
+        assert_eq!(slot.load(), None, "a fresh slot holds nothing");
+
+        let at = Instant::now();
+        slot.store(at);
+        assert_eq!(slot.load(), Some(at));
+
+        assert_eq!(slot.take(), Some(at), "take yields what was there");
+        assert_eq!(slot.load(), None, "and leaves the slot unset");
+
+        slot.store(at);
+        slot.clear();
+        assert_eq!(slot.load(), None);
+    }
+
+    /// The clock's own origin is a real instant, not the absence of one: on
+    /// `wasm32` with no wall-clock provider the fallback monotonic source
+    /// answers zero forever, and a zero sentinel would read every stamp there
+    /// as "never armed" and silently disable the dead-socket watchdog.
+    #[test]
+    fn the_clock_origin_is_a_value_not_an_absence() {
+        let slot = AtomicInstant::unset();
+        slot.store(Instant::ZERO);
+        assert_eq!(slot.load(), Some(Instant::ZERO));
+    }
+
+    #[test]
+    fn store_if_respects_the_predicate() {
+        let slot = AtomicInstant::unset();
+        let first = Instant::now();
+        assert!(slot.store_if(first, |current| current.is_none()));
+        assert_eq!(slot.load(), Some(first));
+
+        // Bad path: the slot is taken, so the second store must not land.
+        let second = first + std::time::Duration::from_secs(1);
+        assert!(!slot.store_if(second, |current| current.is_none()));
+        assert_eq!(
+            slot.load(),
+            Some(first),
+            "an occupied slot is not clobbered"
+        );
+    }
 
     // The native default must yield a real wall-clock time, not the wasm fallback's
     // epoch. Guards the cfg-split refactor that keeps wasm32 from panicking.

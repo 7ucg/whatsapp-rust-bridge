@@ -1,24 +1,66 @@
+use divan::black_box;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use iai_callgrind::{
-    Callgrind, FlamegraphConfig, LibraryBenchmarkConfig, library_benchmark,
-    library_benchmark_group, main,
-};
-use std::hint::black_box;
+use std::collections::HashSet;
 use std::io::Write;
+use wacore_binary::NodeStream;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::marshal::{
     marshal, marshal_auto, marshal_exact, marshal_ref, marshal_ref_auto, marshal_ref_exact,
-    marshal_to, marshal_to_vec, unmarshal_ref,
+    marshal_shallow, marshal_to, unmarshal_ref,
 };
 use wacore_binary::node::Node;
-use wacore_binary::util::unpack;
+use wacore_binary::util::{FORMAT_COMPRESSED, unpack};
+
+fn main() {
+    divan::main();
+}
 
 fn create_small_node() -> Node {
     NodeBuilder::new("message")
         .attr("to", "user@s.whatsapp.net")
         .attr("id", "12345")
         .attr("type", "text")
+        .build()
+}
+
+/// The shape the wire is mostly made of: a short ack carrying a JID, a
+/// nibble-packed number and a hex-packed id at once. `create_small_node`
+/// already reaches `read_jid_pair` and the nibble half of `read_packed`, but
+/// nothing reached the hex half, since the large fixture's lowercase `abcdef`
+/// encodes as raw bytes rather than `HEX_8`.
+fn create_ack_node() -> Node {
+    NodeBuilder::new("ack")
+        .attr("to", "5511999990000@s.whatsapp.net")
+        .attr("id", "3EB0A1B2C3D4E5F60718")
+        .attr("class", "message")
+        .build()
+}
+
+/// A device fanout. Device-qualified JIDs encode as `AD_JID`, so what repeats
+/// per child is the packed decode and the AD path, not `read_jid_pair`.
+fn create_fanout_node() -> Node {
+    let devices: Vec<Node> = (0..8)
+        .map(|i| {
+            NodeBuilder::new("to")
+                .attr("jid", format!("5511999990000:{i}@s.whatsapp.net"))
+                .children(vec![
+                    NodeBuilder::new("enc")
+                        .attr("v", "2")
+                        .attr("type", "msg")
+                        .bytes(vec![0xAB; 128])
+                        .build(),
+                ])
+                .build()
+        })
+        .collect();
+    NodeBuilder::new("message")
+        .attr("to", "5511999990000@g.us")
+        .attr("id", "3EB0A1B2C3D4E5F60718")
+        .attr("type", "text")
+        .children(vec![
+            NodeBuilder::new("participants").children(devices).build(),
+        ])
         .build()
 }
 
@@ -149,255 +191,304 @@ fn create_many_children_node() -> Node {
         .build()
 }
 
-// Marshal benchmarks - self-contained, no setup needed
-#[library_benchmark]
-fn bench_marshal_allocating() -> Vec<u8> {
-    let node = create_large_node();
-    black_box(marshal(black_box(&node)).unwrap())
+// Marshal benchmarks. Inputs are pre-built via with_inputs so the reported
+// cost is the encoder alone, not node construction. `marshal_auto` is the
+// production send-path strategy, so it gets one bench per payload shape; the
+// plain/exact strategies are tracked on a single shape for comparison.
+#[divan::bench]
+fn bench_marshal_auto_small(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_small_node)
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
-#[library_benchmark]
-fn bench_marshal_auto_allocating() -> Vec<u8> {
-    let node = create_large_node();
-    black_box(marshal_auto(black_box(&node)).unwrap())
+#[divan::bench]
+fn bench_marshal_auto_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
-#[library_benchmark]
-fn bench_marshal_exact_allocating() -> Vec<u8> {
-    let node = create_large_node();
-    black_box(marshal_exact(black_box(&node)).unwrap())
+#[divan::bench]
+fn bench_marshal_auto_long_string(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_long_string_node)
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
-#[library_benchmark]
-fn bench_marshal_reusing_buffer() -> Vec<u8> {
-    let node = create_large_node();
-    let mut buffer = Vec::with_capacity(4096);
-    marshal_to(black_box(&node), &mut buffer).unwrap();
-    black_box(buffer)
+#[divan::bench]
+fn bench_marshal_auto_huge_bytes(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_huge_bytes_node)
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
-#[library_benchmark]
-fn bench_marshal_reusing_buffer_vec_writer() -> Vec<u8> {
-    let node = create_large_node();
-    let mut buffer = Vec::with_capacity(4096);
-    marshal_to_vec(black_box(&node), &mut buffer).unwrap();
-    black_box(buffer)
+#[divan::bench]
+fn bench_marshal_auto_many_children(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_many_children_node)
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
-// Benchmark for marshaling nodes with long string content.
-// This demonstrates the JID parsing optimization: long strings skip parse_jid.
-#[library_benchmark]
-fn bench_marshal_long_string() -> Vec<u8> {
-    let node = create_long_string_node();
-    black_box(marshal(black_box(&node)).unwrap())
+// The shallow (estimate + single pass) strategy is the production send path
+// for message plaintext, so its worst case — many children, JID-heavy — gets
+// its own pin, against the exact (plan + hint replay) strategy it replaced on
+// the same shape. The sampled estimate is what the pair measures: many
+// children is where sampling has the most room to be wrong, and a reserve that
+// undershoots shows up here as the `Vec` growth it costs.
+#[divan::bench]
+fn bench_marshal_exact_many_children(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_many_children_node)
+        .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
 }
 
-#[library_benchmark]
-fn bench_marshal_auto_long_string() -> Vec<u8> {
-    let node = create_long_string_node();
-    black_box(marshal_auto(black_box(&node)).unwrap())
+#[divan::bench]
+fn bench_marshal_shallow_many_children(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_many_children_node)
+        .bench_refs(|node| black_box(marshal_shallow(black_box(node)).expect("marshal_shallow")));
 }
 
-#[library_benchmark]
-fn bench_marshal_exact_long_string() -> Vec<u8> {
-    let node = create_long_string_node();
-    black_box(marshal_exact(black_box(&node)).unwrap())
+// Strategy comparison on one shape.
+#[divan::bench]
+fn bench_marshal_plain_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_refs(|node| black_box(marshal(black_box(node)).unwrap()));
 }
 
-#[library_benchmark]
-fn bench_marshal_huge_bytes_allocating() -> Vec<u8> {
-    let node = create_huge_bytes_node();
-    black_box(marshal(black_box(&node)).unwrap())
+#[divan::bench]
+fn bench_marshal_exact_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
 }
 
-#[library_benchmark]
-fn bench_marshal_auto_huge_bytes_allocating() -> Vec<u8> {
-    let node = create_huge_bytes_node();
-    black_box(marshal_auto(black_box(&node)).unwrap())
+#[divan::bench]
+fn bench_marshal_shallow_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_refs(|node| black_box(marshal_shallow(black_box(node)).expect("marshal_shallow")));
 }
 
-#[library_benchmark]
-fn bench_marshal_exact_huge_bytes_allocating() -> Vec<u8> {
-    let node = create_huge_bytes_node();
-    black_box(marshal_exact(black_box(&node)).unwrap())
+#[divan::bench]
+fn bench_marshal_to_reused_buffer_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| (create_large_node(), Vec::with_capacity(4096)))
+        .bench_refs(|(node, buffer)| {
+            marshal_to(black_box(node), buffer).unwrap();
+            // Contents, not length: keeps the marshal writes observable.
+            black_box(buffer.as_slice());
+        });
 }
 
-#[library_benchmark]
-fn bench_marshal_many_children_allocating() -> Vec<u8> {
-    let node = create_many_children_node();
-    black_box(marshal(black_box(&node)).unwrap())
+// Setup functions for unmarshal benchmarks: `unmarshal_ref` takes node bytes,
+// so the format byte comes off in setup rather than inside the timed region.
+fn node_bytes(node: &Node) -> Vec<u8> {
+    unpack(&marshal(node).unwrap()).unwrap().into_owned()
 }
 
-#[library_benchmark]
-fn bench_marshal_auto_many_children_allocating() -> Vec<u8> {
-    let node = create_many_children_node();
-    black_box(marshal_auto(black_box(&node)).unwrap())
+fn setup_small_node_bytes() -> Vec<u8> {
+    node_bytes(&create_small_node())
 }
 
-#[library_benchmark]
-fn bench_marshal_exact_many_children_allocating() -> Vec<u8> {
-    let node = create_many_children_node();
-    black_box(marshal_exact(black_box(&node)).unwrap())
+fn setup_large_node_bytes() -> Vec<u8> {
+    node_bytes(&create_large_node())
 }
 
-// Setup functions for unmarshal benchmarks - pre-compute marshaled data
-// Note: marshal() adds a flag byte at position 0, unmarshal_ref expects data without it
-fn setup_small_marshaled() -> Vec<u8> {
-    marshal(&create_small_node()).unwrap()
+#[divan::bench]
+fn bench_unmarshal_small(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_small_node_bytes)
+        .bench_refs(|bytes| {
+            black_box(unmarshal_ref(black_box(bytes)).unwrap());
+        });
 }
 
-fn setup_large_marshaled() -> Vec<u8> {
+fn setup_ack_node_bytes() -> Vec<u8> {
+    node_bytes(&create_ack_node())
+}
+
+fn setup_fanout_node_bytes() -> Vec<u8> {
+    node_bytes(&create_fanout_node())
+}
+
+#[divan::bench]
+fn bench_unmarshal_ack(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_ack_node_bytes)
+        .bench_refs(|bytes| {
+            black_box(unmarshal_ref(black_box(bytes)).unwrap());
+        });
+}
+
+#[divan::bench]
+fn bench_unmarshal_fanout(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_fanout_node_bytes)
+        .bench_refs(|bytes| {
+            black_box(unmarshal_ref(black_box(bytes)).unwrap());
+        });
+}
+
+#[divan::bench]
+fn bench_unmarshal_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_large_node_bytes)
+        .bench_refs(|bytes| {
+            black_box(unmarshal_ref(black_box(bytes)).unwrap());
+        });
+}
+
+// Unpack benchmarks: payloads are pre-built in setup so the compressed case
+// measures the inflate path, not the deflate used to build the fixture. The
+// compressed body is a realistic multi-KB frame (the marshaled usync-like
+// node), matching what the server actually compresses.
+fn setup_uncompressed_payload() -> Vec<u8> {
     marshal(&create_large_node()).unwrap()
 }
 
-#[library_benchmark]
-#[bench::small(setup = setup_small_marshaled)]
-#[bench::large(setup = setup_large_marshaled)]
-fn bench_unmarshal(marshaled: Vec<u8>) {
-    black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
-}
-
-// Unpack benchmarks - self-contained
-#[library_benchmark]
-fn bench_unpack_uncompressed() {
-    let data = b"some random uncompressed data for testing";
-    let mut payload = vec![0u8];
-    payload.extend_from_slice(data);
-    black_box(unpack(black_box(&payload)).unwrap());
-}
-
-#[library_benchmark]
-fn bench_unpack_compressed() {
-    let data = b"some random uncompressed data for testing";
-    let mut payload = vec![2u8];
+fn setup_compressed_payload() -> Vec<u8> {
+    let body = node_bytes(&create_usync_like_node());
+    let mut payload = vec![FORMAT_COMPRESSED];
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data).unwrap();
-    let compressed_data = encoder.finish().unwrap();
-    payload.extend_from_slice(&compressed_data);
-    black_box(unpack(black_box(&payload)).unwrap());
+    encoder.write_all(&body).unwrap();
+    payload.extend_from_slice(&encoder.finish().unwrap());
+    payload
 }
 
-// Setup function for attr_parser benchmark - pre-compute marshaled data
-fn setup_attr_marshaled() -> Vec<u8> {
-    marshal(&create_attr_node()).unwrap()
+#[divan::bench]
+fn bench_unpack_uncompressed(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_uncompressed_payload)
+        .bench_refs(|payload| {
+            black_box(unpack(black_box(payload)).unwrap());
+        });
 }
 
-#[library_benchmark]
-#[bench::attr_lookup(setup = setup_attr_marshaled)]
-fn bench_attr_parser(marshaled: Vec<u8>) {
-    // Skip the flag byte at position 0
-    let node_ref = unmarshal_ref(&marshaled[1..]).unwrap();
+#[divan::bench]
+fn bench_unpack_compressed(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_compressed_payload)
+        .bench_refs(|payload| {
+            black_box(unpack(black_box(payload)).unwrap());
+        });
+}
 
-    let mut parser = node_ref.attrs();
-    black_box(parser.optional_string("xmlns"));
-    black_box(parser.optional_string("type"));
-    black_box(parser.optional_jid("from"));
-    black_box(parser.optional_bool("has_flag"));
-    black_box(parser.optional_u64("timestamp"));
-    black_box(parser.finish().is_ok());
+// Setup function for attr_parser benchmark - pre-compute node bytes
+fn setup_attr_node_bytes() -> Vec<u8> {
+    node_bytes(&create_attr_node())
+}
+
+// Measures decode + attr access together: a NodeRef borrows its wire buffer,
+// so the parse cannot be moved into setup without owning the node.
+#[divan::bench]
+fn bench_attr_parser(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_attr_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(bytes).unwrap();
+
+            let mut parser = node_ref.attrs();
+            black_box(parser.optional_string("xmlns"));
+            black_box(parser.optional_string("type"));
+            black_box(parser.optional_jid("from"));
+            black_box(parser.optional_bool("has_flag"));
+            black_box(parser.optional_u64("timestamp"));
+            black_box(parser.finish().is_ok());
+        });
 }
 
 // Round-trip benchmark: unmarshal to NodeRef and re-marshal using the borrowed path.
 // This tests the zero-copy encoding path with EncodeNode trait.
-#[library_benchmark]
-#[bench::small(setup = setup_small_marshaled)]
-#[bench::large(setup = setup_large_marshaled)]
-fn bench_roundtrip(marshaled: Vec<u8>) -> Vec<u8> {
-    // Skip the flag byte at position 0
-    let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
-    black_box(marshal_ref(&node_ref).unwrap())
+#[divan::bench]
+fn bench_roundtrip_small(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_small_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
+            black_box(marshal_ref(&node_ref).unwrap())
+        });
 }
 
-#[library_benchmark]
-#[bench::small(setup = setup_small_marshaled)]
-#[bench::large(setup = setup_large_marshaled)]
-fn bench_roundtrip_auto(marshaled: Vec<u8>) -> Vec<u8> {
-    // Skip the flag byte at position 0
-    let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
-    black_box(marshal_ref_auto(&node_ref).unwrap())
+#[divan::bench]
+fn bench_roundtrip_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_large_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
+            black_box(marshal_ref(&node_ref).unwrap())
+        });
 }
 
-#[library_benchmark]
-#[bench::small(setup = setup_small_marshaled)]
-#[bench::large(setup = setup_large_marshaled)]
-fn bench_roundtrip_exact(marshaled: Vec<u8>) -> Vec<u8> {
-    // Skip the flag byte at position 0
-    let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
-    black_box(marshal_ref_exact(&node_ref).unwrap())
+#[divan::bench]
+fn bench_roundtrip_auto_small(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_small_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
+            black_box(marshal_ref_auto(&node_ref).unwrap())
+        });
 }
 
-// Child iteration benchmark: tests get_children_by_tag performance
-// Simulates the recursive traversal pattern used in usync parsing
-#[library_benchmark]
-fn bench_get_children_by_tag() {
-    let node = create_usync_like_node();
+#[divan::bench]
+fn bench_roundtrip_auto_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_large_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
+            black_box(marshal_ref_auto(&node_ref).unwrap())
+        });
+}
 
-    // Get the list node containing user children
-    let usync = node.get_optional_child("usync").unwrap();
-    let list = usync.get_optional_child("list").unwrap();
+#[divan::bench]
+fn bench_roundtrip_exact_small(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_small_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
+            black_box(marshal_ref_exact(&node_ref).unwrap())
+        });
+}
 
-    // Iterate over all "user" children (simulates usync parsing)
-    let mut count = 0;
-    for user in black_box(list.get_children_by_tag("user")) {
-        // For each user, get their device children (nested iteration)
-        if let Some(devices) = user.get_optional_child("devices")
-            && let Some(device_list) = devices.get_optional_child("device-list")
-        {
-            for _device in black_box(device_list.get_children_by_tag("device")) {
-                count += 1;
+#[divan::bench]
+fn bench_roundtrip_exact_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_large_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
+            black_box(marshal_ref_exact(&node_ref).unwrap())
+        });
+}
+
+// Child iteration benchmark: tests get_children_by_tag performance over the
+// recursive traversal pattern used in usync parsing. The tree is pre-built.
+#[divan::bench]
+fn bench_get_children_by_tag(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_usync_like_node)
+        .bench_refs(|node| {
+            let usync = node.get_optional_child("usync").unwrap();
+            let list = usync.get_optional_child("list").unwrap();
+
+            let mut count = 0;
+            for user in black_box(list.get_children_by_tag("user")) {
+                if let Some(devices) = user.get_optional_child("devices")
+                    && let Some(device_list) = devices.get_optional_child("device-list")
+                {
+                    for _device in black_box(device_list.get_children_by_tag("device")) {
+                        count += 1;
+                    }
+                }
             }
-        }
-    }
-    black_box(count);
+            black_box(count);
+        });
 }
 
-library_benchmark_group!(
-    name = marshal_group;
-    benchmarks =
-        bench_marshal_allocating,
-        bench_marshal_auto_allocating,
-        bench_marshal_exact_allocating,
-        bench_marshal_reusing_buffer,
-        bench_marshal_reusing_buffer_vec_writer,
-        bench_marshal_long_string,
-        bench_marshal_auto_long_string,
-        bench_marshal_exact_long_string,
-        bench_marshal_huge_bytes_allocating,
-        bench_marshal_auto_huge_bytes_allocating,
-        bench_marshal_exact_huge_bytes_allocating,
-        bench_marshal_many_children_allocating,
-        bench_marshal_auto_many_children_allocating,
-        bench_marshal_exact_many_children_allocating
-);
-
-library_benchmark_group!(
-    name = unmarshal_group;
-    benchmarks = bench_unmarshal
-);
-
-library_benchmark_group!(
-    name = unpack_group;
-    benchmarks = bench_unpack_uncompressed, bench_unpack_compressed
-);
-
-library_benchmark_group!(
-    name = attr_parser_group;
-    benchmarks = bench_attr_parser
-);
-
-library_benchmark_group!(
-    name = roundtrip_group;
-    benchmarks = bench_roundtrip, bench_roundtrip_auto, bench_roundtrip_exact
-);
-
-library_benchmark_group!(
-    name = child_iteration_group;
-    benchmarks = bench_get_children_by_tag
-);
-
-// Setup function for JID optimization benchmark - pre-compute marshaled JID-heavy data
-fn setup_jid_heavy_marshaled() -> Vec<u8> {
-    marshal(&create_jid_heavy_node()).unwrap()
+// Setup function for JID optimization benchmark - pre-compute JID-heavy node bytes
+fn setup_jid_heavy_node_bytes() -> Vec<u8> {
+    node_bytes(&create_jid_heavy_node())
 }
 
 // Benchmark that measures the JID attribute optimization.
@@ -406,40 +497,153 @@ fn setup_jid_heavy_marshaled() -> Vec<u8> {
 // The optimization benefit:
 // - Before: JID decoded → stringified in to_owned() → re-parsed in optional_jid()
 // - After: JID decoded → preserved as Jid in to_owned() → cloned in optional_jid()
-#[library_benchmark]
-#[bench::jid_access(setup = setup_jid_heavy_marshaled)]
-fn bench_jid_to_owned_access(marshaled: Vec<u8>) {
-    // Skip the flag byte at position 0
-    let node_ref = unmarshal_ref(&marshaled[1..]).unwrap();
+#[divan::bench]
+fn bench_jid_to_owned_access(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_jid_heavy_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(bytes).unwrap();
 
-    // Convert to owned Node - this is where JIDs are preserved (optimization)
-    let node = node_ref.to_owned();
+            // Convert to owned Node - this is where JIDs are preserved (optimization)
+            let node = node_ref.to_owned();
 
-    // Access JID attributes via AttrParser - if JIDs are preserved, no parsing needed
-    let mut parser = node.attrs();
-    black_box(parser.optional_jid("from"));
-    black_box(parser.optional_jid("to"));
-    black_box(parser.optional_jid("participant"));
-    black_box(parser.optional_jid("recipient"));
-    black_box(parser.optional_jid("notify"));
-    black_box(parser.optional_string("id"));
-    black_box(parser.optional_string("type"));
+            // Access JID attributes via AttrParser - if JIDs are preserved, no parsing needed
+            let mut parser = node.attrs();
+            black_box(parser.optional_jid("from"));
+            black_box(parser.optional_jid("to"));
+            black_box(parser.optional_jid("participant"));
+            black_box(parser.optional_jid("recipient"));
+            black_box(parser.optional_jid("notify"));
+            black_box(parser.optional_string("id"));
+            black_box(parser.optional_string("type"));
+            node
+        });
 }
 
-library_benchmark_group!(
-    name = jid_optimization_group;
-    benchmarks = bench_jid_to_owned_access
-);
+// The A/B props catalog: thousands of small `<prop>` children under one
+// `<props>` child of the result, of which a client keeps a few dozen. It is
+// the largest frame of a login and the reason `NodeStream` exists, so both
+// readings of it are tracked: the tree decode every other IQ gets, and the
+// streamed walk that keeps only the watched codes.
+const PROPS_CATALOG_CODES: u32 = 2_600;
 
-main!(
-    config = LibraryBenchmarkConfig::default()
-        .tool(Callgrind::default().flamegraph(FlamegraphConfig::default()));
-    library_benchmark_groups =
-        marshal_group,
-        unmarshal_group,
-        unpack_group,
-        attr_parser_group,
-        roundtrip_group,
-        child_iteration_group,
-        jid_optimization_group
-);
+fn create_props_catalog_node() -> Node {
+    let props: Vec<Node> = (0..PROPS_CATALOG_CODES)
+        .map(|i| {
+            let value = match i % 4 {
+                0 => "true".to_string(),
+                1 => "false".to_string(),
+                2 => (i * 7).to_string(),
+                _ => format!(
+                    "{:016x}{:016x}",
+                    u64::from(i) * 0x9E37,
+                    u64::from(i) * 0x79B9
+                ),
+            };
+            NodeBuilder::new("prop")
+                .attr("config_code", (1000 + i).to_string())
+                .attr("config_value", value)
+                .build()
+        })
+        .collect();
+    NodeBuilder::new("iq")
+        .attr("from", "s.whatsapp.net")
+        .attr("type", "result")
+        .attr("id", "1234-5")
+        .children(vec![
+            NodeBuilder::new("props")
+                .attr("ab_key", "abcdef0123456789")
+                .attr("hash", "1a2b3c4d")
+                .attr("refresh", "86400")
+                .children(props)
+                .build(),
+        ])
+        .build()
+}
+
+fn setup_props_catalog_payload() -> Vec<u8> {
+    let body = node_bytes(&create_props_catalog_node());
+    let mut payload = vec![FORMAT_COMPRESSED];
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&body).unwrap();
+    payload.extend_from_slice(&encoder.finish().unwrap());
+    payload
+}
+
+/// The codes a client watches: a few dozen spread over the catalog.
+fn watched_codes() -> HashSet<u32> {
+    (0..PROPS_CATALOG_CODES)
+        .step_by(97)
+        .map(|i| 1000 + i)
+        .collect()
+}
+
+/// The tree reading: inflate, decode the whole tree, then walk it for the
+/// watched codes, the way `PropsSpec::parse_response` reads a response.
+#[divan::bench]
+fn bench_props_catalog_tree(bencher: divan::Bencher) {
+    let watched = watched_codes();
+    bencher
+        .with_inputs(setup_props_catalog_payload)
+        .bench_refs(|payload| {
+            let bytes = unpack(black_box(payload)).unwrap();
+            let root = unmarshal_ref(&bytes).unwrap();
+            let props = root.get_optional_child("props").unwrap();
+            let mut kept = 0usize;
+            for child in props.children().unwrap_or(&[]) {
+                if child.tag != "prop" {
+                    continue;
+                }
+                let Some(code) = child.get_attr("config_code") else {
+                    continue;
+                };
+                if let Ok(code) = code.as_str().parse::<u32>()
+                    && watched.contains(&code)
+                    && child.get_attr("config_value").is_some()
+                {
+                    kept += 1;
+                }
+            }
+            black_box(kept)
+        });
+}
+
+/// The streamed reading: the same selection, one child at a time out of the
+/// inflate window, the way `PropsSpec::consume_response` reads a response.
+#[divan::bench]
+fn bench_props_catalog_stream(bencher: divan::Bencher) {
+    let watched = watched_codes();
+    bencher
+        .with_inputs(setup_props_catalog_payload)
+        .bench_refs(|payload| {
+            let mut stream = NodeStream::from_packed(black_box(payload)).unwrap();
+            stream.open().unwrap().unwrap();
+            let mut kept = 0usize;
+            loop {
+                let Some(head) = stream.open().unwrap() else {
+                    break;
+                };
+                if head.tag != "props" {
+                    stream.close().unwrap();
+                    continue;
+                }
+                while let Some(child) = stream.next_child().unwrap() {
+                    if child.tag != "prop" {
+                        continue;
+                    }
+                    let Some(code) = child.get_attr("config_code") else {
+                        continue;
+                    };
+                    if let Ok(code) = code.as_str().parse::<u32>()
+                        && watched.contains(&code)
+                        && child.get_attr("config_value").is_some()
+                    {
+                        kept += 1;
+                    }
+                }
+                stream.close().unwrap();
+            }
+            stream.finish().unwrap();
+            black_box(kept)
+        });
+}

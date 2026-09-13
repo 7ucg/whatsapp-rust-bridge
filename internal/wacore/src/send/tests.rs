@@ -3,6 +3,7 @@
 use super::*;
 use crate::client::context::{GroupInfo, SendContextResolver};
 use crate::libsignal::protocol::{IdentityKeyPair, KeyPair, PreKeyBundle};
+use crate::types::jid::make_sender_key_name;
 use std::collections::HashMap;
 use wacore_binary::Jid;
 
@@ -307,6 +308,52 @@ mod status_carries_privacy_meta {
     }
 }
 
+mod status_revoke_target_id {
+    use super::*;
+
+    #[test]
+    fn returns_embedded_target_for_revoke() {
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some("target-id".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(status_revoke_target_id(&msg), Some("target-id"));
+    }
+
+    #[test]
+    fn ignores_other_or_incomplete_protocol_messages() {
+        let non_revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::EphemeralSetting),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some("not-a-revoke".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let incomplete_revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(status_revoke_target_id(&non_revoke), None);
+        assert_eq!(status_revoke_target_id(&incomplete_revoke), None);
+    }
+}
+
 #[test]
 fn build_member_label_message_sets_fields() {
     let msg = build_member_label_message("VIP".to_string(), 1_766_847_151);
@@ -375,7 +422,14 @@ struct MockSendContextResolver {
     phone_to_lid: HashMap<String, String>,
     /// JIDs reported via `on_local_identity_change` (send-path detection).
     identity_changes: std::sync::Mutex<Vec<Jid>>,
+    /// What `on_unkeyable_devices` reported, in call order. This is the hook a
+    /// client turns into a counter, so a test asserting on it asserts on the
+    /// only thing that reaches `stats()`.
+    unkeyable: std::sync::Mutex<Vec<(crate::stats::UnkeyableDevice, u64)>>,
     chain_lock_probe: Option<ChainLockProbe>,
+    prekey_error_code: Option<u16>,
+    /// Devices the server names as rejected inside an otherwise fine response.
+    rejected_devices: Vec<crate::prekeys::RejectedDevice>,
 }
 
 impl MockSendContextResolver {
@@ -385,7 +439,10 @@ impl MockSendContextResolver {
             devices: Vec::new(),
             phone_to_lid: HashMap::new(),
             identity_changes: std::sync::Mutex::new(Vec::new()),
+            unkeyable: std::sync::Mutex::new(Vec::new()),
             chain_lock_probe: None,
+            prekey_error_code: None,
+            rejected_devices: Vec::new(),
         }
     }
 
@@ -396,6 +453,10 @@ impl MockSendContextResolver {
 
     fn captured_identity_changes(&self) -> Vec<Jid> {
         self.identity_changes.lock().unwrap().clone()
+    }
+
+    fn captured_unkeyable(&self) -> Vec<(crate::stats::UnkeyableDevice, u64)> {
+        self.unkeyable.lock().unwrap().clone()
     }
 
     fn with_missing_bundle(mut self, jid: Jid) -> Self {
@@ -415,6 +476,19 @@ impl MockSendContextResolver {
 
     fn with_phone_to_lid(mut self, phone: &str, lid: &str) -> Self {
         self.phone_to_lid.insert(phone.to_string(), lid.to_string());
+        self
+    }
+
+    /// The server answers with bundles for the rest of the batch and an
+    /// `<error>` for `jid`, which is how it names one absent device.
+    fn with_rejected_device(mut self, jid: Jid, code: u16) -> Self {
+        self.rejected_devices
+            .push(crate::prekeys::RejectedDevice { jid, code });
+        self
+    }
+
+    fn with_prekey_error(mut self, code: u16) -> Self {
+        self.prekey_error_code = Some(code);
         self
     }
 }
@@ -440,7 +514,15 @@ impl SendContextResolver for MockSendContextResolver {
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>> {
+    ) -> Result<crate::prekeys::PreKeyFetchOutcome> {
+        if let Some(code) = self.prekey_error_code {
+            return Err(anyhow::Error::new(crate::request::ServerErrorCode {
+                code,
+                text: "injected pre-key failure".to_string(),
+                error_type: None,
+                backoff: None,
+            }));
+        }
         if let Some(probe) = &self.chain_lock_probe {
             probe
                 .fetch_calls
@@ -466,19 +548,26 @@ impl SendContextResolver for MockSendContextResolver {
             }
             // If None, we intentionally omit it from the result (simulating server not returning it)
         }
-        Ok(result)
+        Ok(crate::prekeys::PreKeyFetchOutcome {
+            bundles: result,
+            rejected: self.rejected_devices.clone(),
+        })
     }
 
     async fn resolve_group_info(&self, _jid: &Jid) -> Result<std::sync::Arc<GroupInfo>> {
         unimplemented!("resolve_group_info not needed for send.rs tests")
     }
 
-    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
+    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<CompactString> {
         self.phone_to_lid.get(phone_user).map(|s| s.as_str().into())
     }
 
     fn on_local_identity_change(&self, jid: &Jid) {
         self.identity_changes.lock().unwrap().push(jid.clone());
+    }
+
+    fn on_unkeyable_devices(&self, reason: crate::stats::UnkeyableDevice, count: u64) {
+        self.unkeyable.lock().unwrap().push((reason, count));
     }
 }
 
@@ -1134,106 +1223,27 @@ fn test_dm_encryption_treats_own_lid_devices_as_self() {
     );
 }
 
-/// Test case: LID Prekey Lookup Normalization
-///
-/// Verifies that when looking up pre-key bundles for LID JIDs, the lookup key
-/// is normalized (agent=0) to match how the bundles are stored in the map.
-///
-/// This validates the fix for "No pre-key bundle returned" when the requested JID
-/// has non-standard agent/server fields but the bundle is stored under the normalized key.
+/// A pre-key bundle is stored under the JID parsed out of the server's response,
+/// and looked up with the JID we already hold for that device. Those two can
+/// disagree on `agent` — a LID arriving as an AD-JID used to carry the domain
+/// byte there — which once hid the bundle and surfaced as "No pre-key bundle
+/// returned". `agent` is not part of a LID's identity, so the raw lookup finds
+/// it, and the normalising helper that used to be required is gone.
 #[test]
-fn test_lid_prekey_lookup_normalization() {
-    // 1. Define JIDs
-    // The JID we request (simulating what comes from resolve_devices or elsewhere)
-    // Let's pretend it has agent=1 to simulate a mismatch
+fn lid_prekey_bundle_is_found_without_normalising_the_lookup_key() {
     let mut requested_jid = Jid::lid_device("123456789".to_string(), 0);
     requested_jid.agent = 1;
 
-    // The normalized JID (how it's stored in the bundle map)
-    let normalized_jid = Jid::lid_device("123456789".to_string(), 0); // agent=0 by default
+    let stored_jid = Jid::lid_device("123456789".to_string(), 0);
+    assert_eq!(requested_jid.agent, 1, "the inert field is really set");
 
-    // 2. Setup Resolver
-    // Store the bundle under the NORMALIZED key (agent=0)
-    let resolver = MockSendContextResolver::new()
-        .with_bundle(normalized_jid.clone(), create_mock_bundle())
-        .with_devices(vec![requested_jid.clone()]);
-
-    // 3. Verify Mock Setup
-    // Ensure bundle is accessible via normalized key but NOT via requested (raw) key
-    // This confirms our test condition is valid (that implicit lookup would fail)
-    assert!(
-        resolver.prekey_bundles.contains_key(&normalized_jid),
-        "Setup: bundle should exist for normalized key"
-    );
-    assert!(
-        !resolver.prekey_bundles.contains_key(&requested_jid),
-        "Setup: bundle should NOT exist for requested raw key"
-    );
-
-    // 4. Test logic mirroring `encrypt_for_devices`
-    let mut jid_to_encryption_jid = HashMap::new();
-    // Assume direct mapping for simplicity
-    jid_to_encryption_jid.insert(requested_jid.clone(), requested_jid.clone());
-
-    // Get the bundles map (mocks `fetch_prekeys_for_identity_check`)
-    // The mock implementation returns the map as-is filtered by keys.
-    // HOWEVER, `fetch_prekeys` usually takes a list.
-    // In `encrypt_for_devices`, we call:
-    // let prekey_bundles = resolver.fetch_prekeys_for_identity_check(&[requested_jid]).await?;
-
-    // Let's simulate what `fetch_prekeys_for_identity_check` would return.
-    // Our mock implementation `fetch_prekeys` logic:
-    // if let Some(bundle_opt) = self.prekey_bundles.get(jid)
-
-    // Wait, if the mock follows exact HashMap lookup, `fetch_prekeys(&[requested_jid])`
-    // will return EMPTY because `requested_jid` is not in `prekey_bundles`.
-    // The REAL `fetch_prekeys` (in `client.rs` -> `prekeys.rs`) sends an IQ to the server,
-    // and the server response is parsed. The parsing logic (in `prekeys.rs`) normalizes the key.
-    // So the HashMap returned by `fetch_prekeys` will contain NORMALIZED keys.
-
-    // So for this test to be accurate, we must simulate that `fetch_prekeys` returned a map
-    // where the key is NORMALIZED, even if we asked for `requested_jid`?
-    // Actually, `PreKeyFetchSpec` asks for JIDs. The response contains JIDs.
-    // If we ask for `agent=1`, does the server return `agent=1`?
-    // The logs showed:
-    // parsed: `...:82@lid` (agent=0 probably, or just not printed?)
-    // lookup: `...` (failed)
-
-    // The critical part is that the `HashMap` returned by `resolver.fetch_prekeys`
-    // definitely contains the bundle under some key.
-    // If `prekeys.rs` normalizes it, it's under the normalized key.
-    // The `encrypt_for_devices` logic has:
-    // `match prekey_bundles.get(device_jid)`
-    // where `device_jid` is the one from the loop (requested_jid).
-
-    // If `fetch_prekeys` returns a map with `normalized_jid`, and we lookup `requested_jid`, it fails.
-    // My fix was to normalize `requested_jid` before lookup.
-
-    // So I need to construct the `prekey_bundles` map manually here to simulate the return from fetch.
     let mut prekey_bundles = HashMap::new();
-    prekey_bundles.insert(normalized_jid.clone(), create_mock_bundle());
+    prekey_bundles.insert(stored_jid, create_mock_bundle());
 
-    // Now test the logic:
-    let device_jid = &requested_jid;
-
-    // -- Logic from fix --
-    // Use centralized normalization logic
-    let lookup_jid = device_jid.normalize_for_prekey_bundle();
-
-    // Fix: Use the normalized device_jid to lookup the bundle
-    let bundle = prekey_bundles.get(&lookup_jid);
-    // --------------------
-
-    assert!(bundle.is_some(), "Should find bundle after normalization");
-
-    // Verify it would have failed without normalization
-    let raw_lookup = prekey_bundles.get(device_jid);
     assert!(
-        raw_lookup.is_none(),
-        "Should NOT find bundle without normalization"
+        prekey_bundles.contains_key(&requested_jid),
+        "an inert agent must not hide the bundle"
     );
-
-    println!("✅ LID Prekey Lookup Normalization passed");
 }
 
 mod group_retry {
@@ -1342,7 +1352,7 @@ mod group_retry {
             &mut is,
             &bundle,
             &mut rand::make_rng::<rand::rngs::StdRng>(),
-            crate::libsignal::protocol::UsePQRatchet::No,
+            UsePQRatchet::No,
         )
         .await
         .unwrap();
@@ -1355,18 +1365,23 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group.clone(),
-            p.clone(),
-            p.clone(),
-            &wa::Message::default(),
-            "3EB0ABC".into(),
-            1,
-            Some(&account),
-            AddressingMode::Pn,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group.clone(),
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Pn),
+                },
+                encryption_jid: p.clone(),
+                message: &wa::Message::default(),
+                message_id: "3EB0ABC".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: None,
+                pre_encoded: None,
+            },
         )
         .await
         .unwrap();
@@ -1419,18 +1434,23 @@ mod group_retry {
             .serialize()
             .expect("serialize before");
 
-        let result = prepare_group_retry_stanza(
+        let result = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p.clone(),
-            &wa::Message::default(),
-            "grp-retry-no-account".into(),
-            1,
-            None,
-            AddressingMode::Pn,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Pn),
+                },
+                encryption_jid: p.clone(),
+                message: &wa::Message::default(),
+                message_id: "grp-retry-no-account".into(),
+                retry_count: 1,
+                account: None,
+                edit: None,
+                pre_encoded: None,
+            },
         )
         .await;
         let err = result.expect_err("group retry pkmsg must reject missing account");
@@ -1465,17 +1485,22 @@ mod group_retry {
         let recipient: Jid = "100000000000456@lid".parse().unwrap();
         let requester: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_dm_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(recipient.clone()),
-            requester,
-            &wa::Message::default(),
-            "dm-retry-format-1".into(),
-            1,
-            Some(&account),
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(recipient.clone()),
+                },
+                encryption_jid: requester,
+                message: &wa::Message::default(),
+                message_id: "dm-retry-format-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: None,
+                pre_encoded: None,
+            },
         )
         .await
         .unwrap();
@@ -1511,17 +1536,22 @@ mod group_retry {
         let encryption = jid.clone();
         let account = pkmsg_account_proto();
 
-        let n = prepare_dm_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(to.clone()),
-            encryption,
-            &wa::Message::default(),
-            "dm-retry-1".into(),
-            1,
-            Some(&account),
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(to.clone()),
+                },
+                encryption_jid: encryption,
+                message: &wa::Message::default(),
+                message_id: "dm-retry-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: None,
+                pre_encoded: None,
+            },
         )
         .await
         .unwrap();
@@ -1568,17 +1598,22 @@ mod group_retry {
             ..Default::default()
         };
 
-        let n = prepare_dm_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(to),
-            jid,
-            &wa::Message::default(),
-            "dm-retry-2".into(),
-            2,
-            Some(&acc),
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(to),
+                },
+                encryption_jid: jid,
+                message: &wa::Message::default(),
+                message_id: "dm-retry-2".into(),
+                retry_count: 2,
+                account: Some(&acc),
+                edit: None,
+                pre_encoded: None,
+            },
         )
         .await
         .unwrap();
@@ -1601,18 +1636,23 @@ mod group_retry {
             details: Some(b"t".to_vec()),
             ..Default::default()
         };
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p,
-            &wa::Message::default(),
-            "id2".into(),
-            2,
-            Some(&acc),
-            AddressingMode::Pn,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Pn),
+                },
+                encryption_jid: p,
+                message: &wa::Message::default(),
+                message_id: "id2".into(),
+                retry_count: 2,
+                account: Some(&acc),
+                edit: None,
+                pre_encoded: None,
+            },
         )
         .await
         .unwrap();
@@ -1641,18 +1681,23 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         // Fresh session → pkmsg (pre-key), with LID addressing
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p,
-            &wa::Message::default(),
-            "m2".into(),
-            3,
-            Some(&wa::ADVSignedDeviceIdentity::default()),
-            AddressingMode::Lid,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Lid),
+                },
+                encryption_jid: p,
+                message: &wa::Message::default(),
+                message_id: "m2".into(),
+                retry_count: 3,
+                account: Some(&wa::ADVSignedDeviceIdentity::default()),
+                edit: None,
+                pre_encoded: None,
+            },
         )
         .await
         .unwrap();
@@ -1673,18 +1718,23 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_group_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p,
-            &wa::Message::default(),
-            "revoke-1".into(),
-            1,
-            Some(&account),
-            AddressingMode::Lid,
-            Some(crate::types::message::EditAttribute::AdminRevoke),
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Lid),
+                },
+                encryption_jid: p,
+                message: &wa::Message::default(),
+                message_id: "revoke-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: Some(crate::types::message::EditAttribute::AdminRevoke),
+                pre_encoded: None,
+            },
         )
         .await
         .unwrap();
@@ -1696,21 +1746,230 @@ mod group_retry {
         let (mut ss, mut is, jid) = setup_session().await;
         let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_dm_retry_stanza(
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(to),
-            jid,
-            &wa::Message::default(),
-            "edit-1".into(),
-            1,
-            Some(&account),
-            Some(crate::types::message::EditAttribute::MessageEdit),
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(to),
+                },
+                encryption_jid: jid,
+                message: &wa::Message::default(),
+                message_id: "edit-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: Some(crate::types::message::EditAttribute::MessageEdit),
+                pre_encoded: None,
+            },
         )
         .await
         .unwrap();
         assert_eq!(n.attrs().optional_string("edit").unwrap().as_ref(), "1");
+        assert_eq!(
+            n.get_optional_child("enc")
+                .unwrap()
+                .attrs()
+                .optional_string("decrypt-fail")
+                .unwrap()
+                .as_ref(),
+            "hide"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_retry_preserves_target_and_omits_group_addressing() {
+        let (mut ss, mut is, jid) = setup_session().await;
+        let broadcast: Jid = "1234567890@broadcast".parse().unwrap();
+        let participant = jid.clone();
+        let account = pkmsg_account_proto();
+        let node = prepare_pairwise_retry_stanza(
+            &mut ss,
+            &mut is,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: broadcast.clone(),
+                    participant: participant.clone(),
+                    addressing_mode: None,
+                },
+                encryption_jid: jid,
+                message: &wa::Message::default(),
+                message_id: "broadcast-retry-1".into(),
+                retry_count: 2,
+                account: Some(&account),
+                edit: None,
+                pre_encoded: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut attrs = node.attrs();
+        assert_eq!(
+            attrs.optional_string("to").unwrap().as_ref(),
+            broadcast.to_string()
+        );
+        assert_eq!(
+            attrs.optional_string("participant").unwrap().as_ref(),
+            participant.to_string()
+        );
+        assert!(attrs.optional_string("recipient").is_none());
+        assert!(attrs.optional_string("addressing_mode").is_none());
+        assert_eq!(
+            node.get_optional_child("enc")
+                .unwrap()
+                .attrs()
+                .optional_string("count")
+                .unwrap()
+                .as_ref(),
+            "2"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_retry_identity_is_rejected_before_ratchet_advance() {
+        let cases = [
+            ("", 1, "message ID"),
+            ("retry-count-zero", 0, "retry count"),
+            (
+                "retry-count-max",
+                crate::protocol::retry::MAX_RETRY_COUNT,
+                "retry count",
+            ),
+        ];
+
+        for (message_id, retry_count, expected_error) in cases {
+            let (mut sessions, mut identities, jid) = setup_session().await;
+            let address = jid.to_protocol_address();
+            let before = sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            let result = prepare_pairwise_retry_stanza(
+                &mut sessions,
+                &mut identities,
+                PairwiseRetryRequest {
+                    destination: PairwiseRetryDestination::Direct {
+                        to: jid.clone(),
+                        recipient: None,
+                    },
+                    encryption_jid: jid,
+                    message: &wa::Message::default(),
+                    message_id: message_id.into(),
+                    retry_count,
+                    account: Some(&pkmsg_account_proto()),
+                    edit: None,
+                    pre_encoded: None,
+                },
+            )
+            .await;
+            let error = result.expect_err("invalid retry must be rejected");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for {message_id:?}/{retry_count}: {error:#}"
+            );
+            let after = sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            assert_eq!(
+                before, after,
+                "validation must run before the Signal ratchet for {message_id:?}/{retry_count}"
+            );
+        }
+
+        enum InvalidRoute {
+            DirectGroup,
+            GroupWithoutAddressingMode,
+            BroadcastWithAddressingMode,
+            ParticipantOnDirectChat,
+        }
+
+        for (case, expected_error) in [
+            (InvalidRoute::DirectGroup, "direct retry destination"),
+            (
+                InvalidRoute::GroupWithoutAddressingMode,
+                "group retry requires an addressing mode",
+            ),
+            (
+                InvalidRoute::BroadcastWithAddressingMode,
+                "broadcast retry must not carry",
+            ),
+            (
+                InvalidRoute::ParticipantOnDirectChat,
+                "participant retry destination",
+            ),
+        ] {
+            let (mut sessions, mut identities, encryption_jid) = setup_session().await;
+            let address = encryption_jid.to_protocol_address();
+            let before = sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            let group: Jid = "120363098765432100@g.us".parse().unwrap();
+            let broadcast: Jid = "1234567890@broadcast".parse().unwrap();
+            let destination = match case {
+                InvalidRoute::DirectGroup => PairwiseRetryDestination::Direct {
+                    to: group,
+                    recipient: None,
+                },
+                InvalidRoute::GroupWithoutAddressingMode => PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: encryption_jid.clone(),
+                    addressing_mode: None,
+                },
+                InvalidRoute::BroadcastWithAddressingMode => {
+                    PairwiseRetryDestination::Participant {
+                        to: broadcast,
+                        participant: encryption_jid.clone(),
+                        addressing_mode: Some(AddressingMode::Pn),
+                    }
+                }
+                InvalidRoute::ParticipantOnDirectChat => PairwiseRetryDestination::Participant {
+                    to: encryption_jid.clone(),
+                    participant: encryption_jid.clone(),
+                    addressing_mode: None,
+                },
+            };
+
+            let result = prepare_pairwise_retry_stanza(
+                &mut sessions,
+                &mut identities,
+                PairwiseRetryRequest {
+                    destination,
+                    encryption_jid,
+                    message: &wa::Message::default(),
+                    message_id: "invalid-route".into(),
+                    retry_count: 1,
+                    account: Some(&pkmsg_account_proto()),
+                    edit: None,
+                    pre_encoded: None,
+                },
+            )
+            .await;
+            let error = result.expect_err("invalid route must be rejected");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected invalid-route error: {error:#}"
+            );
+            let after = sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            assert_eq!(before, after, "route validation must precede the ratchet");
+        }
     }
 
     #[tokio::test]
@@ -1719,18 +1978,25 @@ mod group_retry {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
         let account = pkmsg_account_proto();
-        let n = prepare_group_retry_stanza(
+        let message = wa::Message::default();
+        let encoded = waproto::codec::message_to_vec(&message);
+        let n = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            group,
-            p.clone(),
-            p,
-            &wa::Message::default(),
-            "plain-1".into(),
-            1,
-            Some(&account),
-            AddressingMode::Lid,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Participant {
+                    to: group,
+                    participant: p.clone(),
+                    addressing_mode: Some(AddressingMode::Lid),
+                },
+                encryption_jid: p,
+                message: &message,
+                message_id: "plain-1".into(),
+                retry_count: 1,
+                account: Some(&account),
+                edit: None,
+                pre_encoded: Some(&encoded),
+            },
         )
         .await
         .unwrap();
@@ -1753,16 +2019,14 @@ mod group_retry {
         }
     }
 
-    async fn build_peer_stanza(
-        account: Option<&wa::ADVSignedDeviceIdentity>,
-    ) -> wacore_binary::Node {
+    async fn build_peer_stanza(account: Option<&wa::ADVSignedDeviceIdentity>) -> Node {
         build_peer_stanza_with_options(account, PeerMessageOptions::default()).await
     }
 
     async fn build_peer_stanza_with_options(
         account: Option<&wa::ADVSignedDeviceIdentity>,
         options: PeerMessageOptions,
-    ) -> wacore_binary::Node {
+    ) -> Node {
         let (mut ss, mut is, jid) = setup_session().await;
         let addr = jid.to_protocol_address();
         prepare_peer_stanza_with_options(
@@ -1771,7 +2035,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "peer-test-1".into(),
+            "peer-test-1",
             account,
             options,
         )
@@ -1876,7 +2140,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "peer-test-no-account".into(),
+            "peer-test-no-account",
             None,
         )
         .await;
@@ -1927,7 +2191,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "peer-preflight-1".into(),
+            "peer-preflight-1",
             None,
         )
         .await;
@@ -1961,17 +2225,22 @@ mod group_retry {
             .expect("serialize before");
 
         let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
-        let result = prepare_dm_retry_stanza(
+        let result = prepare_pairwise_retry_stanza(
             &mut ss,
             &mut is,
-            to.clone(),
-            Some(to),
-            jid.clone(),
-            &wa::Message::default(),
-            "dm-retry-no-account".into(),
-            1,
-            None,
-            None,
+            PairwiseRetryRequest {
+                destination: PairwiseRetryDestination::Direct {
+                    to: to.clone(),
+                    recipient: Some(to),
+                },
+                encryption_jid: jid.clone(),
+                message: &wa::Message::default(),
+                message_id: "dm-retry-no-account".into(),
+                retry_count: 1,
+                account: None,
+                edit: None,
+                pre_encoded: None,
+            },
         )
         .await;
         let err = result.expect_err("DM retry pkmsg path must reject missing account");
@@ -2089,7 +2358,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "preflight-take-bail".into(),
+            "preflight-take-bail",
             None,
         )
         .await;
@@ -2108,7 +2377,7 @@ mod group_retry {
             jid.clone(),
             &addr,
             &wa::Message::default(),
-            "preflight-take-pass".into(),
+            "preflight-take-pass",
             Some(&account),
         )
         .await;
@@ -2384,6 +2653,57 @@ mod stanza_type {
     }
 
     #[test]
+    fn rich_response_is_text() {
+        let m = wa::Message {
+            rich_response_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(media_type_from_message(&m), None);
+        assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
+    }
+
+    #[test]
+    fn bot_forwarded_classifies_by_inner() {
+        let rich = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                rich_response_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&rich), stanza::MSG_TYPE_TEXT);
+        assert_eq!(media_type_from_message(&rich), None);
+
+        let img = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                image_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
+        assert_eq!(media_type_from_message(&img), Some("image"));
+
+        let vazio = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&vazio), stanza::MSG_TYPE_TEXT);
+    }
+
+    #[test]
+    fn lottie_behind_bot_forwarded_stays_sticker() {
+        let m = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                lottie_sticker_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(media_type_from_message(&m), Some("sticker"));
+    }
+
+    #[test]
     fn backfilled_wrappers_classify_by_inner() {
         let spoiler = wa::Message {
             spoiler_message: buffa::MessageField::some(fpm(text_inner())),
@@ -2651,6 +2971,101 @@ mod collect_stale_device_users {
         info
     }
 
+    /// The case that separates a named rejection from an inferred one: one
+    /// device is rejected by name while another simply produced no bundle (an
+    /// absent or malformed one, or a session setup that failed). Only the named
+    /// device's user may be refreshed -- deleting the other user's device
+    /// registry would force a re-resolution over a failure that says nothing
+    /// about the list being stale.
+    #[test]
+    fn only_the_named_device_is_refreshed_when_the_server_named_it() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let named = lid_device("100000000000002", 2);
+        let merely_missing = lid_device("100000000000003", 3);
+        let dist = vec![delivered.clone(), named.clone(), merely_missing.clone()];
+
+        let out = stale_users_for(true, &[named], Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(set.contains("100000000000002"), "the named device's user");
+        assert!(
+            !set.contains("100000000000003"),
+            "a device that merely produced no bundle is not evidence of a stale list"
+        );
+        assert_eq!(set.len(), 1);
+    }
+
+    /// A batch-wide failure names nobody, so the unencrypted remainder is the
+    /// only signal left -- and every target in it is suspect, because none of
+    /// them got a bundle either.
+    #[test]
+    fn a_batch_wide_failure_falls_back_to_the_unencrypted_remainder() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let missing = lid_device("100000000000002", 2);
+        let dist = vec![delivered.clone(), missing];
+
+        let out = stale_users_for(true, &[], Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(set.contains("100000000000002"));
+        assert_eq!(set.len(), 1);
+    }
+
+    /// No unregistered device at all means nothing to refresh, whatever else
+    /// went unencrypted.
+    #[test]
+    fn nothing_is_refreshed_without_an_unregistered_device() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let dist = vec![lid_device("100000000000001", 1)];
+
+        assert!(stale_users_for(false, &[], Some(&dist), &[], &info).is_empty());
+    }
+
+    /// Closes the loop the named rejection opens: the rejected device gets no
+    /// bundle, so it is never in the encrypted set, so it surfaces here as a
+    /// user to re-resolve. This is the recovery — not the sender-key marking,
+    /// which deliberately covers the whole target set (WA Web
+    /// `markHasSenderKey(x, skDistribList)`).
+    #[test]
+    fn a_device_that_was_never_encrypted_for_is_reported_stale() {
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let rejected = lid_device("100000000000002", 9);
+        let dist = vec![delivered.clone(), rejected.clone()];
+
+        let out = collect_stale_device_users(Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(
+            set.contains("100000000000002"),
+            "the device with no bundle must come back as stale"
+        );
+        assert!(
+            !set.contains("100000000000001"),
+            "a device that did receive the SKDM is not stale"
+        );
+    }
+
+    /// The counterpart: when every target was encrypted for, nothing is stale,
+    /// so an ordinary group send does not invalidate any device list.
+    #[test]
+    fn a_fully_delivered_distribution_reports_nothing_stale() {
+        let info = group_info_lid(&[]);
+        let a = lid_device("100000000000001", 1);
+        let b = lid_device("100000000000002", 2);
+        let dist = vec![a.clone(), b.clone()];
+
+        assert!(collect_stale_device_users(Some(&dist), &[a, b], &info).is_empty());
+    }
+
     #[test]
     fn emits_lid_and_pn_alias_when_mapping_known() {
         let info = group_info_lid(&[("100000000000001", "15550000001")]);
@@ -2793,6 +3208,39 @@ mod mark_full_distribution_list {
         }
     }
 
+    /// A store whose reads fail, standing in for a backend that is down.
+    #[derive(Clone)]
+    struct FailingSessionStore;
+    #[async_trait::async_trait]
+    impl SessionStore for FailingSessionStore {
+        async fn load_session(
+            &self,
+            _: &ProtocolAddress,
+        ) -> SigResult<Option<crate::libsignal::protocol::SessionRecord>> {
+            Err(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState(
+                    "load_session",
+                    "session store is unavailable".to_string(),
+                ),
+            )
+        }
+        async fn has_session(&self, _: &ProtocolAddress) -> SigResult<bool> {
+            Err(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState(
+                    "has_session",
+                    "session store is unavailable".to_string(),
+                ),
+            )
+        }
+        async fn store_session(
+            &mut self,
+            _: &ProtocolAddress,
+            _: crate::libsignal::protocol::SessionRecord,
+        ) -> SigResult<()> {
+            unreachable!("nothing is stored once the reads fail")
+        }
+    }
+
     #[derive(Clone)]
     struct MemIdentityStore {
         pair: IdentityKeyPair,
@@ -2893,7 +3341,7 @@ mod mark_full_distribution_list {
         let mut sks = MemSenderKeyStore::default();
         sks.records.insert(name.clone(), record);
 
-        crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+        encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
             .await
             .expect("group encrypt");
 
@@ -2921,7 +3369,7 @@ mod mark_full_distribution_list {
         // Empty store: no local SenderKeyRecord for `name`.
         let mut sks = MemSenderKeyStore::default();
 
-        let err = crate::send::encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
+        let err = encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
             .await
             .expect_err("a missing sender key must error");
         assert!(
@@ -3014,17 +3462,223 @@ mod mark_full_distribution_list {
         (ss, is)
     }
 
+    /// `established_stores` for more than one peer: every listed device gets a
+    /// session, anything else has to go through the resolver's prekey fetch.
+    async fn established_stores_for(peers: &[&Jid]) -> (MemSessionStore, MemIdentityStore) {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let sender = IdentityKeyPair::generate(&mut rng);
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: sender,
+            reg_id: 42,
+            known: Default::default(),
+        };
+        for peer in peers {
+            process_prekey_bundle(
+                &peer.to_protocol_address(),
+                &mut ss,
+                &mut is,
+                &signed_prekey_bundle(),
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .unwrap();
+        }
+        (ss, is)
+    }
+
     #[tokio::test]
-    async fn failed_device_is_still_marked_has_key() {
+    async fn targeted_status_retry_sends_only_the_requesting_device() {
+        let status = Jid::status_broadcast();
+        let own_pn: Jid = "12025550120:7@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000:7@lid".parse().unwrap();
+        let requester: Jid = "100000000000001:11@lid".parse().unwrap();
+        let (mut sessions, mut identities) = established_stores(&requester).await;
+        let mut sender_keys = MemSenderKeyStore::default();
+        let mut prekeys = UnusedPreKeyStore;
+        let signed_prekeys = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+        let group = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let message = wa::Message {
+            conversation: Some("status retry".into()),
+            ..Default::default()
+        };
+        let account = wa::ADVSignedDeviceIdentity::default();
+        let extension = NodeBuilder::new("custom-extension")
+            .attr("version", "1")
+            .build();
+
+        let prepared = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &MockSendContextResolver::new(),
+            GroupStanzaRequest {
+                group: &group,
+                own_jid: &own_pn,
+                own_lid: &own_lid,
+                account: Some(&account),
+                to: &status,
+                message: &message,
+                message_id: "STATUS-RETRY-1",
+                force_distribution: false,
+                distribution_targets: Some(vec![requester.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::Required,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: std::slice::from_ref(&extension),
+                pre_encoded: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut attrs = prepared.node.attrs();
+        assert_eq!(
+            attrs.optional_string("to").unwrap().as_ref(),
+            "status@broadcast"
+        );
+        assert_eq!(
+            attrs.optional_string("id").unwrap().as_ref(),
+            "STATUS-RETRY-1"
+        );
+        assert!(attrs.optional_string("participant").is_none());
+        assert!(attrs.optional_string("recipient").is_none());
+        assert!(attrs.optional_string("addressing_mode").is_none());
+        assert!(attrs.optional_string("phash").is_none());
+        assert_eq!(
+            prepared
+                .node
+                .get_optional_child("custom-extension")
+                .unwrap()
+                .attrs()
+                .optional_string("version")
+                .unwrap()
+                .as_ref(),
+            "1"
+        );
+
+        let skmsg = prepared.node.get_optional_child("enc").unwrap();
+        let mut skmsg_attrs = skmsg.attrs();
+        assert_eq!(
+            skmsg_attrs.optional_string("type").unwrap().as_ref(),
+            stanza::ENC_TYPE_SKMSG
+        );
+        assert!(skmsg_attrs.optional_string("count").is_none());
+
+        let participants = prepared.node.get_optional_child("participants").unwrap();
+        let targets = participants.children().unwrap();
+        assert_eq!(targets.len(), 1, "status retry must not fan out");
+        assert_eq!(
+            targets[0].attrs().optional_string("jid").unwrap().as_ref(),
+            requester.to_string()
+        );
+        assert!(
+            targets[0]
+                .get_optional_child("enc")
+                .unwrap()
+                .attrs()
+                .optional_string("count")
+                .is_none(),
+            "captured status SKDM encryption has no retry count"
+        );
+        assert_eq!(prepared.skdm_devices, [requester]);
+    }
+
+    #[tokio::test]
+    async fn required_targeted_distribution_reports_an_unregistered_target() {
+        let status = Jid::status_broadcast();
+        let own_pn: Jid = "12025550121:7@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000002:7@lid".parse().unwrap();
+        let requester: Jid = "100000000000003:11@lid".parse().unwrap();
+        let mut sessions = MemSessionStore::default();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut identities = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sender_keys = MemSenderKeyStore::default();
+        let mut prekeys = UnusedPreKeyStore;
+        let signed_prekeys = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+        let group = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let message = wa::Message {
+            conversation: Some("status retry".into()),
+            ..Default::default()
+        };
+
+        let result = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &MockSendContextResolver::new().with_prekey_error(406),
+            GroupStanzaRequest {
+                group: &group,
+                own_jid: &own_pn,
+                own_lid: &own_lid,
+                account: Some(&wa::ADVSignedDeviceIdentity::default()),
+                to: &status,
+                message: &message,
+                message_id: "STATUS-RETRY-MISSING-SESSION",
+                force_distribution: false,
+                distribution_targets: Some(vec![requester.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::Required,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a targeted retry must not send without its SKDM"),
+        };
+
+        assert!(
+            format!("{error:#}").contains("required sender-key distribution failed"),
+            "unexpected error chain: {error:#}"
+        );
+        let failure = error
+            .downcast_ref::<RequiredSenderKeyDistributionError>()
+            .expect("required failures must retain typed stale-target metadata");
+        assert_eq!(failure.stale_device_users(), [requester.user.as_str()]);
+        assert_eq!(
+            crate::request::ServerErrorCode::from_anyhow(&error).map(|server| server.code),
+            Some(406),
+            "the typed failure must preserve the original server error chain"
+        );
+    }
+
+    /// `markHasSenderKey(x, M)` marks the whole target set, not the encrypted
+    /// subset, so a companion whose SKDM encryption failed still counts as keyed
+    /// and no re-fanout storm follows. `getKeyDistributionMsg` swallows a
+    /// companion's encryption failure (`isPrimaryDevice(e)` is false), which is
+    /// what lets that marking be reached at all.
+    #[tokio::test]
+    async fn failed_companion_is_still_marked_has_key() {
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
         let own_lid: Jid = "100000000000000@lid".parse().unwrap();
-        // A has a session (encrypts ok); B has neither session nor bundle,
-        // mimicking a device that 406'd / has no key material.
+        // A has a session (encrypts ok); B is a COMPANION with neither session
+        // nor bundle, mimicking a device that 406'd / has no key material.
         let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
-        let b: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let b: Jid = "559933334444:12@s.whatsapp.net".parse().unwrap();
+        let b_primary: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
 
-        let (mut ss, mut is) = established_stores(&a).await;
+        let (mut ss, mut is) = established_stores_for(&[&a, &b_primary]).await;
         let mut sks = MemSenderKeyStore::default();
         let mut pks = UnusedPreKeyStore;
         let spks = UnusedSignedPreKeyStore;
@@ -3054,24 +3708,27 @@ mod mark_full_distribution_list {
             &rt,
             &mut stores,
             &resolver,
-            &group_info,
-            &own_jid,
-            &own_lid,
-            None,
-            group,
-            &msg,
-            "TESTREQID".into(),
-            false,
-            Some(vec![a.clone(), b.clone()]),
-            None,
-            None,
-            &[],
-            None,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID",
+                force_distribution: false,
+                distribution_targets: Some(vec![a.clone(), b_primary.clone(), b.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
         )
         .await
         .expect("prepare_group_stanza should succeed even when a device fails to encrypt");
 
-        let marked: std::collections::HashSet<String> = prepared
+        let marked: HashSet<String> = prepared
             .skdm_devices
             .iter()
             .map(|j| j.to_string())
@@ -3083,19 +3740,188 @@ mod mark_full_distribution_list {
         );
         assert!(
             marked.contains(&b.to_string()),
-            "device whose SKDM encryption FAILED must still be marked has_key \
+            "COMPANION whose SKDM encryption FAILED must still be marked has_key \
                  (WA Web markHasSenderKey(x, M) marks the full target set → no re-fanout storm)"
         );
         assert_eq!(
             prepared.skdm_devices.len(),
-            2,
-            "exactly the full distribution list (A + B), not just the encrypted subset"
+            3,
+            "exactly the full distribution list, not just the encrypted subset"
         );
 
         // A key-distributing send must carry a phash (computed over the list).
         assert!(
             prepared.node.attrs().optional_string("phash").is_some(),
             "a key-distributing group send must carry a phash"
+        );
+    }
+
+    /// The operator's report, at the layer that creates it: in a closed group
+    /// one participant sits on "waiting for this message" forever while every
+    /// other member reads normally.
+    ///
+    /// A primary that never received its SKDM must not be reported as keyed.
+    /// `markHasSenderKey(x, M)` marks the whole target set, but WA Web can never
+    /// reach it with a failed primary in `M`: `getKeyDistributionMsg` rejects
+    /// the entire send on `isPrimaryDevice(e)` and only swallows companions. Our
+    /// marking is the same; the guarantee that no primary is marked without its
+    /// SKDM is what was missing, and a primary marked warm is filtered out of
+    /// every later send by the `device_and_primary_warm` gate, permanently:
+    /// nothing but that member's own traffic ever unmarks it.
+    #[tokio::test]
+    async fn a_primary_that_got_no_skdm_is_not_reported_as_keyed() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+        // A encrypts; B is a whole user whose primary has no key material, plus
+        // a companion that is equally unreachable.
+        let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let b_primary: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let b_companion: Jid = "559933334444:12@s.whatsapp.net".parse().unwrap();
+
+        let (mut ss, mut is) = established_stores(&a).await;
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        let resolver = MockSendContextResolver::new();
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), a.to_non_ad(), b_primary.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &resolver,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "UNKEYEDPRIMARY",
+                force_distribution: false,
+                distribution_targets: Some(vec![a.clone(), b_primary.clone(), b_companion.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("a best-effort send survives a member it cannot encrypt for");
+
+        let marked: HashSet<String> = prepared
+            .skdm_devices
+            .iter()
+            .map(|j| j.to_string())
+            .collect();
+
+        assert!(
+            marked.contains(&a.to_string()),
+            "the device that received its SKDM stays marked"
+        );
+        assert!(
+            !marked.contains(&b_primary.to_string()),
+            "a PRIMARY that received no SKDM must not be reported as keyed: marking \
+             it hides the whole user from every later send's target filter"
+        );
+        assert!(
+            marked.contains(&b_companion.to_string()),
+            "the companion keeps the markHasSenderKey(x, M) rule; only the primary \
+             is held back, mirroring getKeyDistributionMsg's isPrimaryDevice gate"
+        );
+    }
+
+    /// What a device the server returns no bundle for costs, measured on both
+    /// halves: it gets no SKDM, and it produces no refresh signal either, since
+    /// `stale_users_for` only reports users once a device came back 406. So the
+    /// device stays on the participant list and fails the same way next send —
+    /// its only way back is the `<keys>` its own retry receipt carries.
+    #[tokio::test]
+    async fn keyless_device_gets_no_skdm_and_no_refresh_signal() {
+        let group: Jid = "120363000000000002@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+        let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let b: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let (mut ss, mut is) = established_stores(&a).await;
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // Empty resolver: B's prekey fetch returns no bundle at all, which is
+        // not the 406 the stale-user signal keys off.
+        let resolver = MockSendContextResolver::new();
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), a.to_non_ad(), b.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &resolver,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "KEYLESSDEVICE",
+                force_distribution: false,
+                distribution_targets: Some(vec![a.clone(), b.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("a best-effort send survives a device it cannot encrypt for");
+
+        let targets = prepared
+            .node
+            .get_optional_child("participants")
+            .expect("a key-distributing send carries <participants>")
+            .children()
+            .expect("participant children");
+        assert_eq!(targets.len(), 1, "the keyless device receives no SKDM");
+        assert_eq!(
+            targets[0].attrs().optional_string("jid").unwrap().as_ref(),
+            a.to_string()
+        );
+        assert!(
+            prepared.stale_device_users.is_empty(),
+            "an absent bundle is not a 406, so no device list is re-resolved"
         );
     }
 
@@ -3121,7 +3947,7 @@ mod mark_full_distribution_list {
             group_info: &GroupInfo,
             msg: &wa::Message,
             req: &str,
-        ) -> (wacore_binary::Node, bool) {
+        ) -> (Node, bool) {
             let (mut ss, mut is) = established_stores(a).await;
             let mut sks = MemSenderKeyStore::default();
             let mut pks = UnusedPreKeyStore;
@@ -3139,19 +3965,22 @@ mod mark_full_distribution_list {
                 &rt,
                 &mut stores,
                 &resolver,
-                group_info,
-                own_jid,
-                own_lid,
-                None,
-                group.clone(),
-                msg,
-                req.into(),
-                false,
-                Some(vec![a.clone()]),
-                None,
-                None,
-                &[],
-                None,
+                GroupStanzaRequest {
+                    group: group_info,
+                    own_jid,
+                    own_lid,
+                    account: None,
+                    to: group,
+                    message: msg,
+                    message_id: req,
+                    force_distribution: false,
+                    distribution_targets: Some(vec![a.clone()]),
+                    distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                    phash_devices: None,
+                    edit: None,
+                    extra_nodes: &[],
+                    pre_encoded: None,
+                },
             )
             .await
             .expect("prepare_group_stanza should succeed");
@@ -3230,8 +4059,7 @@ mod mark_full_distribution_list {
             known: Default::default(),
         };
         let mut sks = MemSenderKeyStore::default();
-        let chain_name =
-            crate::types::jid::make_sender_key_name(&group, &own_jid.to_protocol_address());
+        let chain_name = make_sender_key_name(&group, &own_jid.to_protocol_address());
         let probe = ChainLockProbe {
             lock: sks.sender_key_lock(&chain_name).await,
             setup_lock: sks.session_setup_lock(&chain_name).await,
@@ -3263,19 +4091,22 @@ mod mark_full_distribution_list {
             &rt,
             &mut stores,
             &resolver,
-            &group_info,
-            &own_jid,
-            &own_lid,
-            None,
-            group,
-            &msg,
-            "TESTREQID2".into(),
-            false,
-            Some(vec![b.clone()]),
-            None,
-            None,
-            &[],
-            None,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID2",
+                force_distribution: false,
+                distribution_targets: Some(vec![b.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
         )
         .await
         .expect("prepare_group_stanza should succeed");
@@ -3358,19 +4189,22 @@ mod mark_full_distribution_list {
             &rt,
             &mut stores,
             &resolver,
-            &group_info,
-            &own_jid,
-            &own_lid,
-            None,
-            group,
-            &msg,
-            "TESTREQID_ISO".into(),
-            false,
-            Some(vec![good.clone(), bad.clone()]),
-            None,
-            None,
-            &[],
-            None,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID_ISO",
+                force_distribution: false,
+                distribution_targets: Some(vec![good.clone(), bad.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
         )
         .await
         .expect("prepare_group_stanza must succeed despite one device's setup failure");
@@ -3385,6 +4219,593 @@ mod mark_full_distribution_list {
             "only the good device receives an SKDM; the failed one is skipped, \
              not aborting the whole cohort"
         );
+    }
+
+    /// Same fixture as the isolation test above, read from the other side: the
+    /// device that gets no SKDM is the moment a participant starts seeing
+    /// "Waiting for this message", and until it reached a counter the only
+    /// evidence it happened was a log line nobody was tailing.
+    #[tokio::test]
+    async fn a_device_the_group_send_cannot_key_is_counted() {
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000001@lid".parse().unwrap();
+        let good: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let bad: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // `create_mock_bundle`'s zeroed signature fails X3DH, so `bad` is the
+        // device the fan-out drops.
+        let resolver = MockSendContextResolver::new()
+            .with_bundle(good.clone(), signed_prekey_bundle())
+            .with_bundle(bad.clone(), create_mock_bundle());
+
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), good.to_non_ad(), bad.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &resolver,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID_COUNT",
+                force_distribution: false,
+                distribution_targets: Some(vec![good.clone(), bad.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("the send still succeeds; that part is parity and does not change");
+
+        // Exactly one entry, and this is also what pins the no-double-count
+        // rule: `bad` has no session, so it fails the encrypt fan-out too, and a
+        // fan-out that counted that failure would report one dropped device as
+        // both a session-setup drop and an encrypt drop.
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::SessionSetup, 1)],
+            "the dropped device must be reported exactly once, as a session-setup failure"
+        );
+    }
+
+    /// The counter has to stay silent when nothing went wrong, or a rate built
+    /// on it measures traffic rather than breakage.
+    #[tokio::test]
+    async fn a_group_send_that_keys_every_device_counts_nothing() {
+        let group: Jid = "120363000000000004@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000001@lid".parse().unwrap();
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        let resolver = MockSendContextResolver::new()
+            .with_bundle(first.clone(), signed_prekey_bundle())
+            .with_bundle(second.clone(), signed_prekey_bundle());
+
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), first.to_non_ad(), second.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &resolver,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID_CLEAN",
+                force_distribution: false,
+                distribution_targets: Some(vec![first.clone(), second.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("prepare");
+
+        assert_eq!(
+            prepared
+                .node
+                .get_optional_child("participants")
+                .and_then(|p| p.children().map(|c| c.len()))
+                .unwrap_or(0),
+            2,
+            "both devices are keyed, so both get an SKDM"
+        );
+        assert!(
+            resolver.captured_unkeyable().is_empty(),
+            "a send that keyed everyone must not report a drop: {:?}",
+            resolver.captured_unkeyable()
+        );
+    }
+
+    /// Run the session half of the fan-out, which is where a device the server
+    /// will not hand key material for is dropped.
+    async fn ensure_sessions(resolver: &MockSendContextResolver, devices: &[Jid]) -> SessionPlan {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+        ensure_sessions_for_devices(&TokioTestRuntime, &mut stores, resolver, devices)
+            .await
+            .expect("a device without key material is skipped, not fatal")
+    }
+
+    /// A device the response simply omits is ambiguous, and is counted as such.
+    #[tokio::test]
+    async fn a_device_that_came_back_without_a_bundle_is_counted() {
+        let absent: Jid = "559955556666:0@s.whatsapp.net".parse().unwrap();
+        let resolver = MockSendContextResolver::new().with_missing_bundle(absent.clone());
+
+        ensure_sessions(&resolver, std::slice::from_ref(&absent)).await;
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::NoBundle, 1)]
+        );
+    }
+
+    /// A rejection carries the server's code, and only a 406 claims the device
+    /// is gone: any other code is counted and otherwise left alone, so no
+    /// device list is refreshed on a server-side wobble. The rejection is also
+    /// the reason the bundle is missing, so it must not also be counted as one.
+    #[tokio::test]
+    async fn a_rejected_device_is_counted_under_its_code_and_only_a_406_invalidates() {
+        for code in [406u16, 503] {
+            let gone: Jid = "559977778888:0@s.whatsapp.net".parse().unwrap();
+            let resolver = MockSendContextResolver::new().with_rejected_device(gone.clone(), code);
+
+            let plan = ensure_sessions(&resolver, std::slice::from_ref(&gone)).await;
+
+            assert_eq!(
+                resolver.captured_unkeyable(),
+                vec![(crate::stats::UnkeyableDevice::Rejected(code), 1)],
+                "a {code} rejection is one drop, named by its code"
+            );
+            assert_eq!(
+                plan.rejected_devices.is_empty(),
+                code != 406,
+                "only a 406 may put the device on the device-list refresh list"
+            );
+        }
+    }
+
+    /// A batch-wide 406 names nobody, so every device it answered for is
+    /// counted under it rather than as an absent bundle — and under its own
+    /// reason, because attributing a named rejection to each device would claim
+    /// per-device knowledge the refusal does not carry.
+    #[tokio::test]
+    async fn a_batch_wide_refusal_counts_every_device_it_answered_for() {
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let resolver = MockSendContextResolver::new().with_prekey_error(406);
+
+        ensure_sessions(&resolver, &[first, second]).await;
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::BatchRefused, 2)],
+            "the whole batch is one refusal covering both devices"
+        );
+    }
+
+    /// A fetch that never answered — a timeout, a dropped socket, a 429 —
+    /// leaves the same devices unkeyed as a refusal does, and a best-effort
+    /// group send carries on without distributing to any of them. Counting only
+    /// the refusal would make the signal go quiet during the outage.
+    #[tokio::test]
+    async fn a_fetch_that_never_answered_counts_every_device_it_asked_about() {
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let resolver = MockSendContextResolver::new().with_prekey_error(503);
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // `expect_err` would need SessionPlan: Debug, which it has no other
+        // reason to carry.
+        assert!(
+            ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[first, second]
+            )
+            .await
+            .is_err(),
+            "a non-406 batch failure still fails the session half"
+        );
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::FetchFailed, 2)],
+            "both devices the fetch asked about are counted, under a reason that \
+             claims nothing about them"
+        );
+    }
+
+    /// A session store that cannot answer abandons the plan before any device
+    /// is keyed, and a best-effort group send then distributes to nobody. The
+    /// loudest local fault a send can hit has to move a counter.
+    #[tokio::test]
+    async fn a_session_store_that_cannot_answer_counts_every_device() {
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut sessions = FailingSessionStore;
+        let mut identities = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sender_keys = MemSenderKeyStore::default();
+        let mut prekeys = UnusedPreKeyStore;
+        let signed_prekeys = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+        let resolver = MockSendContextResolver::new();
+
+        assert!(
+            ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[first, second]
+            )
+            .await
+            .is_err(),
+            "a store that cannot answer still fails the session half"
+        );
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::SessionLookup, 2)],
+            "the error takes the whole plan with it, so every device is unkeyed"
+        );
+    }
+
+    /// A steady-state group stanza's size tracks our OWN device count, never
+    /// the group's.
+    ///
+    /// `<participants>` carries sender-key distributions only. A warm send
+    /// distributes none to members — but it does re-distribute to our own
+    /// companions on every send, because own devices are never memoized warm
+    /// (WA Web `!isMeDevice`, see `update_sender_key_devices`). So the steady
+    /// state is one `<to>` per own companion and nothing per member, and the
+    /// `phash` covering the whole device set is a fixed-width digest ("2:" plus
+    /// 8 base64 chars) memoized on the resolved set. Both the single-device and
+    /// the multi-device steady state are pinned below at 8 and at 512 members:
+    /// the encoded stanza is the same size either way, so a repeat group send
+    /// has no per-member encoding to cache between sends.
+    ///
+    /// Pinned as a test rather than left to the group benchmarks because the
+    /// claim is about the *shape* of the stanza: a future change that folded
+    /// member state into it would still benchmark fine on a small group.
+    #[tokio::test]
+    async fn warm_group_stanza_size_tracks_own_devices_not_group_size() {
+        // Our own other devices, which receive a fresh SKDM on every send.
+        // Shared with the assertions so they can name the exact JIDs the stanza
+        // must address, not merely how many.
+        fn companion_jids(companions: usize) -> Vec<Jid> {
+            (1..=companions)
+                .map(|d| format!("12025550111:{d}@s.whatsapp.net").parse().unwrap())
+                .collect()
+        }
+
+        // `members` is the group; `companions` are our own other devices.
+        async fn warm_stanza(members: usize, companions: usize) -> Node {
+            let own_jid: Jid = "12025550111:0@s.whatsapp.net".parse().unwrap();
+            let own_lid: Jid = "100000000000001:0@lid".parse().unwrap();
+            let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+            let participants: Vec<Jid> = (0..members)
+                .map(|i| {
+                    format!("{}@s.whatsapp.net", 12025550200u64 + i as u64)
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+            let own_companions: Vec<Jid> = companion_jids(companions);
+
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut sks = MemSenderKeyStore::default();
+            // A warm send never creates the chain, so seed it exactly as the
+            // first (cold) send to this group would have.
+            let sk_name = make_sender_key_name(&group, &own_jid.to_protocol_address());
+            crate::libsignal::protocol::create_sender_key_distribution_message(
+                &sk_name, &mut sks, &mut rng,
+            )
+            .await
+            .expect("seed the sender key chain");
+
+            // Sessions already exist for the companions, as they do in the
+            // steady state, so the SKDM encrypts to `msg` (not `pkmsg`) and no
+            // prekey fetch or device-identity node enters the stanza.
+            let mut ss = MemSessionStore::default();
+            let mut is = MemIdentityStore {
+                pair: IdentityKeyPair::generate(&mut rng),
+                reg_id: 7,
+                known: Default::default(),
+            };
+            for companion in &own_companions {
+                let addr = companion.to_protocol_address();
+                process_prekey_bundle(
+                    &addr,
+                    &mut ss,
+                    &mut is,
+                    &signed_prekey_bundle(),
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("establish the companion session");
+                // `process_prekey_bundle` alone leaves the session holding a
+                // pending pre-key, so its next encryption is still a `pkmsg`
+                // first contact. The steady state this fixture models is the
+                // one after the companion has answered, which is what clears
+                // the pending key — so clear it, and let the `enc type`
+                // assertion below hold the fixture to it.
+                let mut record = ss
+                    .load_session(&addr)
+                    .await
+                    .expect("load")
+                    .expect("session present");
+                record
+                    .session_state_mut()
+                    .expect("session state")
+                    .clear_unacknowledged_pre_key_message();
+                ss.store_session(&addr, record).await.expect("store");
+            }
+            let mut pks = UnusedPreKeyStore;
+            let spks = UnusedSignedPreKeyStore;
+            let mut stores = SignalStores {
+                sender_key_store: &mut sks,
+                session_store: &mut ss,
+                identity_store: &mut is,
+                prekey_store: &mut pks,
+                signed_prekey_store: &spks,
+            };
+
+            let mut group_participants = participants.clone();
+            group_participants.push(own_jid.to_non_ad());
+            let group_info = GroupInfo::new(group_participants, AddressingMode::Pn);
+            // The full resolved device set the warm send hashes into `phash`.
+            // The companions belong inside it, not beside it: production filters
+            // the SKDM targets out of this very set (`filter_skdm_targets` over
+            // `all_devices_for_phash`), and the server validates the phash against
+            // every recipient device — so a stanza whose `<participants>` named a
+            // device the phash did not cover is a shape no send produces.
+            let mut resolved_devices = participants;
+            resolved_devices.extend(own_companions.iter().cloned());
+            let resolved = ResolvedGroupDevices::new(resolved_devices);
+            let msg = wa::Message {
+                conversation: Some("steady state".into()),
+                ..Default::default()
+            };
+
+            prepare_group_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &MockSendContextResolver::new(),
+                GroupStanzaRequest {
+                    group: &group_info,
+                    own_jid: &own_jid,
+                    own_lid: &own_lid,
+                    account: None,
+                    to: &group,
+                    message: &msg,
+                    message_id: "WARMGROUPSCALE1",
+                    force_distribution: false,
+                    distribution_targets: (!own_companions.is_empty())
+                        .then(|| own_companions.clone()),
+                    distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                    phash_devices: Some(&resolved),
+                    edit: None,
+                    extra_nodes: &[],
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("warm group send")
+            .node
+        }
+
+        // Every ciphertext in the stanza varies in length run to run (WA pads
+        // each plaintext by a random 1..=16 bytes), so sizes are only
+        // comparable with the payloads normalised. What is under test is the
+        // stanza's structure and attributes, not the ciphertext.
+        fn with_fixed_payloads(node: &Node) -> Node {
+            use wacore_binary::node::NodeContent;
+            let mut out = node.clone();
+            out.content = match out.content {
+                Some(NodeContent::Bytes(_)) => Some(NodeContent::Bytes(vec![0u8; 96])),
+                Some(NodeContent::Nodes(children)) => Some(NodeContent::Nodes(
+                    children.iter().map(with_fixed_payloads).collect(),
+                )),
+                other => other,
+            };
+            out
+        }
+
+        // The whole hierarchy, not just the root's children: a `<to>` or `<enc>`
+        // subtree that grew with the group would otherwise slip past, and a
+        // rename that happens to preserve the encoded length would slip past the
+        // size comparison too. Attribute *keys* only — the values legitimately
+        // differ (the phash digests two different device sets), and the phash is
+        // asserted on its own below.
+        fn shape(node: &Node) -> String {
+            let mut attrs: Vec<&str> = node.attrs.0.iter().map(|(k, _)| k.as_ref()).collect();
+            attrs.sort_unstable();
+            let children: Vec<String> = node.children().unwrap_or(&[]).iter().map(shape).collect();
+            format!("{}[{}]({})", node.tag, attrs.join(","), children.join(" "))
+        }
+
+        // Single-device account (no companions) and a two-companion one: the
+        // two steady states this client actually produces.
+        for companions in [0usize, 2] {
+            let small = warm_stanza(8, companions).await;
+            let large = warm_stanza(512, companions).await;
+
+            for (label, node) in [("8-member", &small), ("512-member", &large)] {
+                // The JIDs, not just how many: a list of the right length that
+                // addressed group members instead of our companions would be
+                // exactly the regression this test exists to catch.
+                let distributed: Vec<Jid> = node
+                    .get_optional_child("participants")
+                    .and_then(Node::children)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|to| to.attrs().jid("jid"))
+                    .collect();
+                assert_eq!(
+                    distributed,
+                    companion_jids(companions),
+                    "{label} warm send distributes to our own companions only, \
+                     never to the group's members"
+                );
+                // The enc type is the whole premise of the fixture, so it is
+                // checked rather than asserted in a comment.
+                for to in node
+                    .get_optional_child("participants")
+                    .and_then(Node::children)
+                    .unwrap_or(&[])
+                {
+                    let enc = to
+                        .get_optional_child("enc")
+                        .unwrap_or_else(|| panic!("{label} participant carries an enc"));
+                    assert_eq!(
+                        enc.attrs().optional_string("type").as_deref(),
+                        Some("msg"),
+                        "{label} companion SKDM ciphertext type"
+                    );
+                }
+                // Version tag plus 8 base64 chars — the width is what makes the
+                // stanza size independent of the set hashed, and the `2:` is
+                // what makes it the phash the server expects rather than some
+                // other ten-character attribute.
+                let phash = node
+                    .attrs()
+                    .optional_string("phash")
+                    .unwrap_or_else(|| panic!("{label} warm send must carry a phash"));
+                assert!(
+                    phash.starts_with("2:") && phash.len() == 10,
+                    "{label} phash is a fixed-width v2 digest, got {phash:?}"
+                );
+            }
+
+            assert_eq!(
+                shape(&small),
+                shape(&large),
+                "same stanza shape with {companions} companions"
+            );
+            assert_eq!(
+                wacore_binary::marshal::marshal(&with_fixed_payloads(&small))
+                    .unwrap()
+                    .len(),
+                wacore_binary::marshal::marshal(&with_fixed_payloads(&large))
+                    .unwrap()
+                    .len(),
+                "the encoded warm group stanza is the same size at 8 and 512 members \
+                 with {companions} companions"
+            );
+        }
     }
 }
 
@@ -3562,23 +4983,18 @@ mod local_identity_change_on_send {
         }
     }
     #[derive(Default)]
-    struct MemSenderKeyStore(
-        HashMap<crate::libsignal::store::sender_key_name::SenderKeyName, SenderKeyRecord>,
-    );
+    struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
     #[async_trait::async_trait]
     impl SenderKeyStore for MemSenderKeyStore {
         async fn store_sender_key(
             &mut self,
-            n: &crate::libsignal::store::sender_key_name::SenderKeyName,
+            n: &SenderKeyName,
             r: SenderKeyRecord,
         ) -> SigResult<()> {
             self.0.insert(n.clone(), r);
             Ok(())
         }
-        async fn load_sender_key(
-            &self,
-            n: &crate::libsignal::store::sender_key_name::SenderKeyName,
-        ) -> SigResult<Option<SenderKeyRecord>> {
+        async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
             Ok(self.0.get(n).cloned())
         }
     }
@@ -3738,6 +5154,61 @@ mod local_identity_change_on_send {
 
         assert_eq!(raw.devices.len(), 1);
         assert_eq!(raw.devices[0].device_jid, device_ok);
+        // `assume_ready` ran no session setup, so nothing has counted this
+        // device yet and the fan-out is the first thing to see it dropped.
+        assert_eq!(raw.unkeyed_at_encrypt, 1);
+    }
+
+    /// A stored session that cannot be used is the failure session repair
+    /// exists for, and the fan-out is the only place that sees it: session
+    /// setup skips the device because `has_session` says one is there.
+    ///
+    /// This is also why the "already counted" set names devices instead of
+    /// testing the error: libsignal reports a degenerate stored session as
+    /// `SessionNotFound`, exactly like a device that has no session at all.
+    #[tokio::test]
+    async fn a_stored_session_that_cannot_be_used_is_counted_at_encrypt() {
+        let device = Jid::pn_device("15550000002", 0);
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut session_store = MemSessionStore::default();
+        let mut identity_store = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            known: HashMap::new(),
+        };
+        // A row that exists (so `has_session` is true) and carries no usable
+        // state, which is what an unusable stored session looks like.
+        session_store
+            .0
+            .insert(device.to_protocol_address(), Vec::new());
+
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = raw_fanout_stores(
+            &mut sender_key_store,
+            &mut session_store,
+            &mut identity_store,
+            &mut prekey_store,
+            &signed_prekey_store,
+        );
+
+        let devices = vec![device];
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &TokioTestRuntime,
+            &mut stores,
+            &devices,
+            b"payload",
+            SessionPlan::assume_ready(devices.len()),
+        )
+        .await
+        .expect("the send carries on without the device");
+
+        assert!(raw.devices.is_empty());
+        assert_eq!(
+            raw.unkeyed_at_encrypt, 1,
+            "the drop nobody else can see must be the one this counter reports"
+        );
     }
 
     /// Regression: the chunked fan-out must return empty, not divide by zero, for
@@ -3849,6 +5320,1374 @@ mod local_identity_change_on_send {
             resolver.captured_identity_changes(),
             vec![device],
             "replaced identity on the send path must be reported via the resolver"
+        );
+    }
+
+    /// The DM fan-out writes its `<to><enc>` nodes into the stanza's own
+    /// participant vector instead of staging one per half.
+    mod dm_fanout_sink {
+        use super::*;
+
+        fn sentinel() -> Node {
+            NodeBuilder::new("sentinel").build()
+        }
+
+        fn participant_jids(nodes: &[Node]) -> Vec<String> {
+            nodes
+                .iter()
+                .map(|n| {
+                    n.attrs()
+                        .optional_string("jid")
+                        .expect("participant node carries a jid")
+                        .into_owned()
+                })
+                .collect()
+        }
+
+        async fn fan_out_into(
+            devices: &[Jid],
+            resolver: &MockSendContextResolver,
+            nodes: &mut Vec<Node>,
+        ) -> EncryptFanoutSummary {
+            let (mut session_store, mut identity_store) = stores_with_sessions(devices).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            encrypt_for_devices_into(
+                &TokioTestRuntime,
+                &mut stores,
+                resolver,
+                devices,
+                b"payload",
+                false,
+                None,
+                nodes,
+                None,
+            )
+            .await
+            .expect("fan-out into the caller's buffer")
+        }
+
+        /// A half with no devices must contribute nothing at all: it may not
+        /// clear, replace, or grow the buffer it was handed.
+        #[tokio::test]
+        async fn an_empty_half_leaves_the_buffer_exactly_as_it_found_it() {
+            let mut nodes = vec![sentinel()];
+            let resolver = MockSendContextResolver::new();
+
+            let summary = fan_out_into(&[], &resolver, &mut nodes).await;
+
+            assert_eq!(nodes.len(), 1, "an empty half must append nothing");
+            assert_eq!(nodes[0].tag.as_ref(), "sentinel", "and remove nothing");
+            assert!(!summary.includes_prekey_message);
+            assert!(!summary.had_unregistered_device);
+        }
+
+        /// The single-device DM, which is the whole fan-out on a steady 1:1
+        /// chat: one node, appended after whatever the caller already had.
+        #[tokio::test]
+        async fn one_device_appends_one_node_after_the_existing_content() {
+            let device: Jid = "5511900000001:0@s.whatsapp.net".parse().unwrap();
+            let mut nodes = vec![sentinel()];
+            let resolver = MockSendContextResolver::new();
+
+            let summary = fan_out_into(std::slice::from_ref(&device), &resolver, &mut nodes).await;
+
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(
+                nodes[0].tag.as_ref(),
+                "sentinel",
+                "the sink appends; it does not overwrite"
+            );
+            assert_eq!(participant_jids(&nodes[1..]), vec![device.to_string()]);
+            assert!(
+                summary.includes_prekey_message,
+                "a session whose pre-key is still unacked emits pkmsg"
+            );
+        }
+
+        /// Several devices, appended in fan-out order after the existing
+        /// content, so two halves in a row concatenate rather than interleave.
+        #[tokio::test]
+        async fn many_devices_append_in_order_after_the_existing_content() {
+            let first: Vec<Jid> = (0..3u16)
+                .map(|i| format!("5511900000002:{i}@s.whatsapp.net").parse().unwrap())
+                .collect();
+            let second: Vec<Jid> = vec!["5511900000003:1@s.whatsapp.net".parse().unwrap()];
+            let mut nodes = vec![sentinel()];
+            let resolver = MockSendContextResolver::new();
+
+            fan_out_into(&first, &resolver, &mut nodes).await;
+            fan_out_into(&second, &resolver, &mut nodes).await;
+
+            assert_eq!(nodes[0].tag.as_ref(), "sentinel");
+            let mut expected: Vec<String> = first.iter().map(Jid::to_string).collect();
+            expected.extend(second.iter().map(Jid::to_string));
+            assert_eq!(
+                participant_jids(&nodes[1..]),
+                expected,
+                "each half appends its own devices, in order, after the last"
+            );
+        }
+
+        /// Skip-on-fail: a device with neither a session nor a bundle drops out
+        /// of the fan-out, and the surviving devices still land in the buffer.
+        #[tokio::test]
+        async fn a_device_that_cannot_encrypt_contributes_no_node() {
+            let good: Jid = "5511900000004:0@s.whatsapp.net".parse().unwrap();
+            let sessionless: Jid = "5511900000005:0@s.whatsapp.net".parse().unwrap();
+
+            // Only `good` gets a session; the resolver offers no bundle for the
+            // other, so its encrypt has nothing to work with.
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&good)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new().with_missing_bundle(sessionless.clone());
+
+            let mut nodes = vec![sentinel()];
+            encrypt_for_devices_into(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[good.clone(), sessionless],
+                b"payload",
+                false,
+                None,
+                &mut nodes,
+                None,
+            )
+            .await
+            .expect("one bad device must not abort the fan-out");
+
+            assert_eq!(
+                participant_jids(&nodes[1..]),
+                vec![good.to_string()],
+                "only the device that could encrypt is in the participant list"
+            );
+        }
+
+        /// The server names one device inside an otherwise fine response, and
+        /// that naming has to survive the resolver boundary: the fan-out sets
+        /// the same stale-device flag a batch-wide 406 would, so the group path
+        /// still refreshes the list after the send. Flattening the rejection
+        /// into "no bundle" loses it, and the stale device is kept forever.
+        #[tokio::test]
+        async fn a_named_rejection_reaches_the_fan_out_like_a_batch_failure() {
+            let warm: Jid = "5511900000061:0@s.whatsapp.net".parse().unwrap();
+            let gone: Jid = "5511900000061:9@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+
+            // Not `with_prekey_error`: the batch succeeds, and the server names
+            // the one device it will not hand a bundle for.
+            let resolver = MockSendContextResolver::new().with_rejected_device(gone.clone(), 406);
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[warm.clone(), gone.clone()],
+            )
+            .await
+            .expect("a named rejection must not fail the fan-out");
+
+            assert!(
+                plan.had_unregistered_device,
+                "the named device must raise the same flag a batch 406 raises"
+            );
+        }
+
+        /// Only a `406` means "this device is gone". Another refusal code says
+        /// something else, and refreshing a device list over it costs a usync
+        /// for nothing.
+        #[tokio::test]
+        async fn a_rejection_that_is_not_a_406_leaves_the_device_list_alone() {
+            let warm: Jid = "5511900000071:0@s.whatsapp.net".parse().unwrap();
+            let odd: Jid = "5511900000071:9@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new().with_rejected_device(odd.clone(), 503);
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[warm.clone(), odd.clone()],
+            )
+            .await
+            .expect("a non-406 rejection is still not a fan-out failure");
+
+            assert!(
+                !plan.had_unregistered_device,
+                "a 503 is not the server saying the device is unregistered"
+            );
+        }
+
+        /// A response with nothing rejected must not raise the flag either, or
+        /// every ordinary send would invalidate device lists.
+        #[tokio::test]
+        async fn a_clean_fetch_reports_no_unregistered_device() {
+            let warm: Jid = "5511900000081:0@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &MockSendContextResolver::new(),
+                std::slice::from_ref(&warm),
+            )
+            .await
+            .expect("plan");
+
+            assert!(!plan.had_unregistered_device);
+        }
+
+        /// End to end through `prepare_dm_stanza`: recipient devices and own
+        /// companion devices are two separate fan-outs but one participant
+        /// list, recipients first.
+        #[tokio::test]
+        async fn a_dm_stanza_carries_both_halves_in_one_participants_node() {
+            let own_jid: Jid = "5511900000010:0@s.whatsapp.net".parse().unwrap();
+            let recipient_a: Jid = "5511900000011:0@s.whatsapp.net".parse().unwrap();
+            let recipient_b: Jid = "5511900000011:1@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000010:2@s.whatsapp.net".parse().unwrap();
+            let all = vec![
+                recipient_a.clone(),
+                recipient_b.clone(),
+                own_companion.clone(),
+                own_jid.clone(),
+            ];
+
+            let (mut session_store, mut identity_store) = stores_with_sessions(&[
+                recipient_a.clone(),
+                recipient_b.clone(),
+                own_companion.clone(),
+            ])
+            .await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new();
+            let devices = ResolvedDmDevices::new(all, &own_jid, None);
+            let to = recipient_a.to_non_ad();
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            };
+
+            let prepared = prepare_dm_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                DmStanzaRequest {
+                    own_jid: &own_jid,
+                    own_lid: None,
+                    account: None,
+                    to: &to,
+                    message: &message,
+                    message_id: "DM_SINK_1",
+                    edit: None,
+                    extra_nodes: &[],
+                    devices: &devices,
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("dm stanza");
+
+            let participants = prepared
+                .node
+                .get_optional_child("participants")
+                .expect("stanza has a participants node");
+            let entries = participants.children().expect("participants has children");
+            // Same reasoning as the sink tests: the recipient half drains a
+            // FuturesUnordered, so which of its devices lands first is not
+            // promised. The boundary between the halves is, because they are
+            // sequential awaits, and that is what this test is about.
+            let written = participant_jids(entries);
+            assert_eq!(
+                written.len(),
+                3,
+                "each device contributes exactly one participant node"
+            );
+            let (recipients, own) = written.split_at(2);
+            assert_eq!(
+                recipients
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                [recipient_a.to_string(), recipient_b.to_string()]
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "both recipient devices belong to the first half"
+            );
+            assert_eq!(
+                own,
+                [own_companion.to_string()],
+                "the own-device half lands after the recipient half, in one list"
+            );
+        }
+
+        /// Every case below runs through the real fan-out; only the device set,
+        /// the sessions we hold and the bundles the resolver refuses change.
+        async fn prepare_dm(
+            own_jid: &Jid,
+            to: &Jid,
+            devices: &ResolvedDmDevices,
+            with_sessions: &[Jid],
+            missing_bundles: &[Jid],
+            message_id: &str,
+        ) -> Result<PreparedDmStanza, anyhow::Error> {
+            let (mut session_store, mut identity_store) = stores_with_sessions(with_sessions).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = missing_bundles
+                .iter()
+                .fold(MockSendContextResolver::new(), |resolver, device| {
+                    resolver.with_missing_bundle(device.clone())
+                });
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            };
+
+            prepare_dm_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                DmStanzaRequest {
+                    own_jid,
+                    own_lid: None,
+                    account: None,
+                    to,
+                    message: &message,
+                    message_id,
+                    edit: None,
+                    extra_nodes: &[],
+                    devices,
+                    pre_encoded: None,
+                },
+            )
+            .await
+        }
+
+        /// The empty-participants guard still fires when every device drops
+        /// out: an empty `<participants>` would silently drop the message.
+        #[tokio::test]
+        async fn a_dm_whose_every_device_fails_is_refused() {
+            let own_jid: Jid = "5511900000020:0@s.whatsapp.net".parse().unwrap();
+            let recipient: Jid = "5511900000021:0@s.whatsapp.net".parse().unwrap();
+
+            let devices =
+                ResolvedDmDevices::new(vec![recipient.clone(), own_jid.clone()], &own_jid, None);
+
+            let err = prepare_dm(
+                &own_jid,
+                &recipient.to_non_ad(),
+                &devices,
+                &[],
+                std::slice::from_ref(&recipient),
+                "DM_SINK_2",
+            )
+            .await
+            .err()
+            .expect("a stanza with no participants must not be built");
+            assert!(
+                err.to_string().contains("encryption failed for all"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// Regression (issue #1298): the recipient's devices and our own
+        /// companions share one participant list, so "the list is not empty"
+        /// still held for a stanza carrying our own devices alone. That stanza
+        /// is acked, no receipt ever follows, and the caller was told `Ok`.
+        #[tokio::test]
+        async fn a_dm_no_recipient_device_encrypted_is_not_reported_as_sent() {
+            let own_jid: Jid = "5511900000030:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000030:2@s.whatsapp.net".parse().unwrap();
+            let recipient_primary: Jid = "5511900000031:0@s.whatsapp.net".parse().unwrap();
+            let recipient_companion: Jid = "5511900000031:1@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let err = prepare_dm(
+                &own_jid,
+                &recipient_primary.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[recipient_primary.clone(), recipient_companion.clone()],
+                "DM_SINK_3",
+            )
+            .await
+            .err()
+            .expect("a DM that reached no recipient device must not report success");
+
+            let typed = err
+                .downcast_ref::<NoRecipientDeviceError>()
+                .expect("the caller must be able to match on this, not parse it");
+            assert!(
+                matches!(
+                    typed,
+                    NoRecipientDeviceError::EncryptionFailed { attempted: 2, .. }
+                ),
+                "unexpected variant: {typed:?}"
+            );
+            assert!(
+                std::error::Error::source(typed).is_some(),
+                "the first per-device failure must stay reachable as the source"
+            );
+        }
+
+        /// One surviving recipient device is a real delivery: the stanza goes
+        /// out with the devices that encrypted, the failures are skipped, and
+        /// the caller still gets `Ok`.
+        #[tokio::test]
+        async fn a_dm_with_one_recipient_device_left_still_sends() {
+            let own_jid: Jid = "5511900000040:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000040:1@s.whatsapp.net".parse().unwrap();
+            let reachable: Jid = "5511900000041:0@s.whatsapp.net".parse().unwrap();
+            let unreachable: Jid = "5511900000041:3@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    reachable.clone(),
+                    unreachable.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &reachable.to_non_ad(),
+                &devices,
+                &[reachable.clone(), own_companion.clone()],
+                std::slice::from_ref(&unreachable),
+                "DM_SINK_4",
+            )
+            .await
+            .expect("a partially encrypted DM is still sent");
+
+            let entries = prepared
+                .node
+                .get_optional_child("participants")
+                .expect("stanza has a participants node")
+                .children()
+                .expect("participants has children");
+            assert_eq!(
+                participant_jids(entries),
+                vec![reachable.to_string(), own_companion.to_string()],
+                "the stanza carries what encrypted, recipients first"
+            );
+            let fanout = prepared.recipient_fanout;
+            assert_eq!(
+                (fanout.addressed, fanout.encrypted),
+                (2, 1),
+                "the caller must be able to see one recipient device was dropped"
+            );
+            assert!(fanout.is_partial());
+            assert!(
+                !fanout.skipped_primary,
+                "the device that dropped was a companion, not the phone"
+            );
+        }
+
+        /// Regression (issue #1361): the recipient's phone drops out of the
+        /// fan-out and a companion does not, so the stanza is built, acked and
+        /// returned as `Ok`. Nothing the recipient can read was sent (the
+        /// chat lives on the phone) and before this the return value was
+        /// identical to a send that reached every device.
+        #[tokio::test]
+        async fn a_dm_that_lost_the_recipients_phone_says_so() {
+            let own_jid: Jid = "5511900000050:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000050:1@s.whatsapp.net".parse().unwrap();
+            let recipient_primary: Jid = "5511900000051:0@s.whatsapp.net".parse().unwrap();
+            let recipient_companion: Jid = "5511900000051:2@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &recipient_primary.to_non_ad(),
+                &devices,
+                &[recipient_companion.clone(), own_companion.clone()],
+                std::slice::from_ref(&recipient_primary),
+                "DM_SINK_10",
+            )
+            .await
+            .expect("a companion still encrypted, so the stanza is built");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (2, 1));
+            assert!(
+                fanout.skipped_primary,
+                "the one device whose absence means undelivered must be named"
+            );
+            assert!(fanout.is_partial());
+            assert_eq!(
+                prepared.unreached_devices,
+                vec![recipient_primary],
+                "a repair has to know which device holds no copy, not just how many"
+            );
+        }
+
+        /// The happy path answers the same question, and answers it "nobody was
+        /// lost": a caller reading `is_partial` must not have to special-case
+        /// a complete send.
+        #[tokio::test]
+        async fn a_dm_that_reached_every_device_reports_no_loss() {
+            let own_jid: Jid = "5511900000060:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000060:1@s.whatsapp.net".parse().unwrap();
+            let recipient_primary: Jid = "5511900000061:0@s.whatsapp.net".parse().unwrap();
+            let recipient_companion: Jid = "5511900000061:2@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &recipient_primary.to_non_ad(),
+                &devices,
+                &[
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                ],
+                &[],
+                "DM_SINK_11",
+            )
+            .await
+            .expect("every device has a session");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (2, 2));
+            assert!(!fanout.is_partial());
+            assert!(!fanout.skipped_primary);
+            assert!(!fanout.had_unregistered_device);
+            assert!(
+                prepared.unreached_devices.is_empty(),
+                "a complete fan-out names nobody, and allocates for nobody"
+            );
+        }
+
+        /// A note to self has no recipient half, so the fan-out it reports is
+        /// the empty one. `is_partial` must read false there: nothing was
+        /// addressed, so nothing was lost.
+        #[tokio::test]
+        async fn a_self_chat_reports_an_empty_recipient_fanout() {
+            let own_jid: Jid = "5511900000070:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000070:1@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![own_companion.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &own_jid.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[],
+                "DM_SINK_12",
+            )
+            .await
+            .expect("a note to self is its own-devices copy");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (0, 0));
+            assert!(!fanout.is_partial());
+            assert!(!fanout.skipped_primary);
+        }
+
+        /// A note to self has no recipient half at all: every resolved device is
+        /// ours and the own-devices copy IS the message, so this must not be
+        /// mistaken for a DM that lost its recipient.
+        #[tokio::test]
+        async fn a_self_chat_dm_carries_only_own_devices() {
+            let own_jid: Jid = "5511900000050:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000050:1@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![own_companion.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &own_jid.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[],
+                "DM_SINK_5",
+            )
+            .await
+            .expect("a self chat sends to our own companions");
+
+            let entries = prepared
+                .node
+                .get_optional_child("participants")
+                .expect("stanza has a participants node")
+                .children()
+                .expect("participants has children");
+            assert_eq!(
+                participant_jids(entries),
+                vec![own_companion.to_string()],
+                "only our own companion is addressable in a self chat"
+            );
+        }
+
+        /// The same empty recipient half with a destination that is not us: the
+        /// fan-out kept no device for them, so nothing was attempted and there
+        /// is nothing to deliver.
+        #[tokio::test]
+        async fn a_dm_whose_recipient_resolved_to_no_device_is_refused() {
+            let own_jid: Jid = "5511900000060:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000060:1@s.whatsapp.net".parse().unwrap();
+            let recipient: Jid = "5511900000061:0@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![own_companion.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+
+            let err = prepare_dm(
+                &own_jid,
+                &recipient.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[],
+                "DM_SINK_6",
+            )
+            .await
+            .err()
+            .expect("a DM with no recipient device must not report success");
+
+            assert!(
+                matches!(
+                    err.downcast_ref::<NoRecipientDeviceError>(),
+                    Some(NoRecipientDeviceError::Unresolved)
+                ),
+                "unexpected error: {err:#}"
+            );
+        }
+    }
+
+    /// The session phase hands its scratch address on to the single-device
+    /// encrypt instead of both phases building one for the same device.
+    mod reused_protocol_address {
+        use super::*;
+
+        async fn fan_out_one_plan(
+            devices: &[Jid],
+            resolver: &MockSendContextResolver,
+            session_store: &mut MemSessionStore,
+            identity_store: &mut MemIdentityStore,
+            plan: Option<SessionPlan>,
+        ) -> EncryptForDevicesRaw {
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                session_store,
+                identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let plan = match plan {
+                Some(plan) => plan,
+                None => {
+                    ensure_sessions_for_devices(&TokioTestRuntime, &mut stores, resolver, devices)
+                        .await
+                        .expect("session phase")
+                }
+            };
+            encrypt_for_devices_with_sessions_raw(
+                &TokioTestRuntime,
+                &mut stores,
+                devices,
+                b"payload",
+                plan,
+            )
+            .await
+            .expect("encrypt fan-out")
+        }
+
+        /// The reused buffer must name the same device the session phase just
+        /// interrogated: a stale or mis-written name resolves no session and
+        /// the device silently drops out of the fan-out.
+        #[tokio::test]
+        async fn the_reused_address_still_names_the_device_it_was_checked_for() {
+            let device: Jid = "5511900000030:0@s.whatsapp.net".parse().unwrap();
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&device)).await;
+            let resolver = MockSendContextResolver::new();
+
+            let raw = fan_out_one_plan(
+                std::slice::from_ref(&device),
+                &resolver,
+                &mut session_store,
+                &mut identity_store,
+                None,
+            )
+            .await;
+
+            assert_eq!(raw.devices.len(), 1, "the one device must encrypt");
+            assert_eq!(raw.devices[0].device_jid, device);
+        }
+
+        /// A PN device whose session lives under its LID address: the address
+        /// the encrypt uses is the overridden (LID) one, not the device's own.
+        /// Only the LID address has a session, so getting this wrong drops the
+        /// device.
+        #[tokio::test]
+        async fn a_lid_upgraded_device_encrypts_against_its_lid_address() {
+            let pn: Jid = "5511900000031:0@s.whatsapp.net".parse().unwrap();
+            let lid: Jid = "100000000000031:0@lid".parse().unwrap();
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&lid)).await;
+            let resolver = MockSendContextResolver::new()
+                .with_phone_to_lid(pn.user.as_str(), lid.user.as_str());
+
+            let raw = fan_out_one_plan(
+                std::slice::from_ref(&pn),
+                &resolver,
+                &mut session_store,
+                &mut identity_store,
+                None,
+            )
+            .await;
+
+            assert_eq!(
+                raw.devices.len(),
+                1,
+                "only the LID address has a session; the PN address would find none"
+            );
+            assert_eq!(
+                raw.devices[0].device_jid, pn,
+                "the wire still names the device, only the Signal address is upgraded"
+            );
+        }
+
+        /// Session state that survives `clone_box`. The session-establishment
+        /// tasks each get their own clone of the store, so a per-value map
+        /// would carry their writes away with them and the encrypt that
+        /// follows would find nothing.
+        #[derive(Clone, Default)]
+        struct SharedSessionStore(
+            std::sync::Arc<std::sync::Mutex<HashMap<ProtocolAddress, Vec<u8>>>>,
+        );
+
+        #[async_trait::async_trait]
+        impl SessionStore for SharedSessionStore {
+            async fn load_session(&self, a: &ProtocolAddress) -> SigResult<Option<SessionRecord>> {
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .get(a)
+                    .and_then(|b| SessionRecord::deserialize(b).ok()))
+            }
+            async fn has_session(&self, a: &ProtocolAddress) -> SigResult<bool> {
+                Ok(self.0.lock().unwrap().contains_key(a))
+            }
+            async fn store_session(
+                &mut self,
+                a: &ProtocolAddress,
+                r: SessionRecord,
+            ) -> SigResult<()> {
+                self.0.lock().unwrap().insert(a.clone(), r.serialize()?);
+                Ok(())
+            }
+        }
+
+        /// See [`SharedSessionStore`].
+        #[derive(Clone)]
+        struct SharedIdentityStore {
+            pair: IdentityKeyPair,
+            known: std::sync::Arc<std::sync::Mutex<HashMap<ProtocolAddress, IdentityKey>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl IdentityKeyStore for SharedIdentityStore {
+            async fn get_identity_key_pair(&self) -> SigResult<IdentityKeyPair> {
+                Ok(self.pair.clone())
+            }
+            async fn get_local_registration_id(&self) -> SigResult<u32> {
+                Ok(42)
+            }
+            async fn save_identity(
+                &mut self,
+                a: &ProtocolAddress,
+                id: &IdentityKey,
+            ) -> SigResult<IdentityChange> {
+                let mut known = self.known.lock().unwrap();
+                let changed = known.get(a).is_some_and(|k| k != id);
+                known.insert(a.clone(), *id);
+                Ok(IdentityChange::from_changed(changed))
+            }
+            async fn is_trusted_identity(
+                &self,
+                _: &ProtocolAddress,
+                _: &IdentityKey,
+                _: Direction,
+            ) -> SigResult<bool> {
+                Ok(true)
+            }
+            async fn get_identity(&self, a: &ProtocolAddress) -> SigResult<Option<IdentityKey>> {
+                Ok(self.known.lock().unwrap().get(a).copied())
+            }
+        }
+
+        /// The case the reuse must not get wrong: a cold PN device that the
+        /// session phase upgraded to LID and established a session for. The
+        /// buffer is left holding the PN name (the last thing the session loop
+        /// wrote for it), while the encrypt has to address the LID session that
+        /// was just created. Only rewriting the buffer gets that right.
+        #[tokio::test]
+        async fn a_cold_pn_device_upgraded_to_lid_encrypts_against_the_new_lid_session() {
+            let pn: Jid = "5511900000033:0@s.whatsapp.net".parse().unwrap();
+            let lid: Jid = "100000000000033:0@lid".parse().unwrap();
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+            // No session anywhere yet: the session phase has to create one, and
+            // it creates it under the LID address.
+            let mut session_store = SharedSessionStore::default();
+            let mut identity_store = SharedIdentityStore {
+                pair: IdentityKeyPair::generate(&mut rng),
+                known: Default::default(),
+            };
+            let sessions = session_store.0.clone();
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = SignalStores {
+                sender_key_store: &mut sender_key_store,
+                session_store: &mut session_store,
+                identity_store: &mut identity_store,
+                prekey_store: &mut prekey_store,
+                signed_prekey_store: &signed_prekey_store,
+            };
+            let resolver = MockSendContextResolver::new()
+                .with_phone_to_lid(pn.user.as_str(), lid.user.as_str())
+                .with_bundle(pn.clone(), signed_prekey_bundle());
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                std::slice::from_ref(&pn),
+            )
+            .await
+            .expect("session phase");
+
+            {
+                let sessions = sessions.lock().unwrap();
+                assert!(
+                    sessions.contains_key(&lid.to_protocol_address()),
+                    "the session phase must have created the LID session"
+                );
+                assert!(
+                    !sessions.contains_key(&pn.to_protocol_address()),
+                    "and nothing under the PN address the buffer was left holding"
+                );
+            }
+
+            let raw = encrypt_for_devices_with_sessions_raw(
+                &TokioTestRuntime,
+                &mut stores,
+                std::slice::from_ref(&pn),
+                b"payload",
+                plan,
+            )
+            .await
+            .expect("encrypt fan-out");
+
+            assert_eq!(
+                raw.devices.len(),
+                1,
+                "the freshly established LID session must be the one encrypted against"
+            );
+            assert!(
+                raw.includes_prekey_message,
+                "a brand new session emits pkmsg"
+            );
+        }
+
+        /// A plan that never ran a session phase carries no buffer, so the
+        /// encrypt has to build its own address as before.
+        #[tokio::test]
+        async fn a_plan_with_no_session_phase_builds_its_own_address() {
+            let device: Jid = "5511900000032:0@s.whatsapp.net".parse().unwrap();
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&device)).await;
+            let resolver = MockSendContextResolver::new();
+
+            let raw = fan_out_one_plan(
+                std::slice::from_ref(&device),
+                &resolver,
+                &mut session_store,
+                &mut identity_store,
+                Some(SessionPlan::assume_ready(1)),
+            )
+            .await;
+
+            assert_eq!(raw.devices.len(), 1);
+            assert_eq!(raw.devices[0].device_jid, device);
+        }
+
+        /// The multi-device branch gives every job its own address and must be
+        /// untouched by the buffer the plan now carries.
+        #[tokio::test]
+        async fn several_devices_each_get_their_own_address() {
+            let devices: Vec<Jid> = (0..3u16)
+                .map(|i| format!("551190000004{i}:0@s.whatsapp.net").parse().unwrap())
+                .collect();
+            let (mut session_store, mut identity_store) = stores_with_sessions(&devices).await;
+            let resolver = MockSendContextResolver::new();
+
+            let raw = fan_out_one_plan(
+                &devices,
+                &resolver,
+                &mut session_store,
+                &mut identity_store,
+                None,
+            )
+            .await;
+
+            let mut encrypted: Vec<Jid> =
+                raw.devices.iter().map(|d| d.device_jid.clone()).collect();
+            encrypted.sort_by_key(Jid::to_string);
+            assert_eq!(
+                encrypted, devices,
+                "every device gets its own session address"
+            );
+        }
+
+        /// An empty device list has nothing to name: the plan still carries a
+        /// buffer and neither branch may touch it.
+        #[tokio::test]
+        async fn an_empty_device_list_names_nothing() {
+            let (mut session_store, mut identity_store) = stores_with_sessions(&[]).await;
+            let resolver = MockSendContextResolver::new();
+
+            let raw = fan_out_one_plan(
+                &[],
+                &resolver,
+                &mut session_store,
+                &mut identity_store,
+                None,
+            )
+            .await;
+
+            assert!(raw.devices.is_empty());
+            assert!(!raw.includes_prekey_message);
+        }
+    }
+}
+
+/// A warm group send — one with no sender-key distribution, which is what a
+/// group in ordinary conversation does for every message between topology
+/// changes — carries nothing per recipient. Profiling a client reported the
+/// encoder growing with group size and named the recipient list as the thing
+/// being serialized per message; on the warm path it is not, and these tests
+/// pin that so it cannot quietly become true.
+///
+/// The distinction that makes it work: `<participants>` (one pairwise-encrypted
+/// `<enc>` per device) is built only inside the `distribution_list` branch. A
+/// warm send leaves that `None`, the phash comes from a memo as a fixed-length
+/// hash, and `stale_users_for` returns empty without walking anything. What is
+/// left is `<enc type="skmsg">` — one ciphertext for the whole group — plus a
+/// reporting token, and neither knows how many members there are.
+///
+/// The distributing send *is* linear, and inherently so: each device needs its
+/// own copy of the sender key under its own ratcheting session, so there is no
+/// cache to add. That side is covered by `mark_full_distribution_list`.
+mod warm_group_send_encoding_scale {
+    use super::*;
+    use crate::libsignal::protocol::{
+        Direction, IdentityChange, IdentityKey, IdentityKeyStore, PreKeyId, PreKeyRecord,
+        PreKeyStore, ProtocolAddress, SenderKeyRecord, SessionRecord, SessionStore, SignedPreKeyId,
+        SignedPreKeyRecord, SignedPreKeyStore,
+    };
+    use crate::runtime::{AbortHandle, Runtime};
+    use crate::types::jid::{JidExt, make_sender_key_name};
+    use crate::types::message::AddressingMode;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+    use wacore_binary::marshal::marshal;
+    use wacore_binary::node::NodeContent;
+
+    type SigResult<T> = crate::libsignal::protocol::error::Result<T>;
+
+    /// A warm send touches no pairwise session, so every store below except the
+    /// sender-key one exists only to satisfy `SignalStores`. `unreachable!()`
+    /// rather than a stub answer: if the warm path ever starts reaching for a
+    /// session, that is the regression these tests are here to catch, and it
+    /// should fail loudly instead of being absorbed.
+    #[derive(Clone, Default)]
+    struct UnusedSessionStore;
+    #[async_trait::async_trait]
+    impl SessionStore for UnusedSessionStore {
+        async fn load_session(&self, _: &ProtocolAddress) -> SigResult<Option<SessionRecord>> {
+            unreachable!("warm group send must not load a pairwise session")
+        }
+        async fn has_session(&self, _: &ProtocolAddress) -> SigResult<bool> {
+            unreachable!("warm group send must not probe for a pairwise session")
+        }
+        async fn store_session(&mut self, _: &ProtocolAddress, _: SessionRecord) -> SigResult<()> {
+            unreachable!("warm group send must not write a pairwise session")
+        }
+    }
+
+    #[derive(Clone)]
+    struct UnusedIdentityStore;
+    #[async_trait::async_trait]
+    impl IdentityKeyStore for UnusedIdentityStore {
+        async fn get_identity_key_pair(&self) -> SigResult<IdentityKeyPair> {
+            unreachable!()
+        }
+        async fn get_local_registration_id(&self) -> SigResult<u32> {
+            unreachable!()
+        }
+        async fn save_identity(
+            &mut self,
+            _: &ProtocolAddress,
+            _: &IdentityKey,
+        ) -> SigResult<IdentityChange> {
+            unreachable!()
+        }
+        async fn is_trusted_identity(
+            &self,
+            _: &ProtocolAddress,
+            _: &IdentityKey,
+            _: Direction,
+        ) -> SigResult<bool> {
+            unreachable!()
+        }
+        async fn get_identity(&self, _: &ProtocolAddress) -> SigResult<Option<IdentityKey>> {
+            unreachable!()
+        }
+    }
+
+    struct UnusedPreKeys;
+    #[async_trait::async_trait]
+    impl PreKeyStore for UnusedPreKeys {
+        async fn get_pre_key(&self, _: PreKeyId) -> SigResult<PreKeyRecord> {
+            unreachable!()
+        }
+        async fn save_pre_key(&mut self, _: PreKeyId, _: &PreKeyRecord) -> SigResult<()> {
+            unreachable!()
+        }
+        async fn remove_pre_key(&mut self, _: PreKeyId) -> SigResult<()> {
+            unreachable!()
+        }
+    }
+    struct UnusedSignedPreKeys;
+    #[async_trait::async_trait]
+    impl SignedPreKeyStore for UnusedSignedPreKeys {
+        async fn get_signed_pre_key(&self, _: SignedPreKeyId) -> SigResult<SignedPreKeyRecord> {
+            unreachable!()
+        }
+        async fn save_signed_pre_key(
+            &mut self,
+            _: SignedPreKeyId,
+            _: &SignedPreKeyRecord,
+        ) -> SigResult<()> {
+            unreachable!()
+        }
+    }
+    #[derive(Default)]
+    struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
+    #[async_trait::async_trait]
+    impl SenderKeyStore for MemSenderKeyStore {
+        async fn store_sender_key(
+            &mut self,
+            n: &SenderKeyName,
+            r: SenderKeyRecord,
+        ) -> SigResult<()> {
+            self.0.insert(n.clone(), r);
+            Ok(())
+        }
+        async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
+            Ok(self.0.get(n).cloned())
+        }
+    }
+
+    struct TestRuntime;
+    #[async_trait::async_trait]
+    impl Runtime for TestRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            let handle = tokio::spawn(future);
+            AbortHandle::new(move || handle.abort())
+        }
+        fn sleep(&self, _d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                let _ = tokio::task::spawn_blocking(f).await;
+            })
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    fn member(i: usize) -> Jid {
+        // Fictitious, fixed-width user parts: a varying digit count would change
+        // the encoded length of the *participant list*, which is exactly the
+        // quantity under test, and only in the distributing case does it reach
+        // the wire at all.
+        format!("10000000000{:04}@s.whatsapp.net", i)
+            .parse()
+            .unwrap()
+    }
+
+    /// Byte length of the marshalled stanza with the skmsg ciphertext removed.
+    ///
+    /// The ciphertext cannot be compared directly: `pad_with_context_from_encoded`
+    /// appends a random 1..16-byte pad, so two encodes of the same message differ
+    /// in length by design. Everything else in the stanza is deterministic, and
+    /// everything else is what "does the recipient list reach the wire" asks about.
+    fn stanza_size_without_ciphertext(node: &Node) -> usize {
+        let enc = node
+            .get_optional_child("enc")
+            .expect("a group send always carries <enc>");
+        let payload = match &enc.content {
+            Some(NodeContent::Bytes(b)) => b.len(),
+            other => panic!("<enc> must carry bytes, got {other:?}"),
+        };
+        marshal(node).expect("stanza must marshal").len() - payload
+    }
+
+    async fn warm_group_stanza(member_count: usize) -> Node {
+        let own: Jid = "12025550100:3@s.whatsapp.net".parse().unwrap();
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let members: Vec<Jid> = (0..member_count).map(member).collect();
+
+        // Seed the chain the warm path expects to already exist: distribution is
+        // what would otherwise create it, and a warm send by definition skips it.
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let kp = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(3, 1, 0, &[7u8; 32], kp.public_key, Some(kp.private_key))
+            .expect("valid sender key state");
+        let name = make_sender_key_name(&group, &own.to_protocol_address());
+        let mut sender_keys = MemSenderKeyStore::default();
+        sender_keys.0.insert(name, record);
+
+        let mut sessions = UnusedSessionStore;
+        let mut identities = UnusedIdentityStore;
+        let mut prekeys = UnusedPreKeys;
+        let signed_prekeys = UnusedSignedPreKeys;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+
+        let group_info = GroupInfo::new(members.clone(), AddressingMode::Pn);
+        let resolved = std::sync::Arc::new(ResolvedGroupDevices::new(members));
+        // Warm the phash memo in setup, exactly as `setup_group_send` does in
+        // the benchmark and as production does on the first send after a
+        // topology change. Left cold, the `OnceLock` would make the *first*
+        // send recompute an O(member_count) hash inside the very path these
+        // tests claim is warm — measuring the cold path under a warm name, and
+        // leaving a regression that recomputed it per send undetectable.
+        resolved.phash(&own).expect("phash must warm in setup");
+        let message = wa::Message {
+            conversation: Some("same text regardless of group size".into()),
+            ..Default::default()
+        };
+        let account = wa::ADVSignedDeviceIdentity::default();
+
+        prepare_group_stanza(
+            &TestRuntime,
+            &mut stores,
+            &MockSendContextResolver::new(),
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own,
+                own_lid: &own,
+                account: Some(&account),
+                to: &group,
+                message: &message,
+                message_id: "WARM-SCALE-1",
+                force_distribution: false,
+                distribution_targets: None,
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: Some(&resolved),
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("warm group send must succeed")
+        .node
+    }
+
+    /// The headline: 8 members and 512 members produce a byte-identical stanza
+    /// once the randomly padded ciphertext is discounted. If a future change
+    /// puts anything per-recipient back on a warm send, this is what fails.
+    #[tokio::test]
+    async fn warm_send_stanza_size_is_independent_of_group_size() {
+        let mut sizes = Vec::new();
+        for n in [8usize, 32, 128, 512] {
+            let node = warm_group_stanza(n).await;
+
+            assert!(
+                node.get_optional_child("participants").is_none(),
+                "a warm send distributes no sender key, so it must emit no \
+                 <participants> fan-out (group size {n})"
+            );
+            assert!(
+                node.get_optional_child("device-identity").is_none(),
+                "<device-identity> rides along with a pkmsg in the fan-out, and \
+                 there is no fan-out here (group size {n})"
+            );
+            sizes.push((n, stanza_size_without_ciphertext(&node)));
+        }
+
+        let (_, first) = sizes[0];
+        assert!(
+            sizes.iter().all(|&(_, s)| s == first),
+            "warm group stanza must not grow with the participant count; \
+             got {sizes:?} (size excludes the randomly padded skmsg ciphertext)"
+        );
+    }
+
+    /// The phash is the one input that *is* derived from every participant, so
+    /// it is the obvious candidate for smuggling O(N) bytes onto the wire. It
+    /// does not: it is a fixed-width hash, present and identical in width at
+    /// every group size, and different between sizes because the set differs.
+    #[tokio::test]
+    async fn phash_is_present_and_fixed_width_at_every_group_size() {
+        let mut seen: Vec<(usize, String)> = Vec::new();
+        for n in [8usize, 512] {
+            let node = warm_group_stanza(n).await;
+            let phash = node
+                .attrs()
+                .optional_string("phash")
+                .unwrap_or_else(|| panic!("group send carries a phash on every send (size {n})"))
+                .to_string();
+            seen.push((n, phash));
+        }
+        assert_eq!(
+            seen[0].1.len(),
+            seen[1].1.len(),
+            "phash width must not depend on the member count: {seen:?}"
+        );
+        assert_ne!(
+            seen[0].1, seen[1].1,
+            "different participant sets must hash differently, or the \
+             fixed width above would be proving nothing"
         );
     }
 }

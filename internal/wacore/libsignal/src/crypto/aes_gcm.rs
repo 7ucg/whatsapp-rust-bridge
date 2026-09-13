@@ -73,11 +73,10 @@ impl GcmGhash {
         let leftover = msg.len() - 16 * full_blocks;
         assert!(leftover < TAG_SIZE);
 
-        let (chunks, _) = msg[..16 * full_blocks].as_chunks::<16>();
-        for chunk in chunks {
-            let block: ghash::Block = (*chunk).into();
-            self.ghash.update(std::slice::from_ref(&block));
-        }
+        // One call for the whole run: `update_padded` on a block-multiple
+        // slice is exactly `update(blocks)` with no padding, and lets the
+        // carryless-multiply backend batch instead of taking one block per call.
+        self.ghash.update_padded(&msg[..16 * full_blocks]);
 
         self.msg_buf[0..leftover].copy_from_slice(&msg[full_blocks * 16..]);
         self.msg_buf_offset = leftover;
@@ -171,7 +170,6 @@ pub struct Aes256GcmEncryption {
 }
 
 impl Aes256GcmEncryption {
-    pub const TAG_SIZE: usize = TAG_SIZE;
     pub const NONCE_SIZE: usize = NONCE_SIZE;
 
     pub fn new(key: &[u8], nonce: &[u8], associated_data: &[u8]) -> Result<Self> {
@@ -200,7 +198,6 @@ pub struct Aes256GcmDecryption {
 }
 
 impl Aes256GcmDecryption {
-    pub const TAG_SIZE: usize = TAG_SIZE;
     pub const NONCE_SIZE: usize = NONCE_SIZE;
 
     pub fn new(key: &[u8], nonce: &[u8], associated_data: &[u8]) -> Result<Self> {

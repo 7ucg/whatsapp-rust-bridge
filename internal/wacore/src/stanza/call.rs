@@ -11,19 +11,7 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef};
 
 use crate::time::from_secs;
-use crate::types::call::{CallAction, CallAudioCodec, IncomingCall, VideoState};
-
-const KNOWN_ACTIONS: &[&str] = &[
-    "offer",
-    "offer_notice",
-    "preaccept",
-    "accept",
-    "reject",
-    "terminate",
-    "transport",
-    "relaylatency",
-    "video",
-];
+use crate::types::call::{CallAction, CallActionTag, CallAudioCodec, IncomingCall, VideoState};
 
 pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     if node.tag != "call" {
@@ -32,10 +20,13 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 
     // Find a known action child first so unknown/future actions short-circuit
     // before attr validation (forward-compat, even if stanza attrs also shift).
-    let Some(child) = node
-        .children()
-        .and_then(|cs| cs.iter().find(|c| KNOWN_ACTIONS.contains(&c.tag.as_ref())))
-    else {
+    let Some((child, action_tag)) = node.children().and_then(|children| {
+        children.iter().find_map(|child| {
+            CallActionTag::try_from(child.tag.as_ref())
+                .ok()
+                .map(|action_tag| (child, action_tag))
+        })
+    }) else {
         return Ok(None);
     };
 
@@ -46,7 +37,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     // whatsmeow doesn't require an id on <call>, and the signaling-only actions (transport,
     // relaylatency) can arrive without one. Only the offer-ack consumes stanza_id and real offers
     // always carry it, so default a missing id to empty rather than rejecting the whole stanza --
-    // which would drop these actions right after we added them to KNOWN_ACTIONS to surface them.
+    // which would drop these actions right after the generated tag accepted them.
     let stanza_id = attrs
         .optional_string("id")
         .map(|s| s.into_owned())
@@ -56,6 +47,8 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .and_then(|s| (!s.is_empty()).then(|| s.into_owned()));
     let platform = attrs.optional_string("platform").map(|s| s.into_owned());
     let version = attrs.optional_string("version").map(|s| s.into_owned());
+    let participant = attrs.optional_jid("participant");
+    let recipient = attrs.optional_jid("recipient");
     let ts = attrs
         .optional_unix_time("t")
         .ok_or_else(|| anyhow!("<call> missing or invalid 't' attribute"))?;
@@ -66,25 +59,50 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 
     attrs.finish().map_err(|e| anyhow!("<call> attrs: {e}"))?;
 
-    let action = parse_action(child)?;
+    let is_offer = action_tag == CallActionTag::Offer;
+    // Read before `parse_action` consumes the child: an <offer> and an <accept>
+    // are the only actions whose <video> child announces the sending device's
+    // camera rotation, and the value belongs on the payload rather than in
+    // either action variant (see `IncomingCall::video_orientation`).
+    let video_orientation = matches!(action_tag, CallActionTag::Offer | CallActionTag::Accept)
+        .then(|| {
+            child
+                .get_optional_child("video")
+                .and_then(|video| parse_video_orientation(video))
+        })
+        .flatten();
+    let action = parse_action(child, action_tag)?;
+    let group = if is_offer {
+        super::group_call::parse_group_invite_snapshot(child)?.map(Box::new)
+    } else {
+        None
+    };
+    #[cfg(feature = "voip")]
+    let media = is_offer
+        .then(|| parse_media_offer(node, child, participant.as_ref().unwrap_or(&from)))
+        .flatten()
+        .map(Box::new);
 
-    Ok(Some(IncomingCall {
-        from,
-        stanza_id,
-        notify,
-        platform,
-        version,
-        timestamp,
-        offline,
-        action,
-        // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
-        // capture them only on an <offer> and only when `voip` is on (RelayData lives there).
-        #[cfg(feature = "voip")]
-        media: (child.tag.as_ref() == "offer")
-            .then(|| parse_media_offer(node, child))
-            .flatten()
-            .map(Box::new),
-    }))
+    let call = IncomingCall::builder()
+        .from(from)
+        .stanza_id(stanza_id)
+        .maybe_notify(notify)
+        .maybe_platform(platform)
+        .maybe_version(version)
+        .maybe_participant(participant)
+        .maybe_recipient(recipient)
+        .timestamp(timestamp)
+        .offline(offline)
+        .action(action)
+        .maybe_video_orientation(video_orientation)
+        .maybe_group(group);
+    let call = call.build();
+    // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
+    // capture it only on an <offer> and only when `voip` is on (RelayData lives there).
+    #[cfg(feature = "voip")]
+    let call = call.with_media(media);
+
+    Ok(Some(call))
 }
 
 /// Extract the media material from an `<offer>`: the `<enc>` addressed to us (direct child or under
@@ -94,8 +112,10 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 fn parse_media_offer(
     call: &NodeRef<'_>,
     offer: &NodeRef<'_>,
+    peer: &Jid,
 ) -> Option<crate::types::call::MediaOffer> {
     use crate::types::call::{MediaOffer, OfferRecipientEnc};
+    use crate::types::group_call::GroupCallDevice;
 
     let mut encs = Vec::new();
     if let Some(enc_node) = offer.get_optional_child("enc") {
@@ -147,11 +167,30 @@ fn parse_media_offer(
             )
         })
         .unwrap_or_default();
+    // A `<capability>` that is PRESENT keeps its device, even when the blob is empty or its `ver`
+    // will not parse. Those are the conditions the official client sends to its version -1 fallback,
+    // against which every query answers false -- so they have to reach `capability_bit` as an
+    // unreadable blob and read `Clear`. Dropping the node here would collapse them into "the peer
+    // announced nothing", which resets nothing and keeps MLOW on against a peer that cannot decode
+    // it: the exact shape of issue #1105. Absence, and only absence, is the absent case.
+    let peer_device = offer.get_optional_child("capability").map(|capability| {
+        let mut device = GroupCallDevice::new(peer.clone());
+        // `None` for absent AND for unparseable, so both read as an unreadable blob. The official
+        // client's deserializer treats a missing `ver` as an error and rebuilds the capability with
+        // a version that answers false for every index; its own writer always emits `ver="1"`, so a
+        // node without one is not something a conforming peer sends.
+        device.capability_version = capability
+            .get_attr("ver")
+            .and_then(|version| version.as_str().parse::<u32>().ok());
+        device.capability = capability.content_bytes().unwrap_or_default().to_vec();
+        device
+    });
     Some(MediaOffer {
         encs,
         relay,
         peer_abtest_bucket,
         peer_abtest_bucket_id_list,
+        peer_device,
     })
 }
 
@@ -185,6 +224,22 @@ pub fn find_relay<'a, 'b>(nr: &'b NodeRef<'a>) -> Option<&'b NodeRef<'a>> {
     nr.children().and_then(|cs| cs.iter().find_map(find_relay))
 }
 
+/// The `device_orientation` a `<video>` advertisement child carries, in quarter
+/// turns.
+///
+/// One definition for the offer and the accept, and deliberately the same
+/// filter the mid-call `<video>` parser applies: a value outside `0..=3` is a
+/// peer counting something other than quarter turns, and folding it into range
+/// would stamp every frame with a rotation nobody announced. `None` there means
+/// "not announced", which the caller already has to handle for a `<video>` that
+/// carries no rotation at all.
+fn parse_video_orientation(node: &NodeRef<'_>) -> Option<u8> {
+    node.attrs()
+        .optional_string("device_orientation")
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|orientation| *orientation <= 3)
+}
+
 fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec> {
     let mut a = node.attrs();
     let enc = a
@@ -200,7 +255,7 @@ fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec> {
     Ok(CallAudioCodec { enc, rate })
 }
 
-fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
+fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAction> {
     let mut attrs = node.attrs();
     let call_id = attrs
         .required_string("call-id")
@@ -210,8 +265,29 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
         .optional_jid("call-creator")
         .ok_or_else(|| anyhow!("<{}> missing 'call-creator'", node.tag))?;
 
-    Ok(match node.tag.as_ref() {
-        "offer" => {
+    // The group parsers re-read the action identity and finish their own attribute readers because
+    // they also own the action-specific attributes.
+    Ok(match action_tag {
+        CallActionTag::GroupUpdate => CallAction::GroupUpdate {
+            update: super::group_call::parse_group_update(node)?.into(),
+        },
+        CallActionTag::EncRekey => CallAction::EncRekey {
+            rekey: super::group_call::parse_group_enc_rekey(node)?.into(),
+        },
+        CallActionTag::WaitingRoomUpdate => CallAction::WaitingRoomUpdate {
+            room: super::group_call::parse_waiting_room_update(node)?.into(),
+        },
+        CallActionTag::RaiseHand => CallAction::RaiseHand {
+            call_id,
+            call_creator,
+            raised: super::group_call::parse_raise_hand(node)?,
+        },
+        CallActionTag::ScreenShare => CallAction::ScreenShare {
+            call_id,
+            call_creator,
+            screen_share: super::group_call::parse_screen_share(node)?,
+        },
+        CallActionTag::Offer => {
             let caller_pn = attrs.optional_jid("caller_pn");
             let caller_country_code = attrs
                 .optional_string("caller_country_code")
@@ -247,7 +323,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 group_jid,
             }
         }
-        "offer_notice" => {
+        CallActionTag::OfferNotice => {
             let is_video = attrs.optional_string("media").is_some_and(|s| s == "video");
             let is_group = attrs.optional_string("type").is_some_and(|s| s == "group");
             attrs
@@ -260,7 +336,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 is_group,
             }
         }
-        "preaccept" => {
+        CallActionTag::PreAccept => {
             attrs
                 .finish()
                 .map_err(|e| anyhow!("<preaccept> attrs: {e}"))?;
@@ -277,7 +353,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio,
             }
         }
-        "transport" => {
+        CallActionTag::Transport => {
             let p2p_cand_round = attrs
                 .optional_string("p2p-cand-round")
                 .map(|s| s.into_owned());
@@ -294,7 +370,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 transport_message_type,
             }
         }
-        "relaylatency" => {
+        CallActionTag::RelayLatency => {
             attrs
                 .finish()
                 .map_err(|e| anyhow!("<relaylatency> attrs: {e}"))?;
@@ -303,11 +379,10 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 call_creator,
             }
         }
-        "accept" => {
+        CallActionTag::Accept => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
-            let audio = node
-                .children()
-                .unwrap_or_default()
+            let children = node.children().unwrap_or_default();
+            let audio = children
                 .iter()
                 .filter(|child| child.tag == "audio")
                 .map(parse_audio_codec)
@@ -318,22 +393,24 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio,
             }
         }
-        "reject" => {
+        CallActionTag::Reject => {
+            // `reason` distinguishes a device that CANNOT take the call (`busy`, `enc`) from the
+            // callee actually declining; dropping it made both look identical and ended calls the
+            // peer's other devices were still answering.
+            let reason = attrs.optional_string("reason").map(|c| c.into_owned());
             attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
             CallAction::Reject {
                 call_id,
                 call_creator,
+                reason,
             }
         }
-        "video" => {
+        CallActionTag::VideoState => {
             let state_raw = attrs
                 .optional_string("state")
                 .and_then(|s| s.parse::<i32>().ok())
                 .ok_or_else(|| anyhow!("<video> missing or non-numeric 'state'"))?;
-            let orientation = attrs
-                .optional_string("device_orientation")
-                .and_then(|s| s.parse::<u8>().ok())
-                .filter(|orientation| *orientation <= 3);
+            let orientation = parse_video_orientation(node);
             let dec = attrs.optional_string("dec").map(|s| s.into_owned());
             // The upgrade-request marker attr and the server-enriched knobs; consumed (their
             // semantics ride on `state`), plus a possible `<voip_settings>` blob child we ignore.
@@ -347,7 +424,7 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 dec,
             }
         }
-        "terminate" => {
+        CallActionTag::Terminate => {
             // WA Web gates the call-log outcome on `reason` (missed vs accepted/rejected-elsewhere),
             // so surface it instead of dropping it.
             let reason = attrs.optional_string("reason").map(|c| c.into_owned());
@@ -368,7 +445,6 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 audio_duration,
             }
         }
-        other => return Err(anyhow!("unreachable: unknown action <{other}>")),
     })
 }
 
@@ -417,15 +493,146 @@ pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13]
 pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x07];
 /// Legacy offer order observed on WhatsApp Web.
 pub const DEFAULT_AUDIO_RATES: &[&str] = &["8000", "16000"];
-/// Capability blob a client places in a VIDEO `<offer>`: byte 5 is `0xfa` (video) vs the audio
-/// `0xbb`. Observed in a real from-start video offer. A video CALLEE preaccepts with [`CAPABILITY_OFFER`]
-/// (`0xbb`), not this.
-pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13];
+/// Capability blob a client places in a VIDEO `<offer>`, byte-matching the captured J engine driven
+/// with the video flag set (`JgwtTQVeWPm.wasm`, `video_offer_matches_the_vendor_engine`). The `0xfa`
+/// byte 5 seen in one early capture belongs to another platform's offer and must not be sent here:
+/// against Android it left callees answering a call whose video never rendered, while every flow
+/// that renders — our own video preaccepts, audio offers, and the engine's audio and video offers —
+/// stays in the `0xbb` family. A video CALLEE preaccepts with [`CAPABILITY_OFFER`], not this.
+pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x53];
+
+/// Capability index for `use_mlow_codec_v1`.
+///
+/// Recovered from the WhatsApp Web VoIP module, not guessed: the index the client's
+/// `reset_voip_params_if_no_capability` consults before zeroing the parameter at offset 2736 is 31,
+/// and that parameter registers under the name `use_mlow_codec_v1`.
+pub const CAPABILITY_INDEX_MLOW_V1: u32 = 31;
+
+/// Capability blob version this client speaks. The official client builds its own with
+/// `capabilities_create(1, ..)`, so an index carries an implicit version of 1.
+const CAPABILITY_VERSION: u32 = 1;
+
+/// Bytes of `[version][len]` that precede the bitmask inside a `<capability>` blob.
+const CAPABILITY_HEADER_LEN: usize = 2;
 
 const fn without_mlow_capability(mut capability: [u8; 7]) -> [u8; 7] {
-    // Capability 31 is the peer gate for `use_mlow_codec_v1`.
+    // Capability 31 is the peer gate for `use_mlow_codec_v1`: byte `31 / 8` of the bitmask, which
+    // starts at index 2, is `capability[5]`, and the bit within it is `1 << (31 % 8)` = 0x80.
     capability[5] &= 0x7f;
     capability
+}
+
+/// What the peer's `<capability>` says about one index.
+///
+/// Three states, not `Option<bool>`, because the official client treats two of them in **opposite**
+/// directions and writing them the same way is an easy and expensive mistake:
+///
+/// - a peer that sends no `<capability>` at all is skipped entirely, and nothing is reset, so a
+///   feature stays on. Our own video `<accept>` omits the blob, so this is not hypothetical;
+/// - a peer whose blob is unparseable falls back to a capability of version -1, against which every
+///   query answers false, so **everything** resets.
+///
+/// Deliberately NOT `#[non_exhaustive]`, unlike its neighbours in this change: a bit is set, clear,
+/// or unstated, and there is no fourth answer for a future version to add. Callers benefit from the
+/// compiler forcing them to decide all three, because getting the last two the same way round is
+/// the bug this type exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityBit {
+    /// The peer announced the index.
+    Set,
+    /// The peer announced a valid blob that does not carry the index, or announced a blob this
+    /// client cannot read, which the official client treats the same way.
+    Clear,
+    /// The peer announced nothing. Not evidence either way.
+    Unknown,
+}
+
+/// Read one index out of a peer `<capability>` blob.
+///
+/// `version` is the `ver` attribute of the node, and `bytes` its content. The bit lives at byte
+/// `index / 8` of the bitmask, LSB-first within the byte, which is the same arithmetic the
+/// `CAPABILITY_STANDARD_OPUS_*` blobs assume: clearing index 31 is `capability[5] &= 0x7f`.
+///
+/// A blob whose declared length runs past its content, or whose version is below the one the index
+/// belongs to, reads as [`CapabilityBit::Clear`]: the official client's version gate is
+/// `if caps.version < (code >> 16) { return false }`, and its invalid-blob fallback installs
+/// version -1, so both paths answer false rather than "unknown".
+///
+/// **An empty `bytes` is `Clear`, not `Unknown`.** The client's fallback fires on
+/// `blob == null || ver <= 0 || len <= 0`, so a `<capability>` that is present and carries nothing
+/// resets everything. Only an ABSENT node is `Unknown`, and that distinction belongs to the caller,
+/// which is the one that can see whether the node existed: pass [`CapabilityBit::Unknown`] yourself
+/// when there was no node. Getting this backwards keeps MLow enabled against a peer the client
+/// would have downgraded, which is the exact shape of issue #1105.
+#[must_use]
+pub fn capability_bit(version: Option<u32>, bytes: &[u8], index: u32) -> CapabilityBit {
+    // An unparseable `ver` is not the same as a missing one: the client rebuilds the capability
+    // with a version that fails every query, so it must read as Clear.
+    let Some(version) = version else {
+        return CapabilityBit::Clear;
+    };
+    if version < CAPABILITY_VERSION {
+        return CapabilityBit::Clear;
+    }
+    // The blob's OWN version, which is not the attribute's: the header is `[version][len]`, and a
+    // client that cannot write a blob it believes in writes one that reads as nothing. Skipping this
+    // let `[0, 5, ..]` answer `Set` for index 31 -- MLOW kept enabled against a peer that had fallen
+    // back to native Opus, which is then sent MLOW and hears silence. The exact shape of #1105,
+    // reached through the one byte the parse did not look at.
+    // The blob's OWN version, which is not the attribute's: the header is `[version][len]`, and a
+    // client that cannot write a blob it believes in writes one that reads as nothing. Skipping this
+    // let `[0, 5, ..]` answer `Set` for index 31 -- MLOW kept enabled against a peer that had fallen
+    // back to native Opus, which is then sent MLOW and hears silence. The exact shape of #1105,
+    // reached through the one byte the parse did not look at.
+    let Some(&embedded_version) = bytes.first() else {
+        return CapabilityBit::Clear;
+    };
+    if u32::from(embedded_version) != CAPABILITY_VERSION {
+        return CapabilityBit::Clear;
+    }
+    let Some(&declared_len) = bytes.get(1) else {
+        return CapabilityBit::Clear;
+    };
+    let mask = &bytes[CAPABILITY_HEADER_LEN..];
+    // A blob that promises more mask bytes than it carries is truncated, and a truncated blob is
+    // one the peer never wrote: reading the prefix that did arrive would report a bit as set on the
+    // strength of bytes whose sender we cannot vouch for. The client's parser fails the whole blob
+    // and installs the version -1 fallback, which answers false for every index, so refuse before
+    // touching the mask rather than after clamping to what is there.
+    if usize::from(declared_len) > mask.len() {
+        return CapabilityBit::Clear;
+    }
+    let mask_len = usize::from(declared_len);
+    let byte = (index / 8) as usize;
+    // `contain()` masks the byte index with 31 before indexing, so an index past 255 aliases onto a
+    // low one rather than reading out of range. Mirrored here so a blob is read the way the peer
+    // that built it reads it, not the way a reasonable person would.
+    let byte = byte & 31;
+    match mask.get(..mask_len).and_then(|mask| mask.get(byte)) {
+        Some(value) => {
+            if value & (1 << (index % 8)) != 0 {
+                CapabilityBit::Set
+            } else {
+                CapabilityBit::Clear
+            }
+        }
+        None => CapabilityBit::Clear,
+    }
+}
+
+/// Apply one peer's capability to the locally-enabled MLow setting.
+///
+/// The official client runs `set_voip_params_from_capability` and then
+/// `reset_voip_params_if_no_capability`, and the second one walks every participant: if **any** of
+/// them fails to announce the index, the parameter drops to its safe default. So the effective
+/// value is `local && every peer announced it`, and the result is a single boolean that drives both
+/// the encoder and the receive-side decoder registration, not a pair of per-direction flags.
+///
+/// [`CapabilityBit::Unknown`] deliberately does not reset: a peer that sent no blob is skipped by
+/// the client rather than treated as a refusal.
+#[must_use]
+pub fn mlow_after_peer_capability(local: bool, peer: CapabilityBit) -> bool {
+    local && peer != CapabilityBit::Clear
 }
 
 /// Audio offer/accept capability selecting WhatsApp's standard Opus fallback instead of MLOW.
@@ -444,6 +651,14 @@ pub const TERMINATE_REASON_ACCEPTED_ELSEWHERE: &str = "accepted_elsewhere";
 pub const TERMINATE_REASON_REJECTED_ELSEWHERE: &str = "rejected_elsewhere";
 pub const TERMINATE_REASON_TIMEOUT: &str = "timeout";
 pub const TERMINATE_REASON_GROUP_CALL_ENDED: &str = "group_call_ended";
+
+/// `<reject reason>` wire token for a device that cannot take the call - already in a call, or a
+/// companion that does not do voice at all. It is a statement about ONE DEVICE, not the callee's
+/// decision: the peer's remaining devices go on ringing and may still answer.
+pub const REJECT_REASON_BUSY: &str = "busy";
+
+/// Like `busy`, but the device could not decrypt the offer (stale registration). Per-device.
+pub const REJECT_REASON_ENC: &str = "enc";
 
 /// Relay latency wire encoding: `0x2000000 + rtt_ms`.
 pub fn encode_latency(rtt_ms: u32) -> String {
@@ -485,7 +700,7 @@ pub struct OfferParams<'a> {
 }
 
 /// `<call to=peer><offer call-id call-creator>…</offer></call>` with the mandatory
-/// child order: privacy → audio(8k) → audio(16k) → [video] → net → capability →
+/// child order: privacy → audio(8k) → audio(16k) → \[video\] → net → capability →
 /// destination|enc → encopt → device-identity.
 pub fn build_offer(p: &OfferParams<'_>) -> Node {
     let mut children: Vec<Node> = Vec::new();
@@ -578,8 +793,8 @@ pub struct AcceptParams<'a> {
     pub peer_abtest_bucket_id_list: Option<&'a str>,
 }
 
-/// `<accept>`: audio → [video] → [te priority=2] → net medium=2 → encopt → [metadata] →
-/// [capability] → [rte] → [voip_settings].
+/// `<accept>`: audio → \[video\] → \[te priority=2\] → net medium=2 → encopt → \[metadata\] →
+/// \[capability\] → \[rte\] → \[voip_settings\].
 pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     let mut children: Vec<Node> = p.audio_rates.iter().map(|rate| audio_opus(rate)).collect();
     if p.video {
@@ -626,27 +841,66 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     )
 }
 
-/// Default initiator-side geometry used by the WaCalls reference.
-const VIDEO_SCREEN_WIDTH: &str = "1920";
-const VIDEO_SCREEN_HEIGHT: &str = "1080";
+/// The rotation an offer, accept or preaccept announces.
+///
+/// Upright, and not a parameter: none of them has a `CallHandle` yet, so no
+/// rotation can have been set for the call they open. `CallHandle::set_video_orientation`
+/// is where one is set and what carries it from there.
+const INITIAL_DEVICE_ORIENTATION: &str = "0";
 
-/// `<video>` for an `<offer>`: full decoder + geometry advertisement (the initiator side).
+/// A 1:1 video offer carries no geometry: the captured J engine
+/// (`JgwtTQVeWPm.wasm`, SHA-256
+/// `97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db`,
+/// driven via `startVoipCall` with the video flag set) emits
+/// `screen_width="0" screen_height="0"`, and the captured JS never patches
+/// those attributes before the wire. The `1920x1080` we used to send is the
+/// group-call shape (`group_call.rs` keeps it); on a 1:1 offer it left the
+/// callee answering while never rendering our stream.
+///
+/// The codec names a `<video>` advertisement carries. The two attributes use
+/// *different* spellings of the same codec, which is not a typo on either side.
+///
+/// `enc` names an encoding, and WA Web's `<video>` parser (`fill_video`, in
+/// `call_xml_utils.h`) accepts exactly `h.264` and `vp8/h.264` — anything else
+/// takes its `fill_video: unknown video encoding %s` path. The dotless `h264`
+/// we used to send is one of those anything-elses.
+///
+/// `dec` names decoder *capabilities*, built by
+/// `vid_codec_bitmask_to_capability_string` (`codec_utils.cc`) as a
+/// comma-joined list over a five-entry table: `H264`, `VP8`, `VP9`, `H265`,
+/// `AV1`. Upper-case, no dot. We list only `H264`, because a callee that takes
+/// a wider list at its word and encodes H.265 leaves us with a stream we cannot
+/// decode.
+const VIDEO_ENC_H264: &str = "h.264";
+const VIDEO_DEC_H264: &str = "H264";
+
+/// `<video>` for an `<offer>`: codec + geometry advertisement (the initiator side).
+///
+/// Rebuilt against WA Web's own `<video>` reader after the hand-written version
+/// was found to be silently discarded: a video offer carrying it was delivered
+/// and acked and then never rang, while an audio offer to the same callee —
+/// byte-identical apart from this child — was answered in three seconds.
+///
+/// The attribute set is `fill_video`'s: `enc`/`dec` (at least one is required),
+/// `device_orientation`, `screen_width`, `screen_height`, `enc_supported`.
+/// There is no `orientation` — the rotation rides `device_orientation`, and the
+/// spare attribute we used to send is not in the grammar at all. See
+/// [`VIDEO_ENC_H264`] for why the two codec attributes are spelled differently.
 fn video_offer_node() -> Node {
     NodeBuilder::new("video")
-        .attr("enc", "h264")
-        .attr("dec", "h264")
-        .attr("orientation", "0")
-        .attr("screen_width", VIDEO_SCREEN_WIDTH)
-        .attr("screen_height", VIDEO_SCREEN_HEIGHT)
-        .attr("device_orientation", "0")
+        .attr("enc", VIDEO_ENC_H264)
+        .attr("dec", VIDEO_DEC_H264)
+        .attr("screen_width", "0")
+        .attr("screen_height", "0")
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
 
 /// `<video>` byte-matching a captured from-start video callee.
 fn video_accept_node() -> Node {
     NodeBuilder::new("video")
-        .attr("dec", "H264")
-        .attr("device_orientation", "0")
+        .attr("dec", VIDEO_DEC_H264)
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
 
@@ -654,8 +908,8 @@ fn video_accept_node() -> Node {
 /// `device_orientation` + `screen_width="0" screen_height="0"` (the real client sends zero here).
 fn video_preaccept_node() -> Node {
     NodeBuilder::new("video")
-        .attr("dec", "H264")
-        .attr("device_orientation", "0")
+        .attr("dec", VIDEO_DEC_H264)
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .attr("screen_width", "0")
         .attr("screen_height", "0")
         .build()
@@ -682,9 +936,9 @@ fn capability_node(blob: &[u8]) -> Node {
         .build()
 }
 
-/// `<preaccept>`: audio → [video] → encopt → capability. `id` is the random call-wrapper id. A video
+/// `<preaccept>`: audio → \[video\] → encopt → capability. `id` is the random call-wrapper id. A video
 /// callee advertises the `<video>` decoder here; the default capability stays the `0xbb`
-/// [`CAPABILITY_OFFER`] blob (the `0xfa` variant is the caller's offer).
+/// [`CAPABILITY_OFFER`] blob (a video offer carries [`CAPABILITY_VIDEO_OFFER`]).
 pub fn build_preaccept(
     call_id: &str,
     to: &Jid,
@@ -844,7 +1098,7 @@ pub struct VideoStateParams<'a> {
     pub id: &'a str,
     pub call_creator: &'a Jid,
     pub state: VideoState,
-    /// `dec` attr: codecs we can decode (`"H264"` on the upgrade request, `"H264,AV1"` on accept).
+    /// `dec` attr: codecs we can decode (`"H264"` on request/enabled, `"H264,AV1"` on accept).
     pub dec: Option<&'a str>,
     pub device_orientation: Option<u8>,
 }
@@ -874,15 +1128,26 @@ pub fn build_call_video_ack(call: &IncomingCall, original: &NodeRef<'_>) -> Opti
     if call.stanza_id.is_empty() {
         return None;
     }
+    build_typed_call_ack(original, "video")
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn build_typed_call_ack(original: &NodeRef<'_>, action_type: &str) -> Option<Node> {
+    if original.tag != "call" || action_type.is_empty() {
+        return None;
+    }
+    let id = original.get_attr("id")?.to_node_value();
+    let from = original.get_attr("from")?.to_node_value();
     let mut ack = NodeBuilder::new("ack")
         .attr("class", "call")
-        .attr("id", call.stanza_id.as_str())
-        .attr("to", &call.from)
-        .attr("type", "video");
-    let from = call.from.to_string();
-    if let Some(participant) = original
-        .get_attr("participant")
-        .filter(|participant| participant.as_str().as_ref() != from)
+        .attr("id", id)
+        .attr("to", from)
+        .attr("type", action_type);
+    if let Some(participant) = original.get_attr("participant")
+        && original
+            .get_attr("from")
+            .is_none_or(|from| participant.as_str() != from.as_str())
     {
         ack = ack.attr("participant", participant.to_node_value());
     }
@@ -892,13 +1157,22 @@ pub fn build_call_video_ack(call: &IncomingCall, original: &NodeRef<'_>) -> Opti
     Some(ack.build())
 }
 
-pub fn build_mute_v2(call_id: &str, to: &Jid, call_creator: &Jid, mute_state: &str) -> Node {
+/// `<call to=peer id=wrapper_id><mute_v2 call-id call-creator mute-state="1|0"/></call>`: this
+/// side announcing its own microphone state. `mute-state` is the boolean sibling of
+/// `raise-hand-state`, which the same signaling carries in the same shape.
+pub fn build_mute_v2(
+    call_id: &str,
+    to: &Jid,
+    call_creator: &Jid,
+    wrapper_id: &str,
+    muted: bool,
+) -> Node {
     let action = NodeBuilder::new("mute_v2")
         .attr("call-id", call_id)
         .attr("call-creator", call_creator)
-        .attr("mute-state", mute_state.to_string())
+        .attr("mute-state", if muted { "1" } else { "0" })
         .build();
-    call_wrap(to, None, action)
+    call_wrap(to, Some(wrapper_id), action)
 }
 
 /// `<call to=peer id=wrapper_id><reject call-id call-creator count="0"/></call>`.
@@ -940,6 +1214,147 @@ fn call_wrap(to: &Jid, id: Option<&str>, action: Node) -> Node {
 }
 
 #[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    /// The one blob this repository has from a real capture, and the one derived from it.
+    #[test]
+    fn the_captured_blobs_read_the_way_without_mlow_capability_writes_them() {
+        assert_eq!(
+            capability_bit(Some(1), &CAPABILITY_OFFER, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Set,
+            "a real offer announces MLow"
+        );
+        assert_eq!(
+            capability_bit(
+                Some(1),
+                &CAPABILITY_STANDARD_OPUS_OFFER,
+                CAPABILITY_INDEX_MLOW_V1
+            ),
+            CapabilityBit::Clear,
+            "clearing the bit must be observable by the same reader"
+        );
+        for blob in [CAPABILITY_PREACCEPT, CAPABILITY_VIDEO_OFFER] {
+            assert_eq!(
+                capability_bit(Some(1), &blob, CAPABILITY_INDEX_MLOW_V1),
+                CapabilityBit::Set
+            );
+        }
+        for blob in [
+            CAPABILITY_STANDARD_OPUS_PREACCEPT,
+            CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
+        ] {
+            assert_eq!(
+                capability_bit(Some(1), &blob, CAPABILITY_INDEX_MLOW_V1),
+                CapabilityBit::Clear
+            );
+        }
+    }
+
+    /// The bit index maps to the byte the const-fn edits. If these two ever disagree the client
+    /// would announce one thing and read another, which is unfalsifiable in a round-trip test.
+    #[test]
+    fn the_index_and_the_hand_written_mask_agree() {
+        let mut blob = CAPABILITY_OFFER;
+        blob[5] &= 0x7f;
+        assert_eq!(blob, CAPABILITY_STANDARD_OPUS_OFFER);
+        assert_eq!(
+            (CAPABILITY_INDEX_MLOW_V1 / 8) as usize + CAPABILITY_HEADER_LEN,
+            5
+        );
+        assert_eq!(1u8 << (CAPABILITY_INDEX_MLOW_V1 % 8), 0x80);
+    }
+
+    // Absent and invalid are treated in OPPOSITE directions by the official client, and the whole
+    // reason `CapabilityBit` has three states is that writing them the same way is easy.
+    #[test]
+    fn an_absent_blob_is_unknown_and_an_unreadable_one_is_clear() {
+        // A node that is present and carries nothing is one of the three conditions that send the
+        // client to its version -1 fallback, against which every query answers false. Reading it as
+        // "no evidence" would keep MLow on against a peer that cannot decode it.
+        assert_eq!(
+            capability_bit(Some(1), &[], CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "an empty blob is an unreadable one, not an absent one"
+        );
+        assert_eq!(
+            capability_bit(None, &CAPABILITY_OFFER, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "an unparseable ver falls back to a capability that answers false for everything"
+        );
+        assert_eq!(
+            capability_bit(Some(0), &CAPABILITY_OFFER, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a version below the index's own answers false"
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_short_mask_reads_clear_rather_than_panicking() {
+        assert_eq!(
+            capability_bit(Some(1), &[0x01, 0x05], CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a header with no mask"
+        );
+        assert_eq!(
+            capability_bit(Some(1), &[0x01, 0x40, 0xff], CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a declared length longer than the content"
+        );
+        assert_eq!(
+            capability_bit(Some(1), &[0x01], CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a blob with no length byte"
+        );
+        // The dangerous truncation is the one that still carries the byte the index lives in: the
+        // normal offer blob with its last byte lost. Clamping to the surviving prefix would read
+        // index 31 out of it and report Set for a blob the peer's own parser rejects wholesale.
+        let mut truncated = CAPABILITY_OFFER.to_vec();
+        truncated.pop();
+        assert_eq!(
+            capability_bit(Some(1), &truncated, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a truncated blob is unreadable even where the index's own byte survived"
+        );
+    }
+
+    // The official reader masks the byte index with 31, so an index past 255 aliases onto a low
+    // one. Pinned so nobody "fixes" it into a bounds check and diverges from the peer.
+    #[test]
+    fn an_index_past_the_readable_space_aliases_the_way_the_client_does() {
+        let blob = [0x01, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(capability_bit(Some(1), &blob, 0), CapabilityBit::Set);
+        assert_eq!(capability_bit(Some(1), &blob, 256), CapabilityBit::Set);
+    }
+
+    #[test]
+    fn the_mutual_and_only_drops_mlow_on_an_explicit_clear() {
+        assert!(mlow_after_peer_capability(true, CapabilityBit::Set));
+        assert!(
+            mlow_after_peer_capability(true, CapabilityBit::Unknown),
+            "a peer that announced nothing does not reset anything"
+        );
+        assert!(!mlow_after_peer_capability(true, CapabilityBit::Clear));
+        assert!(
+            !mlow_after_peer_capability(false, CapabilityBit::Set),
+            "the local setting is the other half of the AND"
+        );
+    }
+
+    // A peer outside the MLow rollout is exactly the #1105 case, and the whole call hinges on this
+    // one boolean coming out false.
+    #[test]
+    fn a_peer_outside_the_mlow_rollout_selects_standard_opus() {
+        let peer = capability_bit(
+            Some(1),
+            &CAPABILITY_STANDARD_OPUS_OFFER,
+            CAPABILITY_INDEX_MLOW_V1,
+        );
+        assert!(!mlow_after_peer_capability(true, peer));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;
@@ -970,8 +1385,101 @@ mod tests {
             .attr("call-id", "CALL-ID-0001")
     }
 
-    fn as_ref<'a>(n: &'a wacore_binary::Node) -> NodeRef<'a> {
+    fn as_ref<'a>(n: &'a Node) -> NodeRef<'a> {
         n.as_node_ref()
+    }
+
+    #[cfg(feature = "voip")]
+    fn parsed_peer_capability(
+        version: Option<&str>,
+    ) -> Option<crate::types::group_call::GroupCallDevice> {
+        let mut capability = NodeBuilder::new("capability").bytes(CAPABILITY_OFFER.to_vec());
+        if let Some(version) = version {
+            capability = capability.attr("ver", version);
+        }
+        let node = base_call_builder()
+            .children([offer_builder_base()
+                .children([
+                    NodeBuilder::new("audio")
+                        .attr("enc", "opus")
+                        .attr("rate", "16000")
+                        .build(),
+                    NodeBuilder::new("enc")
+                        .attr("v", "2")
+                        .attr("type", "pkmsg")
+                        .bytes(vec![1, 2, 3, 4])
+                        .build(),
+                    capability.build(),
+                ])
+                .build()])
+            .build();
+        parse_call_stanza(&as_ref(&node))
+            .expect("offer parses")
+            .expect("recognized call")
+            .media()
+            .expect("media offer")
+            .peer_device
+            .clone()
+    }
+
+    /// A `<capability>` that is present keeps its device whatever its `ver` says.
+    ///
+    /// Absence and unreadability are opposite states downstream: an absent node resets nothing,
+    /// while an unreadable blob resets every capability-gated parameter. Discarding the device for a
+    /// malformed `ver` collapsed the second into the first, which keeps MLOW enabled against a peer
+    /// that cannot decode it. See `capability_bit`.
+    #[cfg(feature = "voip")]
+    #[test]
+    fn a_present_capability_survives_an_unreadable_version() {
+        assert_eq!(
+            parsed_peer_capability(Some("7")).and_then(|device| device.capability_version),
+            Some(7)
+        );
+        for unreadable in [None, Some("invalid"), Some("4294967296")] {
+            let device = parsed_peer_capability(unreadable)
+                .expect("a present node keeps its device so the blob can read as unreadable");
+            assert_eq!(
+                device.capability_version, None,
+                "ver {unreadable:?} is not readable"
+            );
+            assert_eq!(
+                capability_bit(
+                    device.capability_version,
+                    device.capability(),
+                    CAPABILITY_INDEX_MLOW_V1
+                ),
+                CapabilityBit::Clear,
+                "an unreadable blob must reset, not be mistaken for absence"
+            );
+        }
+    }
+
+    // The blob's header is `[version][len]`, and only the second byte was ever read. A client that
+    // cannot build a capability it believes in writes one that must read as nothing -- but a blob
+    // whose own version byte is wrong still answered `Set` for index 31, keeping MLOW enabled
+    // against a peer that had fallen back to native Opus. That peer is then sent MLOW and hears
+    // silence: #1105 again, reached through the one byte the parse did not look at.
+    #[test]
+    fn a_blob_whose_embedded_version_is_wrong_reads_as_nothing() {
+        // A well-formed mask with index 31 set, under each embedded version byte.
+        let mut mask = [0u8; 4];
+        mask[(CAPABILITY_INDEX_MLOW_V1 / 8) as usize] = 1 << (CAPABILITY_INDEX_MLOW_V1 % 8);
+
+        let good: Vec<u8> = [1u8, 4].iter().copied().chain(mask).collect();
+        assert_eq!(
+            capability_bit(Some(1), &good, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Set,
+            "the version the header declares is the one this crate writes"
+        );
+
+        for wrong in [0u8, 2, 255] {
+            let blob: Vec<u8> = [wrong, 4].iter().copied().chain(mask).collect();
+            assert_eq!(
+                capability_bit(Some(1), &blob, CAPABILITY_INDEX_MLOW_V1),
+                CapabilityBit::Clear,
+                "embedded version {wrong} is not one we can read, so the blob resets"
+            );
+        }
     }
 
     // An offer carrying an <enc> (the encrypted callKey) and a <relay> must surface both on
@@ -1008,6 +1516,10 @@ mod tests {
                             .attr("type", "pkmsg")
                             .bytes(vec![1, 2, 3, 4])
                             .build(),
+                        NodeBuilder::new("capability")
+                            .attr("ver", "1")
+                            .bytes(CAPABILITY_OFFER.to_vec())
+                            .build(),
                         NodeBuilder::new("metadata")
                             .attr("peer_abtest_bucket", "video_interop_holdout")
                             .attr("peer_abtest_bucket_id_list", "110001,110002")
@@ -1019,7 +1531,7 @@ mod tests {
             .build();
 
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
-        let media = call.media.expect("offer with <enc> must capture media");
+        let media = call.media().expect("offer with <enc> must capture media");
         let enc = media
             .enc_for(None)
             .expect("a bare <enc> is addressed to us");
@@ -1034,10 +1546,45 @@ mod tests {
             media.peer_abtest_bucket_id_list.as_deref(),
             Some("110001,110002")
         );
-        let rd = media.relay.expect("the <relay> must be parsed");
+        let peer_device = media.peer_device.as_ref().expect("active peer capability");
+        assert_eq!(peer_device.jid, fake_caller_lid());
+        assert_eq!(peer_device.capability_version, Some(1));
+        assert_eq!(peer_device.capability, CAPABILITY_OFFER);
+        let rd = media.relay.as_ref().expect("the <relay> must be parsed");
         assert_eq!(rd.warp_mi_tag_len, Some(4));
         assert_eq!(rd.relay_tokens[0], vec![0xaa, 0xbb]);
         assert_eq!(rd.endpoints[0].relay_name, "gru1c02");
+    }
+
+    #[cfg(feature = "voip")]
+    #[test]
+    fn peer_capability_binds_to_the_routed_participant() {
+        let participant = fake_caller_lid().with_device(3);
+        let node = base_call_builder()
+            .attr("participant", &participant)
+            .children([offer_builder_base()
+                .children([
+                    NodeBuilder::new("enc")
+                        .attr("v", "2")
+                        .attr("type", "pkmsg")
+                        .bytes(vec![1, 2, 3, 4])
+                        .build(),
+                    NodeBuilder::new("capability")
+                        .attr("ver", "1")
+                        .bytes(CAPABILITY_OFFER.to_vec())
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let device = parse_call_stanza(&as_ref(&node))
+            .unwrap()
+            .unwrap()
+            .media()
+            .expect("media offer")
+            .peer_device
+            .clone()
+            .expect("peer capability");
+        assert_eq!(device.jid, participant);
     }
 
     // An offer with no <enc> for us (e.g. a different device's destination) yields media=None: there
@@ -1054,7 +1601,7 @@ mod tests {
                 .build()])
             .build();
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
-        assert!(call.media.is_none());
+        assert!(call.media().is_none());
     }
 
     // A multi-device offer lists one <to jid><enc> per recipient device. The parser keeps every
@@ -1088,7 +1635,7 @@ mod tests {
             .build();
 
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
-        let media = call.media.expect("multi-device offer captures media");
+        let media = call.media().expect("multi-device offer captures media");
         // Selected by device jid, not by child order: dev2 is second but resolves to its own enc.
         assert_eq!(media.enc_for(Some(&dev2)).unwrap().ciphertext, vec![0xB2]);
         assert_eq!(media.enc_for(Some(&dev2)).unwrap().enc_type, "msg");
@@ -1098,19 +1645,20 @@ mod tests {
         assert!(media.enc_for(Some(&other)).is_none());
     }
 
-    // Regression: a LID `<to jid>` decoded from the wire is an AD-JID carrying agent=1 (the Lid domain
-    // byte); our own LID is agent=1 too. The parser must read the TYPED jid (`to_jid`), never
-    // stringify+reparse it (which drops the agent to 0, since `renders_agent(Lid)` is false), or a
-    // multi-device callee never matches its `<to>` and silently fails "offer carried no callKey",
-    // even against the real server. The typed Jid value with agent=1 here is exactly what
-    // `as_node_ref`/the decoder carries for an AD-JID.
+    // Regression: `enc_for` matches `<to jid>` against our own JID by full structural
+    // equality, so a `<to>` that came off the wire and a JID that came from text have
+    // to agree field for field. When they did not, a multi-device callee never matched
+    // its `<to>` and silently failed "offer carried no callKey" against the real
+    // server. The stanza goes through marshal/unmarshal here so the `<to jid>` is
+    // produced by the real AD-JID decode rather than handed to the parser as an
+    // already-built value.
     #[cfg(feature = "voip")]
     #[test]
-    fn offer_to_jid_keeps_lid_agent_from_typed_jid() {
+    fn offer_to_jid_matches_our_own_jid_field_for_field() {
         let wire_to = Jid {
             user: "111111111111111".into(),
             server: Server::Lid,
-            agent: 1, // the AD-JID domain byte; the string form suppresses it
+            agent: 0,
             device: 7,
             integrator: 0,
         };
@@ -1128,13 +1676,22 @@ mod tests {
                 .build()])
             .build();
 
-        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
-        let media = call.media.expect("offer captures media");
+        let bytes = wacore_binary::marshal::marshal(&node).unwrap();
+        let decoded = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+        let call = parse_call_stanza(&decoded).unwrap().unwrap();
+        let media = call.media().expect("offer captures media");
 
-        // Our own device LID as get_lid() yields it: agent=1.
+        let from_wire = media.encs[0].to.as_ref().expect("<to jid> survives decode");
+        let from_text: Jid = "111111111111111:7@lid".parse().unwrap();
+        assert_eq!(
+            from_wire, &from_text,
+            "the decoded <to jid> must equal the same JID read back as text, which is \
+             how our own LID reaches `enc_for`"
+        );
+
         assert_eq!(
             media
-                .enc_for(Some(&wire_to))
+                .enc_for(Some(&from_text))
                 .expect("callKey for our device")
                 .ciphertext,
             vec![0xB2],
@@ -1183,6 +1740,10 @@ mod tests {
                 group_jid,
             } => {
                 assert_eq!(call_id, "CALL-ID-0001");
+                assert_eq!(
+                    call.video_orientation, None,
+                    "this fixture carries no <video>"
+                );
                 assert_eq!(call_creator, fake_caller_lid());
                 assert_eq!(caller_pn, Some(fake_caller_pn()));
                 assert_eq!(caller_country_code.as_deref(), Some("BR"));
@@ -1421,9 +1982,77 @@ mod tests {
         }
     }
 
+    /// A `<reject>` from a device that cannot take the call carries `reason="busy"`. Dropping it
+    /// made a busy companion indistinguishable from the callee declining, which ended calls the
+    /// peer's other devices were still answering.
+    #[test]
+    fn reject_preserves_a_busy_reason() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .attr("count", "0")
+                .attr("reason", REJECT_REASON_BUSY)
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some(REJECT_REASON_BUSY));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// A `<reject>` from a device that could not decrypt the offer carries `reason="enc"`. The
+    /// pinned whatspec IR models `reason` as an opaque string (`WAWebHandleVoipCall` dispatcher,
+    /// `WAWebHandleVoipCallReceipt` parser; no reject-reason wire enum in the catalog), so the
+    /// parser must preserve it verbatim for the handler's per-device dispatch.
+    #[test]
+    fn reject_preserves_an_enc_reason() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .attr("count", "0")
+                .attr("reason", "enc")
+                .children([NodeBuilder::new("registration")
+                    .bytes(0x12345678u32.to_be_bytes().to_vec())
+                    .build()])
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some(REJECT_REASON_ENC));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// The failure case for the above: an explicit decline carries no `reason`, and must not be
+    /// confused with a busy device.
+    #[test]
+    fn reject_without_a_reason_parses_as_none() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => assert_eq!(reason, None),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
     #[test]
     fn transport_and_relaylatency_are_parsed_not_dropped() {
-        // Regression: these were missing from KNOWN_ACTIONS and silently dropped (Ok(None)).
+        // Regression: these were missing from dispatch and silently dropped (Ok(None)).
         let transport = base_call_builder()
             .children([NodeBuilder::new("transport")
                 .attr("call-creator", fake_caller_lid())
@@ -1978,7 +2607,7 @@ mod tests {
             video.attrs().optional_string("screen_width").as_deref(),
             Some("0")
         );
-        // A video callee preaccepts with the 0xbb CAPABILITY_OFFER blob, not the 0xfa offer blob.
+        // A video callee preaccepts with the 0xbb CAPABILITY_OFFER blob, not the video offer blob.
         let cap = action.get_optional_child("capability").unwrap();
         assert_eq!(cap.content_bytes().unwrap(), &CAPABILITY_OFFER);
 
@@ -2159,6 +2788,33 @@ mod tests {
     }
 
     #[test]
+    fn generated_call_action_tags_drive_dispatch_and_serialization() {
+        assert_eq!(
+            CallActionTag::try_from("group_update").expect("known generated tag"),
+            CallActionTag::GroupUpdate
+        );
+        assert!(CallActionTag::try_from("future_call_action").is_err());
+
+        let action = CallAction::RelayLatency {
+            call_id: "CID".to_string(),
+            call_creator: fake_caller_lid(),
+        };
+        let value = serde_json::to_value(action).expect("serialize call action");
+        assert_eq!(value["type"], "relaylatency");
+
+        let optional = CallAction::Reject {
+            call_id: "CID".to_string(),
+            call_creator: fake_caller_lid(),
+            reason: None,
+        };
+        let value = serde_json::to_value(optional).expect("serialize optional fields");
+        assert!(
+            value.get("reason").is_none(),
+            "tagged WireEnum preserves the frozen omission semantics for None"
+        );
+    }
+
+    #[test]
     fn parse_video_accept_downgrade_and_unknown_states() {
         let accept = video_call_node(&[("state", "4"), ("dec", "H264,AV1")]);
         let call = parse_call_stanza(&as_ref(&accept)).unwrap().unwrap();
@@ -2287,6 +2943,96 @@ mod tests {
         ));
     }
 
+    /// The rotation a video-from-start peer announces rides the `<offer>`'s and
+    /// `<accept>`'s `<video>` child, not only the mid-call `<video>` stanza.
+    /// Both were parsed for `is_video` alone, so a caller holding the phone
+    /// sideways had every frame stamped upright until they happened to turn it.
+    ///
+    /// The offer shape is the one a real Android client sent us; the accept
+    /// mirrors what we ourselves send.
+    #[test]
+    fn offer_and_accept_carry_the_peers_device_orientation() {
+        let offer = NodeBuilder::new("call")
+            .attr("from", "5511999990000@lid")
+            .attr("id", "STANZA-1")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("offer")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([
+                    NodeBuilder::new("audio")
+                        .attr("rate", "16000")
+                        .attr("enc", "opus")
+                        .build(),
+                    NodeBuilder::new("video")
+                        .attr("screen_width", "1280")
+                        .attr("dec", "H264,H265,AV1")
+                        .attr("screen_height", "2772")
+                        .attr("device_orientation", "1")
+                        .attr("enc", "h.264")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&offer.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        assert_eq!(parsed.video_orientation, Some(1));
+        match parsed.action {
+            CallAction::Offer { is_video, .. } => assert!(is_video),
+            other => panic!("expected an offer, got {other:?}"),
+        }
+
+        let accept = NodeBuilder::new("call")
+            .attr("from", "5511999990000:3@lid")
+            .attr("id", "STANZA-2")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([NodeBuilder::new("video")
+                    .attr("dec", "H264")
+                    .attr("device_orientation", "3")
+                    .build()])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&accept.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        assert_eq!(parsed.video_orientation, Some(3));
+        assert!(matches!(parsed.action, CallAction::Accept { .. }));
+    }
+
+    /// Out of range is "not announced", never a folded-in value: `4` is a peer
+    /// counting something other than quarter turns, and answering it with `0`
+    /// would stamp an upright picture that stays wrong for the whole call.
+    #[test]
+    fn an_out_of_range_offer_orientation_is_dropped_not_folded() {
+        let offer = NodeBuilder::new("call")
+            .attr("from", "5511999990000@lid")
+            .attr("id", "STANZA-3")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("offer")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([NodeBuilder::new("video")
+                    .attr("dec", "H264")
+                    .attr("device_orientation", "4")
+                    .build()])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&offer.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        assert_eq!(parsed.video_orientation, None);
+        match parsed.action {
+            CallAction::Offer { is_video, .. } => {
+                assert!(is_video, "the <video> child still means a video offer")
+            }
+            other => panic!("expected an offer, got {other:?}"),
+        }
+    }
+
     #[test]
     fn offer_and_accept_video_advertisement() {
         let peer = peer();
@@ -2360,7 +3106,11 @@ mod tests {
         );
         assert_eq!(vr.attrs().optional_string("screen_width"), None);
 
-        // The offer's <video> carries the decoder/geometry advertisement (WaCalls reference form).
+        // The offer's <video> carries the codec/geometry advertisement in the
+        // shape WA Web's `fill_video` reads: `enc` one of the two encodings it
+        // accepts, `dec` from its five-name capability table, and no
+        // `orientation` — the hand-written form had all three the other way and
+        // its offers were delivered, acked and never rung.
         let ovnode = offer.as_node_ref().children().unwrap()[0]
             .children()
             .unwrap()
@@ -2369,8 +3119,25 @@ mod tests {
             .unwrap()
             .to_owned();
         let ovr = ovnode.as_node_ref();
-        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h264"));
-        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("h264"));
+        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h.264"));
+        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ovr.attrs().optional_string("orientation"),
+            None,
+            "the real client sends no `orientation`; the rotation rides `device_orientation`"
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("screen_width").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("screen_height").as_deref(),
+            Some("0")
+        );
 
         let accept = build_accept(&AcceptParams {
             call_id: "CID",

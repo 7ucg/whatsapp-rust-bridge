@@ -56,6 +56,14 @@ pub(crate) fn unwrap_message(msg: &wa::Message) -> &wa::Message {
         newsletter_admin_profile_message,
         newsletter_admin_profile_message_v2,
         poll_creation_message_v4,
+        // WA Web's typeAttributeFromProtobuf re-checks this wrapper rather than
+        // classifying it, so the inner message decides the type — a
+        // botForwardedMessage carrying an imageMessage is type="media", not
+        // "text". Unwrapping here also reaches `mediaTypeFromProtobuf`, whose
+        // own list omits the wrapper: the same deliberate divergence #692 made
+        // for group_status_message_v2, and the one that delivers, because
+        // `media` with a mediatype renders and `media` without one does not.
+        bot_forwarded_message,
     );
     if let Some(dsm) = msg.device_sent_message.as_option()
         && let Some(inner) = dsm.message.as_option()
@@ -107,6 +115,12 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
         || msg.newsletter_follower_invite_message_v2.is_set()
         || msg.message_history_notice.is_set()
         || msg.album_message.is_set()
+        || msg.rich_response_message.is_set()
+        // Reaching here with the wrapper still set means `unwrap_message` found
+        // no inner to descend into — the one branch where WA Web answers text
+        // (`return h ? f(h, n+1) : text`). With an inner present this is the
+        // unwrapped message instead, and the inner decides.
+        || msg.bot_forwarded_message.is_set()
         // Payment family. WA Web's typeAttributeFromProtobuf leaves these at the media
         // default, but media-without-mediatype is dropped by the server (so is a bare
         // "pay" stanza); text is what delivers and renders on Android.
@@ -164,7 +178,18 @@ pub fn media_type_from_message(msg: &wa::Message) -> Option<&'static str> {
     // WA Web's mediaTypeFromProtobuf treats a top-level lottieStickerMessage as a
     // terminal "sticker" and does NOT recurse into it (unlike typeAttributeFromProtobuf,
     // which unwraps it via getUnwrappedProtobufMessage). Check before the shared unwrap.
-    if msg.lottie_sticker_message.is_set() {
+    // A lottie behind `bot_forwarded_message` counts too: that wrapper is absent
+    // from mediaTypeFromProtobuf's own list but present in the shared unwrap, so
+    // without this the check above misses it, the unwrap descends past it, and
+    // the stanza goes out `media` with no mediatype — the shape the recipient
+    // drops.
+    if msg.lottie_sticker_message.is_set()
+        || msg
+            .bot_forwarded_message
+            .as_option()
+            .and_then(|w| w.message.as_option())
+            .is_some_and(|inner| inner.lottie_sticker_message.is_set())
+    {
         return Some("sticker");
     }
 

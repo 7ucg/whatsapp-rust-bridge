@@ -5,6 +5,27 @@ use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeRef};
 
+/// A device the server refused to hand a bundle for, named individually.
+#[derive(Debug, Clone)]
+pub struct RejectedDevice {
+    pub jid: Jid,
+    /// The `<error code>` the server attached; `406` means unregistered.
+    pub code: u16,
+}
+
+/// What one prekey fetch produced: the bundles it did return, and the devices
+/// it named as rejected.
+///
+/// Kept apart because they call for opposite responses. A missing bundle is
+/// ambiguous and the device is simply skipped this round; a rejected one is the
+/// server telling us which cached device is gone, which is the only per-device
+/// signal a batch-wide failure cannot give.
+#[derive(Default)]
+pub struct PreKeyFetchOutcome {
+    pub bundles: HashMap<Jid, PreKeyBundle>,
+    pub rejected: Vec<RejectedDevice>,
+}
+
 pub struct PreKeyUtils;
 
 /// Compute SHA-1 digest of a key bundle for validation against server.
@@ -175,21 +196,28 @@ impl PreKeyUtils {
     pub fn parse_prekeys_response(
         resp_node: &NodeRef<'_>,
         account_identities: &HashMap<Jid, [u8; 32]>,
-    ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
+    ) -> Result<PreKeyFetchOutcome, anyhow::Error> {
         let list_node = resp_node
             .get_optional_child("list")
             .ok_or_else(|| anyhow::anyhow!("<list> not found in pre-key response"))?;
 
         let children = list_node.children().unwrap_or_default();
-        let mut bundles = HashMap::with_capacity(children.len());
+        let mut outcome = PreKeyFetchOutcome {
+            bundles: HashMap::with_capacity(children.len()),
+            rejected: Vec::new(),
+        };
         for user_node_ref in children {
             if user_node_ref.tag != "user" {
                 continue;
             }
-            let mut jid = user_node_ref
-                .attrs()
-                .jid("jid")
-                .normalize_for_prekey_bundle();
+            // A `<user>` whose jid is missing or unparseable names no device, and
+            // the default would name device 0 of an empty user -- an address a
+            // rejection must never be recorded against.
+            let Some(named) = user_node_ref.attrs().optional_jid("jid") else {
+                log::warn!("prekey response carried a <user> with no usable jid; skipping");
+                continue;
+            };
+            let mut jid = named;
             if jid.device == 0
                 && matches!(
                     jid.server,
@@ -201,6 +229,35 @@ impl PreKeyUtils {
                 jid.user = CompactString::from(user_base);
                 jid.device = device;
             }
+            // A rejected device answers with an `<error>` in place of its key
+            // material, which is how the server names the one device a
+            // batch-wide failure cannot. Distinguished from a malformed bundle
+            // because only this one means "this device is gone": the caller
+            // refreshes that device list, and the rest of the batch is
+            // unaffected. Mirrors WA Web's `FetchKeyBundlesUserError` arm,
+            // which collects per-item errors alongside the bundles.
+            if let Some(error_node) = user_node_ref.get_optional_child("error") {
+                // Narrowed, not truncated: `65942 as u16` is 406, so a cast
+                // would let an out-of-range code arrive as the one value that
+                // makes us refresh a device list. A code we cannot read names
+                // nothing we can act on, so the entry is dropped rather than
+                // guessed at.
+                match error_node
+                    .attrs()
+                    .optional_u64("code")
+                    .and_then(|raw| u16::try_from(raw).ok())
+                {
+                    Some(code) => {
+                        log::debug!("prekey fetch rejected {} with code {code}", jid.observe());
+                        outcome.rejected.push(RejectedDevice { jid, code });
+                    }
+                    None => log::warn!(
+                        "prekey fetch rejected {} with an unreadable code; ignoring",
+                        jid.observe()
+                    ),
+                }
+                continue;
+            }
             let account_identity = account_identities.get(&jid);
             let bundle =
                 match Self::node_to_pre_key_bundle_ref(&jid, user_node_ref, account_identity) {
@@ -210,10 +267,10 @@ impl PreKeyUtils {
                         continue;
                     }
                 };
-            bundles.insert(jid, bundle);
+            outcome.bundles.insert(jid, bundle);
         }
 
-        Ok(bundles)
+        Ok(outcome)
     }
 
     fn node_to_pre_key_bundle_ref(
@@ -224,9 +281,15 @@ impl PreKeyUtils {
         use crate::xml::DisplayableNodeRef;
         use wacore_binary::NodeContentRef;
 
-        fn extract_bytes_ref(node: Option<&NodeRef<'_>>) -> Result<Vec<u8>, anyhow::Error> {
-            match node.and_then(|n| n.content.as_deref()) {
-                Some(NodeContentRef::Bytes(b)) => Ok(b.to_vec()),
+        // Borrows out of the decoded node instead of copying: every value in a
+        // bundle is fixed-width and ends up in an array, so the owned `Vec` this
+        // used to hand back was allocated only to be length-checked, copied out
+        // and dropped. With the `<value>` and `<signature>` reads below that is
+        // five allocations per device, on a path that runs for every device of
+        // every user in a fetch.
+        fn extract_bytes_ref<'a>(node: Option<&'a NodeRef<'_>>) -> Result<&'a [u8], anyhow::Error> {
+            match node.and_then(|n| n.content.as_ref()) {
+                Some(NodeContentRef::Bytes(b)) => Ok(b.as_ref()),
                 _ => Err(anyhow::anyhow!("Expected bytes in node content")),
             }
         }
@@ -239,23 +302,20 @@ impl PreKeyUtils {
         }
 
         let reg_id_bytes = extract_bytes_ref(node.get_optional_child("registration"))?;
-        if reg_id_bytes.len() != 4 {
-            return Err(anyhow::anyhow!("Invalid registration ID length"));
-        }
-        let registration_id = u32::from_be_bytes([
-            reg_id_bytes[0],
-            reg_id_bytes[1],
-            reg_id_bytes[2],
-            reg_id_bytes[3],
-        ]);
+        let registration_id = u32::from_be_bytes(
+            <[u8; 4]>::try_from(reg_id_bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid registration ID length"))?,
+        );
 
         let keys_node = node.get_optional_child("keys").unwrap_or(node);
 
         let identity_key_bytes = extract_bytes_ref(keys_node.get_optional_child("identity"))?;
-        let identity_key_array: [u8; 32] =
-            identity_key_bytes.try_into().map_err(|v: Vec<u8>| {
-                anyhow::anyhow!("Invalid identity key length: got {}, expected 32", v.len())
-            })?;
+        let identity_key_array: [u8; 32] = identity_key_bytes.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid identity key length: got {}, expected 32",
+                identity_key_bytes.len()
+            )
+        })?;
         let identity_key =
             IdentityKey::new(PublicKey::from_djb_public_key_bytes(&identity_key_array)?);
 
@@ -301,7 +361,7 @@ impl PreKeyUtils {
             let device_identity = node
                 .get_optional_child("device-identity")
                 .or_else(|| keys_node.get_optional_child("device-identity"))
-                .and_then(|n| match n.content.as_deref() {
+                .and_then(|n| match n.content.as_ref() {
                     Some(NodeContentRef::Bytes(b)) => Some(b),
                     _ => None,
                 });
@@ -310,6 +370,7 @@ impl PreKeyUtils {
                     di,
                     &identity_key_array,
                     account_identity,
+                    jid,
                 ) {
                     crate::adv::AdvValidation::Valid => {}
                     crate::adv::AdvValidation::Invalid => {
@@ -335,7 +396,7 @@ impl PreKeyUtils {
 
         let id_content = node
             .get_optional_child("id")
-            .and_then(|n| n.content.as_deref());
+            .and_then(|n| n.content.as_ref());
 
         let id = match id_content {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => {
@@ -362,21 +423,17 @@ impl PreKeyUtils {
 
         let value_bytes = node
             .get_optional_child("value")
-            .and_then(|n| n.content.as_deref())
+            .and_then(|n| n.content.as_ref())
             .and_then(|c| {
                 if let NodeContentRef::Bytes(b) = c {
-                    Some(b.to_vec())
+                    Some(b.as_ref())
                 } else {
                     None
                 }
             })
             .ok_or(anyhow::anyhow!("Missing pre-key value"))?;
-        if value_bytes.len() != 32 {
-            return Err(anyhow::anyhow!("Invalid pre-key value length"));
-        }
-
-        let mut value_arr = [0u8; 32];
-        value_arr.copy_from_slice(&value_bytes);
+        let value_arr = <[u8; 32]>::try_from(value_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid pre-key value length"))?;
         Ok(Some((id, value_arr)))
     }
 
@@ -391,21 +448,17 @@ impl PreKeyUtils {
         };
         let signature_bytes = node
             .get_optional_child("signature")
-            .and_then(|n| n.content.as_deref())
+            .and_then(|n| n.content.as_ref())
             .and_then(|c| {
                 if let NodeContentRef::Bytes(b) = c {
-                    Some(b.to_vec())
+                    Some(b.as_ref())
                 } else {
                     None
                 }
             })
             .ok_or(anyhow::anyhow!("Missing signed pre-key signature"))?;
-        if signature_bytes.len() != 64 {
-            return Err(anyhow::anyhow!("Invalid signature length"));
-        }
-
-        let mut sig_arr = [0u8; 64];
-        sig_arr.copy_from_slice(&signature_bytes);
+        let sig_arr = <[u8; 64]>::try_from(signature_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid signature length"))?;
         Ok((id, public_key_bytes, sig_arr))
     }
 }
@@ -508,14 +561,145 @@ mod tests {
             .build();
 
         let bundles = PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
-            .expect("parse bundles");
+            .expect("parse bundles")
+            .bundles;
         assert!(bundles.contains_key(&base_jid));
         assert!(!bundles.contains_key(&raw_jid));
 
         let parsed_jid = bundles.keys().next().expect("parsed jid");
         assert_eq!(parsed_jid.user, base_jid.user);
         assert_eq!(parsed_jid.device, base_jid.device);
-        assert_eq!(parsed_jid.agent, 0);
+        // The server's stray agent byte rides along on the parsed key rather than
+        // being scrubbed off it. It is inert on a LID, so it never reaches
+        // identity — which is what the two `contains_key` assertions above prove,
+        // and what the scrubbing used to be needed for.
+        assert_eq!(parsed_jid.agent, 1);
+    }
+
+    /// The server names a rejected device inside its own `<user>`, which is the
+    /// per-device signal a batch-wide `406` cannot give. The rest of the batch
+    /// must come back intact, or one absent device would cost the send every
+    /// other device in it.
+    #[test]
+    fn a_rejected_user_is_named_without_costing_the_rest_of_the_batch() {
+        let good_jid = Jid::lid_device("100000012345678", 1);
+        let gone_jid = Jid::lid_device("100000087654321", 2);
+
+        let good =
+            PreKeyBundleUserNode::from_bundle(good_jid.clone(), &create_mock_bundle(1), None)
+                .expect("build bundle node")
+                .into_node();
+
+        // What the server sends in place of key material for a device it no
+        // longer knows: an <error> where the bundle would be.
+        let gone = NodeBuilder::new("user")
+            .attr("jid", NodeValue::Jid(gone_jid.clone()))
+            .children([NodeBuilder::new("error")
+                .attr("code", "406")
+                .attr("text", "not-acceptable")
+                .build()])
+            .build();
+
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("list").children([good, gone]).build()])
+            .build();
+
+        let outcome = PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+            .expect("a rejected user must not fail the whole parse");
+
+        assert!(
+            outcome.bundles.contains_key(&good_jid),
+            "the healthy device still gets its bundle"
+        );
+        assert!(
+            !outcome.bundles.contains_key(&gone_jid),
+            "the rejected device has no bundle to give"
+        );
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].jid, gone_jid);
+        assert_eq!(
+            outcome.rejected[0].code, 406,
+            "the code is what separates an unregistered device from another refusal"
+        );
+    }
+
+    /// `65942 as u16` is exactly 406, so a truncating cast turns an
+    /// out-of-range code into the one value that makes the caller refresh a
+    /// device list. The rejection is dropped instead of being invented.
+    #[test]
+    fn an_out_of_range_error_code_is_not_narrowed_into_a_406() {
+        let gone_jid = Jid::lid_device("100000087654321", 2);
+        assert_eq!(65942_u64 as u16, 406, "the cast this guards against");
+
+        let gone = NodeBuilder::new("user")
+            .attr("jid", NodeValue::Jid(gone_jid.clone()))
+            .children([NodeBuilder::new("error").attr("code", "65942").build()])
+            .build();
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("list").children([gone]).build()])
+            .build();
+
+        let outcome = PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+            .expect("parse");
+
+        assert!(
+            outcome.rejected.is_empty(),
+            "an unreadable code must not be recorded as a rejection"
+        );
+        assert!(outcome.bundles.is_empty());
+    }
+
+    /// A `<user>` with no usable jid names no device. Defaulting it would record
+    /// the rejection against device 0 of an empty user and refresh whatever
+    /// that resolves to.
+    #[test]
+    fn a_user_without_a_usable_jid_is_skipped_rather_than_defaulted() {
+        for attrs in [None, Some("not a jid")] {
+            let mut builder = NodeBuilder::new("user");
+            if let Some(raw) = attrs {
+                builder = builder.attr("jid", raw);
+            }
+            let user = builder
+                .children([NodeBuilder::new("error").attr("code", "406").build()])
+                .build();
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("list").children([user]).build()])
+                .build();
+
+            let outcome =
+                PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+                    .expect("parse");
+
+            assert!(
+                outcome.rejected.is_empty(),
+                "a rejection with no device to name must not be recorded ({attrs:?})"
+            );
+        }
+    }
+
+    /// The code travels intact for values that do fit, since it is what decides
+    /// whether the caller acts at all.
+    #[test]
+    fn a_rejection_keeps_the_code_the_server_sent() {
+        for code in [400_u16, 406, 503] {
+            let jid = Jid::lid_device("100000011112222", 3);
+            let user = NodeBuilder::new("user")
+                .attr("jid", NodeValue::Jid(jid.clone()))
+                .children([NodeBuilder::new("error")
+                    .attr("code", code.to_string())
+                    .build()])
+                .build();
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("list").children([user]).build()])
+                .build();
+
+            let outcome =
+                PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+                    .expect("parse");
+
+            assert_eq!(outcome.rejected.len(), 1);
+            assert_eq!(outcome.rejected[0].code, code);
+        }
     }
 
     fn parse_one(jid: Jid, device_identity: Option<Vec<u8>>) -> HashMap<Jid, PreKeyBundle> {
@@ -528,6 +712,78 @@ mod tests {
             .build();
         PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
             .expect("parse bundles")
+            .bundles
+    }
+
+    #[test]
+    fn prekey_fetch_validates_mixed_and_hosted_adv_chains() {
+        use crate::adv::test_util;
+        use buffa::Message;
+        use waproto::whatsapp as wa;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let account_key = account.public_key.public_key_bytes();
+        for (jid, hosted_device) in test_util::device_cases() {
+            let bundle = PreKeyBundle::new(
+                1,
+                u32::from(jid.device).into(),
+                Some((1u32.into(), device.public_key)),
+                2u32.into(),
+                device.public_key,
+                vec![0; 64],
+                IdentityKey::new(device.public_key),
+            )
+            .unwrap();
+            for device_type in test_util::ENCRYPTION_TYPES {
+                let details = wa::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    device_type,
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let acct_prefix = test_util::account_prefix(device_type);
+                for include_account_key in [false, true] {
+                    for correct_device_prefix in [false, true] {
+                        let dev_prefix: &[u8; 2] = if hosted_device == correct_device_prefix {
+                            &[6, 6]
+                        } else {
+                            &[6, 1]
+                        };
+                        let signed = test_util::signed_identity(
+                            &account,
+                            &device,
+                            &details,
+                            acct_prefix,
+                            Some(dev_prefix),
+                            include_account_key,
+                        );
+                        let user = PreKeyBundleUserNode::from_bundle(
+                            jid.clone(),
+                            &bundle,
+                            Some(signed.encode_to_vec()),
+                        )
+                        .unwrap()
+                        .into_node();
+                        let response = NodeBuilder::new("iq")
+                            .children([NodeBuilder::new("list").children([user]).build()])
+                            .build();
+                        let fallbacks =
+                            HashMap::from([(jid.clone(), account_key.try_into().unwrap())]);
+                        let outcome = PreKeyUtils::parse_prekeys_response(
+                            &response.as_node_ref(),
+                            &fallbacks,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            outcome.bundles.contains_key(&jid),
+                            correct_device_prefix,
+                            "jid={jid} device_type={device_type:?} in_blob={include_account_key}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -554,7 +810,7 @@ mod tests {
         // device-identity without account_signature_key, signatures over the
         // bundle's identity key (create_mock_bundle's identity is unrelated, but
         // the NoAccountKey path short-circuits before signature checks anyway).
-        let di = trimmed_device_identity(&account, &device, b"details");
+        let di = trimmed_device_identity(&account, &device, b"\x18\x01");
         let bundles = parse_one(companion.clone(), Some(di));
         assert!(
             bundles.contains_key(&companion),
@@ -572,11 +828,7 @@ mod tests {
     }
 
     /// Encode an ADVSignedDeviceIdentity without the account_signature_key field.
-    fn trimmed_device_identity(
-        account: &crate::libsignal::protocol::KeyPair,
-        device: &crate::libsignal::protocol::KeyPair,
-        details: &[u8],
-    ) -> Vec<u8> {
+    fn trimmed_device_identity(account: &KeyPair, device: &KeyPair, details: &[u8]) -> Vec<u8> {
         use buffa::Message;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity = device.public_key.public_key_bytes();

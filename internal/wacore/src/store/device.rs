@@ -123,6 +123,7 @@ pub struct DevicePropsOverride {
     pub os: Option<String>,
     pub version: Option<wa::device_props::AppVersion>,
     pub platform_type: Option<wa::device_props::PlatformType>,
+    pub require_full_sync: Option<bool>,
     pub history_sync_config: Option<wa::device_props::HistorySyncConfig>,
 }
 
@@ -146,6 +147,29 @@ impl DevicePropsOverride {
         self
     }
 
+    /// Asks the server for a full history backfill instead of the recent-only
+    /// sync the default requests.
+    ///
+    /// This flag belongs to the `win_hybrid` row of the branch table on
+    /// [`DEVICE_PROPS`], and setting it alone leaves the other three fields on
+    /// the browser row. Rebuild the whole row:
+    ///
+    /// ```rust,ignore
+    /// DevicePropsOverride::new()
+    ///     .with_platform_type(PlatformType::UWP)
+    ///     .with_require_full_sync(true)
+    ///     .with_history_sync_config(wa::device_props::HistorySyncConfig {
+    ///         full_sync_days_limit: Some(365),
+    ///         on_demand_ready: Some(true),
+    ///         complete_on_demand_ready: Some(true),
+    ///         ..default_history_sync_config()
+    ///     })
+    /// ```
+    pub fn with_require_full_sync(mut self, require_full_sync: bool) -> Self {
+        self.require_full_sync = Some(require_full_sync);
+        self
+    }
+
     /// Replaces the entire `HistorySyncConfig`. Spread [`default_history_sync_config`]
     /// into the literal to patch only specific fields while keeping sane defaults.
     pub fn with_history_sync_config(
@@ -160,6 +184,7 @@ impl DevicePropsOverride {
         self.os.is_none()
             && self.version.is_none()
             && self.platform_type.is_none()
+            && self.require_full_sync.is_none()
             && self.history_sync_config.is_none()
     }
 }
@@ -171,14 +196,16 @@ impl DevicePropsOverride {
 /// [`DevicePropsOverride::with_history_sync_config`] without fighting stale
 /// hardcoded values.
 ///
+/// `full_sync_days_limit` is one of those, for the reason the branch table on
+/// [`DEVICE_PROPS`] gives: it is set only on the row that also asks for a full
+/// sync, so it travels with
+/// [`DevicePropsOverride::with_require_full_sync`] rather than living here.
+///
 /// `support_*` capability flags are advertised as `true`: they tell the
 /// server which history payload variants the client can ingest, and the
-/// library either handles them or treats them as opaque (no harm). The
-/// platform-gated `support_call_log_history` is `false` because the call
-/// log history payload is bound to the Windows desktop client.
+/// library either handles them or treats them as opaque (no harm).
 pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
     wa::device_props::HistorySyncConfig {
-        full_sync_days_limit: Some(30),
         inline_initial_payload_in_e2_ee_msg: Some(true),
         support_bot_user_agent_chat_history: Some(true),
         support_cag_reactions_and_polls: Some(true),
@@ -187,7 +214,7 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
         support_biz_hosted_msg: Some(true),
         support_fbid_bot_chat_history: Some(true),
         support_message_association: Some(true),
-        support_call_log_history: Some(false),
+        support_call_log_history: Some(true),
         support_group_history: Some(true),
         support_manus_history: Some(true),
         support_hatch_history: Some(true),
@@ -195,6 +222,33 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
     }
 }
 
+/// WA Web builds exactly two `DeviceProps` shapes, selected by
+/// `WAWebEnvironment.isWindows` (the Windows-native "win_hybrid" client, not a
+/// browser running on Windows):
+///
+/// | | `platform_type` | `require_full_sync` | `full_sync_days_limit` | `on_demand_ready` |
+/// | --- | --- | --- | --- | --- |
+/// | browser | CHROME/FIREFOX/… | `false` | unset | unset |
+/// | win_hybrid | UWP | `true` | `365` | `true` |
+///
+/// The four fields are one decision over there — a single variable drives
+/// `require_full_sync` and the days limit, and the same `isWindows` picks the
+/// platform type and `on_demand_ready` — so they may not be set independently
+/// here without producing a sync shape neither row can explain.
+///
+/// The sync fields below take the browser row: a companion that always asks for
+/// a full backfill is asking for more than the client it claims to be, and it
+/// does so in the registration payload. Embedders who genuinely want the
+/// backfill opt in through [`DevicePropsOverride::with_require_full_sync`],
+/// which rebuilds the `win_hybrid` row.
+///
+/// The identity fields do *not* follow either row: `os` is `"rust"` and
+/// `platform_type` is `UNKNOWN`, which is neither a browser nor `UWP`. That is
+/// deliberate — the library does not impersonate a specific client by default,
+/// and an embedder that wants one sets both through
+/// [`DevicePropsOverride`]. Pairing a real identity with the sync row that
+/// belongs to it is the embedder's call; the table is what makes the pairs
+/// legible.
 pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::DeviceProps {
     os: Some("rust".to_string()),
     version: buffa::MessageField::some(wa::device_props::AppVersion {
@@ -204,7 +258,7 @@ pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::Device
         ..Default::default()
     }),
     platform_type: Some(wa::device_props::PlatformType::UNKNOWN),
-    require_full_sync: Some(true),
+    require_full_sync: Some(false),
     history_sync_config: buffa::MessageField::some(default_history_sync_config()),
 });
 
@@ -272,8 +326,10 @@ pub struct Device {
     /// Server cert chain cached from the last successful XX (or XX-fallback)
     /// handshake. Enables Noise IK on the next connect by exposing
     /// `leaf.key` as the server's static public key, and lets us reject
-    /// stale entries via `not_after` before even attempting IK.
-    /// `None` forces XX on the next connect.
+    /// stale entries via `not_after` before even attempting IK. Only chains
+    /// whose signatures were checked (`signature_verified`) authorize IK;
+    /// `None` — or an unmarked legacy record — forces XX on the next
+    /// connect.
     #[serde(default)]
     pub server_cert_chain: Option<CachedServerCertChain>,
     /// Login counter sent as `ClientPayload.lc` on every login. WA Web's
@@ -296,6 +352,11 @@ pub struct Device {
     /// rotation path treats as "seed the baseline, don't rotate yet".
     #[serde(default)]
     pub last_signed_pre_key_rotation_ms: i64,
+    /// Deadline the server pushed for this build, via `<ib><client_expiration>`.
+    /// `None` until the server says otherwise, which is the common case: the
+    /// stanza is sent when a build is being retired, not on every connect.
+    #[serde(default)]
+    pub server_client_expiration: Option<ServerClientExpiration>,
     /// true means the account's `readreceipts` privacy is `none`, so DM
     /// read/played receipts go out as `*-self` (which don't notify the sender).
     /// Persisted so the value is known on reconnect before the privacy fetch
@@ -316,16 +377,118 @@ pub struct CachedNoiseCert {
     pub not_after: i64,
 }
 
+/// The server's answer to "when does this client build stop being accepted".
+///
+/// Scoped to the build it was issued against, exactly like WA Web's
+/// `setServerClientExpirationOverride(value, VERSION_BASE)`. A deadline learned
+/// for one build says nothing about the next one, so a version change retires
+/// the record rather than carrying it forward.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerClientExpiration {
+    /// Unix seconds after which the server expects to stop accepting this build.
+    pub expires_at: i64,
+    /// The `(primary, secondary, tertiary)` build the deadline was issued for.
+    pub version: (u32, u32, u32),
+}
+
+/// Outcome of applying a `<ib><client_expiration>` to what we already hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientExpirationUpdate {
+    /// Record the new deadline.
+    Set(ServerClientExpiration),
+    /// The stanza carried no `t`: the server withdrew the deadline.
+    Clear,
+    /// The deadline is not sooner than the one we hold, so it changes nothing.
+    Unchanged,
+}
+
+impl ServerClientExpiration {
+    /// WA Web `WATimeUtils.DAY_SECONDS * 3`: the shortest notice a build is
+    /// ever given, however abrupt the server's own answer is.
+    pub const MIN_NOTICE_SECS: i64 = 3 * 86_400;
+
+    /// WA Web's `handleServerClientExpiration`, as a decision over the state we
+    /// already hold.
+    ///
+    /// Scoped to the running build first: see [`Self::held_for`]. What remains
+    /// is two rules, both deliberate. A deadline is only ever brought *forward*:
+    /// the server retiring a build sooner is news, and a later answer -- a
+    /// stale retransmit, or a reconnect to a host that has not caught up --
+    /// must not hand the build an extension. And whatever the server says, the
+    /// recorded deadline is at least [`Self::MIN_NOTICE_SECS`] out, so a client
+    /// told it expires now still gets a window to be updated in.
+    ///
+    /// The comparison is against the stored value, not against the raw `t` that
+    /// produced it, so the two rules interact: an abrupt deadline is stored at
+    /// the floor, and a repeat of that same `t` is still sooner than the stored
+    /// floor and gets re-floored against the new now. A server that keeps
+    /// signalling expiry therefore holds a rolling minimum notice rather than
+    /// pinning one date -- which is WA Web's behaviour, and the reason this is
+    /// not idempotent for an already-elapsed `t`.
+    pub fn decide(
+        current: Option<&Self>,
+        t: Option<i64>,
+        now_secs: i64,
+        version: (u32, u32, u32),
+    ) -> ClientExpirationUpdate {
+        let held = Self::held_for(current, version);
+        let Some(t) = t else {
+            return ClientExpirationUpdate::Clear;
+        };
+        if held.is_some_and(|held| t >= held.expires_at) {
+            return ClientExpirationUpdate::Unchanged;
+        }
+        ClientExpirationUpdate::Set(Self {
+            expires_at: t.max(now_secs.saturating_add(Self::MIN_NOTICE_SECS)),
+            version,
+        })
+    }
+
+    /// The held deadline, but only when it describes the build now running.
+    ///
+    /// A record left from an earlier build is not evidence about this one, so
+    /// every decision treats it as absent. Skipping this is how an upgrade
+    /// silences the new build: the old build's nearer date would read as
+    /// "sooner than the new one" and reject the only notice that applies.
+    ///
+    /// WA Web compares version-blind here, because its stored record is read
+    /// back by a consumer that checks `appVersion` itself. This record is the
+    /// client's own state and is what the comparison above consults, so the
+    /// scoping has to happen at the point of use instead.
+    pub fn held_for(current: Option<&Self>, version: (u32, u32, u32)) -> Option<&Self> {
+        current.filter(|held| held.applies_to(version))
+    }
+
+    /// Whether this deadline describes the build now running. A deadline
+    /// issued against another build says nothing about this one.
+    pub fn applies_to(&self, version: (u32, u32, u32)) -> bool {
+        self.version == version
+    }
+}
+
 /// Cached form of the server's two-cert chain. `leaf.key` is the server
 /// static public key consumed by Noise IK; the intermediate is kept solely
 /// to mirror WA Web's expiry checks.
+///
+/// `signature_verified` records that both XEdDSA signatures were actually
+/// checked when this chain was cached. Only such chains may authorize IK.
+/// Records written before this field existed deserialize it as `false` and
+/// fall back to one XX, which then stores a verified chain. This is upgrade
+/// hygiene, not tamper-proofing: the storage backend remains the trust
+/// boundary, and a backend that rewrites this flag can already rewrite the
+/// keys it guards.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedServerCertChain {
     pub intermediate: CachedNoiseCert,
     pub leaf: CachedNoiseCert,
+    #[serde(default)]
+    pub signature_verified: bool,
 }
 
 impl From<wacore_noise::VerifiedServerCertChain> for CachedServerCertChain {
+    /// Marks the chain verified. Only feed this chains that passed strict
+    /// verification: the orchestrator converts only `Some` outcomes, which
+    /// the handshake states produce solely for signature-checked chains.
     fn from(v: wacore_noise::VerifiedServerCertChain) -> Self {
         Self {
             intermediate: CachedNoiseCert {
@@ -338,6 +501,7 @@ impl From<wacore_noise::VerifiedServerCertChain> for CachedServerCertChain {
                 not_before: v.leaf_not_before,
                 not_after: v.leaf_not_after,
             },
+            signature_verified: true,
         }
     }
 }
@@ -383,9 +547,12 @@ impl Device {
             adv_secret_key,
             account: None,
             push_name: String::new(),
-            app_version_primary: 2,
-            app_version_secondary: 3000,
-            app_version_tertiary: 1042742319,
+            // The build the vendored whatspec artifacts describe, so a device
+            // that never reaches sw.js still announces a version whose stanza
+            // shapes and feature flags this client actually implements.
+            app_version_primary: crate::version::WA_WEB_VERSION.0,
+            app_version_secondary: crate::version::WA_WEB_VERSION.1,
+            app_version_tertiary: crate::version::WA_WEB_VERSION.2,
             app_version_last_fetched_ms: 0,
             device_props: Arc::new(DEVICE_PROPS.clone()),
             client_profile: ClientProfile::web(),
@@ -399,6 +566,7 @@ impl Device {
             server_cert_chain: None,
             login_counter: 0,
             lid_migrated: false,
+            server_client_expiration: None,
             last_signed_pre_key_rotation_ms: crate::time::now_millis(),
             read_receipts_disabled: false,
         }
@@ -419,10 +587,6 @@ impl Device {
         }
     }
 
-    pub fn is_ready_for_presence(&self) -> bool {
-        self.pn.is_some() && !self.push_name.is_empty()
-    }
-
     /// Mirrors WA Web `WAWebUserPrefsMultiDevice.isRegistered()`:
     /// `!!(m() && getMaybeMeDevicePn())`.
     pub fn is_registered(&self) -> bool {
@@ -439,6 +603,9 @@ impl Device {
         }
         if let Some(platform_type) = o.platform_type {
             props.platform_type = Some(platform_type);
+        }
+        if let Some(require_full_sync) = o.require_full_sync {
+            props.require_full_sync = Some(require_full_sync);
         }
         if let Some(history_sync_config) = o.history_sync_config {
             props.history_sync_config = buffa::MessageField::some(history_sync_config);
@@ -570,11 +737,26 @@ mod tests {
                 not_before: 1_700_000_500,
                 not_after: 1_899_999_500,
             },
+            signature_verified: true,
         });
 
         let json = serde_json::to_string(&device).expect("serialize should succeed");
         let restored: Device = serde_json::from_str(&json).expect("deserialize should succeed");
         assert_eq!(device.server_cert_chain, restored.server_cert_chain);
+    }
+
+    #[test]
+    fn test_device_chain_without_provenance_deserializes_untrusted() {
+        // Records written before `signature_verified` existed — including
+        // chains cached while a global bypass was enabled — must load as
+        // untrusted so the next connect falls back to XX.
+        let legacy = r#"{"intermediate":{"key":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"not_before":1700000000,"not_after":1900000000},"leaf":{"key":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"not_before":1700000500,"not_after":1899999500}}"#;
+        let chain: CachedServerCertChain =
+            serde_json::from_str(legacy).expect("legacy record should deserialize");
+        assert!(
+            !chain.signature_verified,
+            "absent provenance must mean untrusted"
+        );
     }
 
     #[test]
@@ -652,6 +834,78 @@ mod tests {
         assert_eq!(
             props.version.as_option(),
             Some(&Device::default_device_props_version())
+        );
+    }
+
+    fn registration_device_props(device: &Device) -> wa::DeviceProps {
+        let bytes = device
+            .get_client_payload()
+            .device_pairing_data
+            .into_option()
+            .expect("device_pairing_data")
+            .device_props
+            .expect("device_props bytes");
+        wa::DeviceProps::decode_from_slice(bytes.as_slice()).expect("decode DeviceProps")
+    }
+
+    /// Pins the browser row of the [`DEVICE_PROPS`] branch table, end to end
+    /// through the registration payload.
+    #[test]
+    fn default_props_request_a_recent_sync_without_a_days_limit() {
+        let props = registration_device_props(&Device::new());
+
+        assert_eq!(props.require_full_sync, Some(false));
+        assert_eq!(
+            props
+                .history_sync_config
+                .as_option()
+                .expect("history_sync_config")
+                .full_sync_days_limit,
+            None,
+        );
+    }
+
+    /// The `win_hybrid` row is reachable in one builder chain, and every field
+    /// of it lands on the wire.
+    #[test]
+    fn require_full_sync_override_reaches_registration_payload() {
+        let mut device = Device::new();
+        device.set_device_props(
+            DevicePropsOverride::new()
+                .with_platform_type(wa::device_props::PlatformType::UWP)
+                .with_require_full_sync(true)
+                .with_history_sync_config(wa::device_props::HistorySyncConfig {
+                    full_sync_days_limit: Some(365),
+                    on_demand_ready: Some(true),
+                    complete_on_demand_ready: Some(true),
+                    ..default_history_sync_config()
+                }),
+        );
+
+        let props = registration_device_props(&device);
+        assert_eq!(props.require_full_sync, Some(true));
+        assert_eq!(
+            props.platform_type,
+            Some(wa::device_props::PlatformType::UWP)
+        );
+        let hsc = props
+            .history_sync_config
+            .into_option()
+            .expect("history_sync_config");
+        assert_eq!(hsc.full_sync_days_limit, Some(365));
+        assert_eq!(hsc.on_demand_ready, Some(true));
+        assert_eq!(hsc.complete_on_demand_ready, Some(true));
+    }
+
+    /// `None` preserves the default, like every other field on the override.
+    #[test]
+    fn require_full_sync_unset_preserves_the_default() {
+        let mut device = Device::new();
+        device.set_device_props(DevicePropsOverride::new().with_os("Windows"));
+
+        assert_eq!(
+            registration_device_props(&device).require_full_sync,
+            Some(false)
         );
     }
 
@@ -954,5 +1208,164 @@ mod tests {
         let restored: Device =
             serde_json::from_value(val).expect("deserialize without account field");
         assert!(restored.account.is_none());
+    }
+}
+
+#[cfg(test)]
+mod client_expiration_tests {
+    use super::*;
+
+    const V: (u32, u32, u32) = (2, 3000, 1044659339);
+    const NOW: i64 = 1_800_000_000;
+    /// Anything past `NOW + MIN_NOTICE_SECS` is recorded verbatim.
+    const FAR: i64 = NOW + ServerClientExpiration::MIN_NOTICE_SECS + 10_000;
+
+    fn held(expires_at: i64) -> ServerClientExpiration {
+        ServerClientExpiration {
+            expires_at,
+            version: V,
+        }
+    }
+
+    #[test]
+    fn a_first_deadline_is_recorded_against_the_running_build() {
+        assert_eq!(
+            ServerClientExpiration::decide(None, Some(FAR), NOW, V),
+            ClientExpirationUpdate::Set(held(FAR))
+        );
+    }
+
+    /// The floor is the whole point: a server that says "now" still has to
+    /// leave a window in which the build can be replaced.
+    #[test]
+    fn an_abrupt_deadline_is_held_off_by_the_minimum_notice() {
+        let floor = NOW + ServerClientExpiration::MIN_NOTICE_SECS;
+        for abrupt in [0, NOW, NOW + 60] {
+            assert_eq!(
+                ServerClientExpiration::decide(None, Some(abrupt), NOW, V),
+                ClientExpirationUpdate::Set(held(floor)),
+                "t={abrupt} must not land sooner than the minimum notice"
+            );
+        }
+    }
+
+    /// A deadline only ever moves closer. A later answer is a stale retransmit
+    /// or a host that has not caught up, and honouring it would hand the build
+    /// an extension the server never granted.
+    #[test]
+    fn a_later_deadline_never_extends_the_one_held() {
+        for later in [FAR + 1, FAR + 86_400] {
+            assert_eq!(
+                ServerClientExpiration::decide(Some(&held(FAR)), Some(later), NOW, V),
+                ClientExpirationUpdate::Unchanged,
+                "t={later} must not push the deadline out"
+            );
+        }
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&held(FAR)), Some(FAR), NOW, V),
+            ClientExpirationUpdate::Unchanged,
+            "an equal deadline is not sooner either"
+        );
+    }
+
+    #[test]
+    fn a_sooner_deadline_replaces_the_one_held() {
+        let sooner = FAR - 5_000;
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&held(FAR)), Some(sooner), NOW, V),
+            ClientExpirationUpdate::Set(held(sooner))
+        );
+    }
+
+    /// The comparison is against the stored (floored) value, so an already
+    /// elapsed `t` stays sooner than it and is re-floored against the new now.
+    /// A server that keeps signalling expiry holds a rolling minimum notice
+    /// rather than pinning one date.
+    #[test]
+    fn repeating_an_abrupt_deadline_rolls_the_notice_forward() {
+        let ClientExpirationUpdate::Set(first) =
+            ServerClientExpiration::decide(None, Some(NOW), NOW, V)
+        else {
+            panic!("the first abrupt deadline is recorded");
+        };
+        assert_eq!(
+            first.expires_at,
+            NOW + ServerClientExpiration::MIN_NOTICE_SECS
+        );
+
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&first), Some(NOW), NOW + 600, V),
+            ClientExpirationUpdate::Set(held(NOW + 600 + ServerClientExpiration::MIN_NOTICE_SECS))
+        );
+    }
+
+    /// A dated deadline, by contrast, settles: once stored it is not sooner
+    /// than itself, so restating it changes nothing however often it arrives.
+    #[test]
+    fn repeating_a_dated_deadline_settles() {
+        let ClientExpirationUpdate::Set(first) =
+            ServerClientExpiration::decide(None, Some(FAR), NOW, V)
+        else {
+            panic!("the first deadline is recorded");
+        };
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&first), Some(FAR), NOW + 600, V),
+            ClientExpirationUpdate::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_stanza_with_no_deadline_withdraws_whatever_is_held() {
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&held(FAR)), None, NOW, V),
+            ClientExpirationUpdate::Clear
+        );
+        assert_eq!(
+            ServerClientExpiration::decide(None, None, NOW, V),
+            ClientExpirationUpdate::Clear
+        );
+    }
+
+    /// The reason `held_for` exists. An upgrade leaves the previous build's
+    /// record in place, and comparing against it would reject the new build's
+    /// deadline as "not sooner" -- silencing the only notice that applies.
+    #[test]
+    fn an_old_builds_deadline_does_not_suppress_the_running_ones() {
+        let old_build = ServerClientExpiration {
+            expires_at: NOW + 1_000,
+            version: (2, 2999, 1),
+        };
+        let later = FAR;
+        assert!(
+            later >= old_build.expires_at,
+            "the case only bites when the new deadline is the later one"
+        );
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&old_build), Some(later), NOW, V),
+            ClientExpirationUpdate::Set(held(later))
+        );
+    }
+
+    /// The scoping is not a free pass either: within the running build the
+    /// comparison still applies.
+    #[test]
+    fn scoping_does_not_weaken_the_forward_only_rule() {
+        assert_eq!(
+            ServerClientExpiration::held_for(Some(&held(FAR)), V),
+            Some(&held(FAR))
+        );
+        assert_eq!(
+            ServerClientExpiration::held_for(Some(&held(FAR)), (2, 2999, 1)),
+            None
+        );
+    }
+
+    /// A deadline is about the build it names, so an upgrade retires it rather
+    /// than inheriting someone else's date.
+    #[test]
+    fn a_deadline_only_describes_the_build_it_was_issued_for() {
+        let e = held(FAR);
+        assert!(e.applies_to(V));
+        assert!(!e.applies_to((2, 3000, 1044659340)));
     }
 }

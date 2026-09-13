@@ -18,7 +18,7 @@ use core::num::NonZeroU64;
 ///
 /// [IdentityKeyStore::is_trusted_identity] uses this to ensure the identity provided is configured
 /// for the appropriate role.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Direction {
     /// We are in the context of sending a message.
     Sending,
@@ -27,14 +27,28 @@ pub enum Direction {
 }
 
 /// The result of saving a new identity key for a protocol address.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, derive_more::TryFrom)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
-#[try_from(repr)]
 pub enum IdentityChange {
     /// The protocol address didn't have an identity key or had the same key.
     NewOrUnchanged,
     /// The new identity key replaced a different key for the protocol address.
     ReplacedExisting,
+}
+
+// `isize` rather than the narrower `u8` the variants fit in: `repr(C)` leaves
+// the discriminant type unspecified, so this mirrors what a repr-driven derive
+// falls back to and keeps the conversion callable with the same argument.
+impl TryFrom<isize> for IdentityChange {
+    type Error = crate::core::UnknownDiscriminant<isize>;
+
+    fn try_from(value: isize) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::NewOrUnchanged),
+            1 => Ok(Self::ReplacedExisting),
+            _ => Err(crate::core::UnknownDiscriminant { value }),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -46,6 +60,53 @@ impl<T: Send + Sync> ThreadSafe for T {}
 pub trait ThreadSafe {}
 #[cfg(target_arch = "wasm32")]
 impl<T> ThreadSafe for T {}
+
+/// Answers through a store's sync hook when it can, and only then falls back to
+/// the boxed async method.
+///
+/// `#[async_trait]` turns every method into a `Pin<Box<dyn Future>>`, and
+/// `SignalStores` holds these as `&mut dyn`, so native AFIT cannot replace it.
+/// For stores whose hot path is a cache hit, that box is the entire cost: the
+/// future it wraps is already ready. These helpers exist so the call sites
+/// express "ask, then await" once rather than eight times.
+pub async fn is_trusted_identity<S: IdentityKeyStore + ?Sized>(
+    store: &S,
+    address: &ProtocolAddress,
+    identity: &IdentityKey,
+    direction: Direction,
+) -> Result<bool> {
+    match store.try_is_trusted_identity(address, identity, direction) {
+        Some(answer) => answer,
+        None => {
+            store
+                .is_trusted_identity(address, identity, direction)
+                .await
+        }
+    }
+}
+
+/// See [`is_trusted_identity`].
+pub async fn save_identity<S: IdentityKeyStore + ?Sized>(
+    store: &mut S,
+    address: &ProtocolAddress,
+    identity: &IdentityKey,
+) -> Result<IdentityChange> {
+    match store.try_save_identity(address, identity) {
+        Some(answer) => answer,
+        None => store.save_identity(address, identity).await,
+    }
+}
+
+/// See [`is_trusted_identity`].
+pub async fn has_session<S: SessionStore + ?Sized>(
+    store: &S,
+    address: &ProtocolAddress,
+) -> Result<bool> {
+    match store.try_has_session(address) {
+        Some(answer) => answer,
+        None => store.has_session(address).await,
+    }
+}
 
 /// Interface defining the identity store, which may be in-memory, on-disk, etc.
 ///
@@ -77,6 +138,19 @@ pub trait IdentityKeyStore: ThreadSafe {
         identity: &IdentityKey,
     ) -> Result<IdentityChange>;
 
+    /// Avoids boxing the async fallback when the store can answer immediately.
+    ///
+    /// Same contract as [`Self::save_identity`]: implementing this is optional,
+    /// and returning `None` falls back to the async path.
+    #[doc(hidden)]
+    fn try_save_identity(
+        &mut self,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
+    ) -> Option<Result<IdentityChange>> {
+        None
+    }
+
     /// Return whether an identity is trusted for the role specified by `direction`.
     async fn is_trusted_identity(
         &self,
@@ -84,6 +158,19 @@ pub trait IdentityKeyStore: ThreadSafe {
         identity: &IdentityKey,
         direction: Direction,
     ) -> Result<bool>;
+
+    /// Avoids boxing the async fallback when the store can answer immediately.
+    ///
+    /// Same contract as [`Self::is_trusted_identity`]; `None` falls back.
+    #[doc(hidden)]
+    fn try_is_trusted_identity(
+        &self,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
+        _direction: Direction,
+    ) -> Option<Result<bool>> {
+        None
+    }
 
     /// Return the public identity for the given `address`, if known.
     async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>>;
@@ -132,8 +219,23 @@ pub trait SignedPreKeyStore: ThreadSafe {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait SessionStore: ThreadSafe {
     /// Loads the session for `address` without removing it from the store.
-    /// Destructive cache checkouts belong in [`load_session_for_update`].
+    /// Destructive cache checkouts belong in `load_session_for_update`.
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>>;
+
+    /// Hint to fault `addresses` into the store in one backend round-trip.
+    ///
+    /// A send fans out over every device, and without this each device pays its
+    /// own load; the caller offers the whole candidate set up front so a
+    /// batch-capable store can collapse the N+1. The default does nothing:
+    /// warming then happens through the normal per-address paths, so stores
+    /// without a batch backend keep their exact behavior. An override must only
+    /// populate what a later `load_session`/`has_session` would have read
+    /// anyway — never change store contents — so ignoring the hint is always
+    /// correct, just slower on a cold cache.
+    async fn prefetch_sessions(&self, addresses: &[ProtocolAddress]) -> Result<()> {
+        let _ = addresses;
+        Ok(())
+    }
 
     /// Loads a mutation copy and optionally marks it as destructively checked out.
     ///
@@ -159,6 +261,15 @@ pub trait SessionStore: ThreadSafe {
 
     /// Non-destructive existence check (must not consume the cached entry).
     async fn has_session(&self, address: &ProtocolAddress) -> Result<bool>;
+
+    /// Avoids boxing the async fallback when the store can answer immediately.
+    ///
+    /// Same contract as [`Self::try_load_session_for_update`]; `None` falls back
+    /// to [`Self::has_session`].
+    #[doc(hidden)]
+    fn try_has_session(&self, _address: &ProtocolAddress) -> Option<Result<bool>> {
+        None
+    }
 
     /// Set the entry for `address` to the value of `record`.
     async fn store_session(
@@ -195,7 +306,13 @@ pub trait SessionStore: ThreadSafe {
 }
 
 /// Result of returning a record from a cancellation-safe checkout.
+///
+/// A transient return value, moved out of as soon as it is matched, so the
+/// record-carrying arm costs nothing beyond the record itself; boxing it
+/// would add an allocation to a path that is done with the value by the next
+/// statement.
 #[doc(hidden)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionCheckoutStoreResult {
     Stored,
     Rejected,

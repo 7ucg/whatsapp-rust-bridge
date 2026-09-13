@@ -17,6 +17,48 @@ use wacore_binary::{Node, NodeRef};
 
 const MISSING_PARTICIPANT_IDENTIFICATION_TAG: &str = "missing_participant_identification";
 
+/// Tag of the server-originated `<groups_dirty>` child.
+const GROUPS_DIRTY_TAG: &str = "groups_dirty";
+
+/// Parse the server's "these groups went stale" notification.
+///
+/// ```xml
+/// <notification type="w:gp2" from="s.whatsapp.net" id="..." t="...">
+///   <groups_dirty><group jid="...@g.us"/></groups_dirty>
+/// </notification>
+/// ```
+///
+/// WA Web gives this shape a parser of its own
+/// (`WASmaxInGroupsGroupsDirtyNotificationRequest`) rather than routing it
+/// through the group-notification parser, because it is the one `w:gp2`
+/// stanza whose `from` is the group *server* — the parser pins it with
+/// `literalJid(attrDomainJid, "from", "g.us")` — instead of one group's JID.
+/// The groups it speaks about are named by the `<group jid>` children.
+///
+/// The discriminator is the **first** child's tag, matching
+/// `WAWebHandleGroupNotification`, which branches before its own parser runs:
+///
+/// ```js
+/// var r = t[0], a = r.tag;
+/// if (a === "groups_dirty")
+///   return handleGroupsDirtyNotificationJob(e)
+/// ```
+///
+/// Returns `None` for an ordinary group update, which
+/// [`GroupNotification::try_from_node_ref`] handles.
+pub fn parse_groups_dirty(node: &NodeRef<'_>) -> Option<Vec<Jid>> {
+    let dirty = node
+        .children()
+        .and_then(|children| children.first())
+        .filter(|first| first.tag.as_ref() == GROUPS_DIRTY_TAG)?;
+    Some(
+        dirty
+            .get_children_by_tag("group")
+            .filter_map(|group| group.attrs().optional_jid("jid"))
+            .collect(),
+    )
+}
+
 /// How a membership request was initiated.
 ///
 /// Maps to `WAWebRequestMethodType` in WhatsApp Web JS.
@@ -61,18 +103,7 @@ pub struct GroupNotification {
     pub actions: Vec<GroupNotificationAction>,
 }
 
-/// Admin tier from `<participant type="...">`. Mirrors
-/// `GROUP_PARTICIPANT_TYPES` in `WAWebGroupApiConst`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum GroupParticipantType {
-    #[wire_default]
-    #[wire = "participant"]
-    Participant,
-    #[wire = "admin"]
-    Admin,
-    #[wire = "superadmin"]
-    SuperAdmin,
-}
+pub use crate::types::wire_enums::GroupParticipantType;
 
 /// Delivery state for history shared with a newly joined participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -171,11 +202,21 @@ pub enum GroupNotificationAction {
     },
 
     // -- Metadata --
-    /// `<subject subject="..." s_o="..." s_t="..."/>` — Group name changed
+    /// `<subject subject="..." s_o="..." s_o_pn="..." s_o_username="..." s_t="..."/>`
+    /// — Group name changed.
+    ///
+    /// `s_o` follows the group's addressing mode, so in a LID-addressed group it
+    /// is a `@lid` JID and the phone-number alias arrives separately in `s_o_pn`
+    /// — the same split the notification's own `participant` / `participant_pn`
+    /// pair uses.
     #[wire = "subject"]
     Subject {
         subject: String,
         subject_owner: Option<Jid>,
+        /// Phone-number JID of the renamer when `subject_owner` is a LID.
+        subject_owner_pn: Option<Jid>,
+        /// Renamer's username, when username addressing is enabled.
+        subject_owner_username: Option<String>,
         subject_time: Option<u64>,
     },
     /// `<description id="..."><body>text</body></description>` or `<description id="..."><delete/></description>`
@@ -476,6 +517,11 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
                 .unwrap_or_default()
                 .to_string(),
             subject_owner: node.attrs().optional_jid("s_o"),
+            subject_owner_pn: node.attrs().optional_jid("s_o_pn"),
+            subject_owner_username: node
+                .attrs()
+                .optional_string("s_o_username")
+                .map(|value| value.into_owned()),
             subject_time: node.attrs().optional_u64("s_t"),
         },
         T::Description => {
@@ -548,7 +594,7 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
             GroupNotificationAction::RevokedMembershipRequests { participants }
         }
         T::MemberAddMode => {
-            let mode = match node.content.as_deref() {
+            let mode = match node.content.as_ref() {
                 Some(NodeContentRef::String(s)) => s.to_string(),
                 Some(NodeContentRef::Bytes(b)) => String::from_utf8_lossy(b.as_ref()).into_owned(),
                 _ => String::new(),
@@ -1068,6 +1114,7 @@ mod tests {
                 subject,
                 subject_owner,
                 subject_time,
+                ..
             } => {
                 assert_eq!(subject, "New Group Name");
                 assert_eq!(*subject_owner, Some(admin_jid()));
@@ -1075,6 +1122,76 @@ mod tests {
             }
             other => panic!("expected Subject, got {:?}", other),
         }
+    }
+
+    /// A LID-addressed group names the renamer by LID in `s_o` and carries the
+    /// phone-number alias in `s_o_pn` (plus `s_o_username`), the same split the
+    /// notification root uses for `participant` / `participant_pn`. Reading
+    /// only `s_o` leaves a consumer with a LID it cannot resolve to a contact.
+    #[test]
+    fn test_parse_subject_notification_carries_owner_pn_and_username() {
+        let owner_lid: Jid = "271060335329480@lid".parse().unwrap();
+        let node = make_notification(vec![
+            NodeBuilder::new("subject")
+                .attr("subject", "New Group Name")
+                .attr("s_o", owner_lid.clone())
+                .attr("s_o_pn", admin_jid())
+                .attr("s_o_username", "group-admin")
+                .attr("s_t", "1704067200")
+                .build(),
+        ]);
+
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Subject {
+                subject,
+                subject_owner,
+                subject_owner_pn,
+                subject_owner_username,
+                subject_time,
+            } => {
+                assert_eq!(subject, "New Group Name");
+                assert_eq!(*subject_owner, Some(owner_lid));
+                assert_eq!(*subject_owner_pn, Some(admin_jid()));
+                assert_eq!(subject_owner_username.as_deref(), Some("group-admin"));
+                assert_eq!(*subject_time, Some(1704067200));
+            }
+            other => panic!("expected Subject, got {:?}", other),
+        }
+    }
+
+    /// `<groups_dirty>` is the one `w:gp2` stanza whose `from` is the server
+    /// rather than a group; the groups it speaks about are its `<group jid>`
+    /// children.
+    #[test]
+    fn test_parse_groups_dirty_collects_group_jids() {
+        let a: Jid = "120363000000000001@g.us".parse().unwrap();
+        let b: Jid = "120363000000000002@g.us".parse().unwrap();
+        let node = NodeBuilder::new("notification")
+            .attr("type", "w:gp2")
+            .attr("from", "g.us")
+            .attr("id", "GD-1")
+            .attr("t", "1704067200")
+            .children(vec![
+                NodeBuilder::new("groups_dirty")
+                    .children(vec![
+                        NodeBuilder::new("group").attr("jid", a.clone()).build(),
+                        NodeBuilder::new("group").attr("jid", b.clone()).build(),
+                    ])
+                    .build(),
+            ])
+            .build();
+
+        let groups = parse_groups_dirty(&node.as_node_ref())
+            .expect("a groups_dirty notification must be recognized");
+        assert_eq!(groups, vec![a, b]);
+    }
+
+    /// An ordinary group update must not be mistaken for one.
+    #[test]
+    fn test_parse_groups_dirty_ignores_ordinary_group_notification() {
+        let node = make_notification(vec![NodeBuilder::new("announcement").build()]);
+        assert!(parse_groups_dirty(&node.as_node_ref()).is_none());
     }
 
     #[test]
@@ -1617,6 +1734,8 @@ mod tests {
             GroupNotificationAction::Subject {
                 subject: "s".into(),
                 subject_owner: None,
+                subject_owner_pn: None,
+                subject_owner_username: None,
                 subject_time: None,
             },
             GroupNotificationAction::Description {

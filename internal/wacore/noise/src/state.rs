@@ -54,7 +54,7 @@ impl NoiseCipher {
     /// Encrypts plaintext in-place within the provided buffer: on entry `buffer`
     /// holds the plaintext; on return it holds ciphertext + 16-byte tag.
     /// Preserves the buffer's allocated capacity across calls.
-    /// Accepts any [`NoiseBuffer`] (`Vec<u8>` or `bytes::BytesMut`).
+    /// Accepts any `NoiseBuffer` (`Vec<u8>` or `bytes::BytesMut`).
     pub fn encrypt_in_place_with_counter<B: NoiseBuffer>(
         &self,
         counter: u32,
@@ -68,7 +68,7 @@ impl NoiseCipher {
 
     /// Decrypts ciphertext (with 16-byte tag appended) in-place within the
     /// provided buffer. On return, `buffer` holds the plaintext (tag removed).
-    /// Accepts any [`NoiseBuffer`] (`Vec<u8>` or `bytes::BytesMut`).
+    /// Accepts any `NoiseBuffer` (`Vec<u8>` or `bytes::BytesMut`).
     /// Zero allocations with the default [`wacore_libsignal::crypto::RustCryptoProvider`].
     pub fn decrypt_in_place_with_counter<B: NoiseBuffer>(
         &self,
@@ -118,7 +118,12 @@ impl NoiseState {
     /// Per Noise spec § 5.2: when `protocol_name` is ≤ HASHLEN bytes, append
     /// zero bytes to make HASHLEN; otherwise hash with SHA256.
     pub fn new(pattern: impl AsRef<[u8]>, prologue: &[u8]) -> Result<Self> {
-        let pattern = pattern.as_ref();
+        Self::new_inner(pattern.as_ref(), prologue)
+    }
+
+    // The generic shell above is instantiated once per argument type at the
+    // call sites; the body lives here so it is compiled once.
+    fn new_inner(pattern: &[u8], prologue: &[u8]) -> Result<Self> {
         let h: [u8; 32] = if pattern.len() <= 32 {
             let mut h = [0u8; 32];
             h[..pattern.len()].copy_from_slice(pattern);

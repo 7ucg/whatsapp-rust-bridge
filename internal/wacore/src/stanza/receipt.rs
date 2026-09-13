@@ -6,7 +6,7 @@
 use crate::types::message::{MessageCategory, MessageInfo};
 use crate::types::presence::ReceiptType;
 use wacore_binary::NodeRef;
-use wacore_binary::{Jid, JidExt as _, STATUS_BROADCAST_USER};
+use wacore_binary::{CompactString, Jid, JidExt as _, STATUS_BROADCAST_USER};
 
 /// Parsed `<user>` entry inside `<receipt><participants>`.
 ///
@@ -16,14 +16,18 @@ use wacore_binary::{Jid, JidExt as _, STATUS_BROADCAST_USER};
 ///
 /// `timestamp` is `None` when the `<user t>` attr is missing (malformed
 /// stanza). The handler falls back to the stanza-level `t` in that case.
+///
+/// The text fields are `CompactString`: a receipt type ("delivery", "read") and
+/// a username both fit in the 24 inline bytes, and a group receipt builds one
+/// of these per participant.
 #[derive(Debug, Clone)]
 pub struct ReceiptUser {
     pub jid: Jid,
     pub timestamp: Option<u64>,
     /// Per-user `type` attr (only on aggregated_by_message shape).
-    pub r#type: Option<String>,
+    pub r#type: Option<CompactString>,
     pub participant_pn: Option<Jid>,
-    pub participant_username: Option<String>,
+    pub participant_username: Option<CompactString>,
 }
 
 /// Parses `<participants>` child of `<receipt>`. Returns `(message_id, key, users)`.
@@ -31,10 +35,14 @@ pub struct ReceiptUser {
 /// (aggregated_by_message); `key` is the legacy aggregated_by_type identifier.
 pub fn parse_participants(
     node: &NodeRef<'_>,
-) -> (Option<String>, Option<String>, Vec<ReceiptUser>) {
+) -> (
+    Option<CompactString>,
+    Option<CompactString>,
+    Vec<ReceiptUser>,
+) {
     let mut attrs = node.attrs();
-    let message_id = attrs.optional_string("message_id").map(|s| s.into_owned());
-    let key = attrs.optional_string("key").map(|s| s.into_owned());
+    let message_id = attrs.optional_string("message_id").map(CompactString::from);
+    let key = attrs.optional_string("key").map(CompactString::from);
 
     let users = node
         .children()
@@ -46,11 +54,11 @@ pub fn parse_participants(
                     let mut a = c.attrs();
                     let jid = a.optional_jid("jid")?;
                     let timestamp = a.optional_u64("t");
-                    let r#type = a.optional_string("type").map(|s| s.into_owned());
+                    let r#type = a.optional_string("type").map(CompactString::from);
                     let participant_pn = a.optional_jid("participant_pn");
                     let participant_username = a
                         .optional_string("participant_username")
-                        .map(|s| s.into_owned());
+                        .map(CompactString::from);
                     Some(ReceiptUser {
                         jid,
                         timestamp,
@@ -71,27 +79,38 @@ pub fn parse_participants(
 /// Mirrors `WAWebHandleMsgReceiptParser` p() branch: read `<list><item id=.../>`
 /// when present, then append the stanza id for non-view receipts (for view
 /// receipts the items use `server_id` and the stanza id is NOT appended).
+///
+/// Takes `stanza_id` by value: the common receipt carries no `<list>` at all, so
+/// the stanza id is the whole result and the caller's copy would otherwise be
+/// cloned into the vector and dropped one line later.
 pub fn collect_simple_message_ids(
     node: &NodeRef<'_>,
-    stanza_id: &str,
+    stanza_id: wacore_binary::MessageId,
     is_view: bool,
-) -> Vec<String> {
+) -> Vec<wacore_binary::MessageId> {
     let id_attr = if is_view { "server_id" } else { "id" };
-    let mut ids: Vec<String> = node
+    let mut ids: Vec<wacore_binary::MessageId> = node
         .get_optional_child("list")
         .and_then(|list| {
             list.children().map(|items| {
                 items
                     .iter()
                     .filter(|c| c.tag == "item")
-                    .filter_map(|c| c.attrs().optional_string(id_attr).map(|s| s.into_owned()))
+                    .filter_map(|c| {
+                        c.attrs()
+                            .optional_string(id_attr)
+                            .map(|s| wacore_binary::MessageId::from(s.as_ref()))
+                    })
                     .collect()
             })
         })
         .unwrap_or_default();
 
     if !is_view {
-        ids.push(stanza_id.to_string());
+        // Exact, not the growth default: a listless receipt holds this one id and
+        // is handed straight to the event, so the spare capacity is never used.
+        ids.reserve_exact(1);
+        ids.push(stanza_id);
     }
     ids
 }
@@ -113,9 +132,9 @@ pub fn collect_simple_message_ids(
 /// NOTE: the message-dispatch hot path uses
 /// `crate::client::Client::should_send_delivery_receipt` (in the
 /// `whatsapp-rust` crate), which is authoritative and intentionally diverges
-/// here (it also sends `<receipt context="status">` for status broadcasts,
+/// here (it also sends `<receipt class="status">` for status broadcasts,
 /// which this copy still skips). The self-fanout rule is shared via
-/// [`MessageSource::is_self_fanout`].
+/// [`MessageSource::is_self_fanout`](crate::types::message::MessageSource::is_self_fanout).
 pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
     if info.id.is_empty()
         || info.source.chat.user == STATUS_BROADCAST_USER
@@ -162,6 +181,50 @@ mod tests {
     use super::*;
     use crate::types::message::{MessageCategory, MessageInfo, MessageSource};
 
+    /// The receipt handler gates on the raw parsed type *before* running this
+    /// downgrade, so the gate is only behaviour-preserving while no input can
+    /// come out the other side as a `Retry` (the one type it must not drop
+    /// without a subscriber). The scoping to `Delivered` is what guarantees
+    /// that; this pins it, so widening the downgrade fails here rather than
+    /// silently dropping retries on the receive path.
+    #[test]
+    fn downgrade_never_turns_a_type_into_a_retry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .children([NodeBuilder::new("error")
+                .attr("reason", "lid")
+                .attr("type", "feature-incapable")
+                .build()])
+            .build();
+        let node = node.as_node_ref();
+
+        // Every variant; a new one belongs in this list.
+        for parsed in [
+            ReceiptType::Delivered,
+            ReceiptType::Sent,
+            ReceiptType::Sender,
+            ReceiptType::Retry,
+            ReceiptType::EncRekeyRetry,
+            ReceiptType::Read,
+            ReceiptType::ReadSelf,
+            ReceiptType::Played,
+            ReceiptType::PlayedSelf,
+            ReceiptType::ServerError,
+            ReceiptType::Inactive,
+            ReceiptType::PeerMsg,
+            ReceiptType::HistorySync,
+            ReceiptType::Other("something-new".to_string()),
+        ] {
+            let downgraded = downgrade_for_feature_incapable(&node, parsed.clone());
+            assert_eq!(
+                downgraded == ReceiptType::Retry,
+                parsed == ReceiptType::Retry,
+                "downgrading {parsed:?} changed whether it is a Retry"
+            );
+        }
+    }
+
     #[test]
     fn feature_incapable_error_downgrades_delivery_to_sent() {
         use wacore_binary::builder::NodeBuilder;
@@ -207,7 +270,7 @@ mod tests {
     #[test]
     fn skip_empty_id() {
         let info = MessageInfo {
-            id: "".to_string(),
+            id: "".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -222,7 +285,7 @@ mod tests {
     #[test]
     fn skip_status_broadcast() {
         let info = MessageInfo {
-            id: "MSG1".to_string(),
+            id: "MSG1".into(),
             source: MessageSource {
                 chat: "status@broadcast".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -238,7 +301,7 @@ mod tests {
     #[test]
     fn skip_newsletter() {
         let info = MessageInfo {
-            id: "NL1".to_string(),
+            id: "NL1".into(),
             source: MessageSource {
                 chat: "120363173003902460@newsletter".parse().unwrap(),
                 sender: "120363173003902460@newsletter".parse().unwrap(),
@@ -253,7 +316,7 @@ mod tests {
     #[test]
     fn skip_own_non_peer_messages() {
         let info = MessageInfo {
-            id: "OWN1".to_string(),
+            id: "OWN1".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -268,7 +331,7 @@ mod tests {
     #[test]
     fn allow_peer_self_synced_messages() {
         let info = MessageInfo {
-            id: "PEER1".to_string(),
+            id: "PEER1".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -287,7 +350,7 @@ mod tests {
         // sender receipt. A recipient-less own message (skip_own_non_peer_*)
         // stays skipped. Mirrors the hot-path copy in the whatsapp-rust crate.
         let info = MessageInfo {
-            id: "FANOUT1".to_string(),
+            id: "FANOUT1".into(),
             source: MessageSource {
                 chat: "200000000000002@bot".parse().unwrap(),
                 sender: "100000000000001@lid".parse().unwrap(),
@@ -306,7 +369,7 @@ mod tests {
         // self-fanout allowance must NOT leak into own status broadcasts or
         // group messages, even when a recipient is present.
         let own_status = MessageInfo {
-            id: "OWN_STATUS".to_string(),
+            id: "OWN_STATUS".into(),
             source: MessageSource {
                 chat: "status@broadcast".parse().unwrap(),
                 sender: "100000000000001@lid".parse().unwrap(),
@@ -319,7 +382,7 @@ mod tests {
         assert!(!should_send_delivery_receipt(&own_status));
 
         let own_group = MessageInfo {
-            id: "OWN_GROUP".to_string(),
+            id: "OWN_GROUP".into(),
             source: MessageSource {
                 chat: "120363021033254949@g.us".parse().unwrap(),
                 sender: "100000000000001@lid".parse().unwrap(),
@@ -336,7 +399,7 @@ mod tests {
     #[test]
     fn allow_incoming_dm() {
         let info = MessageInfo {
-            id: "DM1".to_string(),
+            id: "DM1".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -449,7 +512,7 @@ mod tests {
                 ])
                 .build()])
             .build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "STANZA-Z", false);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "STANZA-Z".into(), false);
         assert_eq!(ids, vec!["MSG-A", "MSG-B", "STANZA-Z"]);
     }
 
@@ -457,7 +520,7 @@ mod tests {
     #[test]
     fn simple_message_ids_without_list() {
         let node = NodeBuilder::new("receipt").attr("id", "SOLO").build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO", false);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".into(), false);
         assert_eq!(ids, vec!["SOLO"]);
     }
 
@@ -474,7 +537,45 @@ mod tests {
                 ])
                 .build()])
             .build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA", true);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA".into(), true);
         assert_eq!(ids, vec!["100", "101"]);
+    }
+
+    /// The listless receipt is the common one, and its vector is handed straight
+    /// to the event: sizing it to the growth default left three unused slots on
+    /// every receipt.
+    ///
+    /// Asserted as "below the growth default" rather than "exactly one": an
+    /// allocator is free to hand back a larger block than `reserve_exact` asked
+    /// for, so an exact figure would be testing the allocator. Growing from
+    /// empty lands on 4 for a `String` element, so this still fails if the
+    /// reservation goes away.
+    #[test]
+    fn listless_receipt_ids_are_sized_to_what_they_hold() {
+        let node = NodeBuilder::new("receipt").attr("id", "SOLO").build();
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".into(), false);
+        assert_eq!(ids.len(), 1);
+        assert!(
+            ids.capacity() < 4,
+            "one id must not take the growth default, got capacity {}",
+            ids.capacity()
+        );
+    }
+
+    /// Failure shape: a view receipt whose items carry no `server_id` yields an
+    /// empty vector, and the stanza id is still not appended.
+    #[test]
+    fn view_receipt_without_server_ids_collects_nothing() {
+        let node = NodeBuilder::new("receipt")
+            .attr("id", "VIEW-STANZA")
+            .children([NodeBuilder::new("list")
+                .children([NodeBuilder::new("item").attr("id", "MSG-A").build()])
+                .build()])
+            .build();
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA".into(), true);
+        assert!(
+            ids.is_empty(),
+            "items without server_id contribute nothing and the stanza id is not appended"
+        );
     }
 }

@@ -220,8 +220,9 @@ mod tests {
     // counts + the full signed pulse vector against the reference.
     #[test]
     fn pulses_match_go() {
-        let recs: Value = serde_json::from_str(include_str!("testdata/pulse_vectors.json"))
-            .expect("pulse_vectors");
+        let recs: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/pulse_vectors.cbor.zst"))
+                .expect("pulse_vectors");
         let tbl = load_smpl_tables();
         let cc = load_cc_tables();
         let arr = recs.as_array().unwrap();
@@ -230,7 +231,7 @@ mod tests {
             let frame = hex::decode(rec["frame"].as_str().unwrap()).unwrap();
             let mut st = SmplLsfState::default();
             let mut dec = RangeDecoder::new(&frame[1..]);
-            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut st, 0, 0);
+            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut st, 0, 0, true);
             let pr = decode_smpl_pulses(&mut dec, cc, 320, 4, 1, 0, lsf.stage1);
 
             let want_subfr: Vec<i32> = rec["subfr"]

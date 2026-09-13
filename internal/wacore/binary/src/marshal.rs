@@ -4,7 +4,7 @@ use crate::{
     BinaryError, Node, NodeRef, Result,
     decoder::Decoder,
     encoder::{Encoder, build_marshaled_node_plan, build_marshaled_node_ref_plan},
-    node::{NodeContent, NodeContentRef},
+    node::{NodeContent, NodeContentRef, NodeValue},
 };
 
 const DEFAULT_MARSHAL_CAPACITY: usize = 1024;
@@ -17,6 +17,22 @@ const AUTO_ATTR_ESTIMATE: usize = 24;
 const AUTO_CHILD_ESTIMATE: usize = 96;
 const AUTO_GRANDCHILD_ESTIMATE: usize = 40;
 
+/// Per node, before its own strings: `write_list_start`'s widest form
+/// (`LIST_16`: tag + u16), plus slack.
+const SHALLOW_NODE_OVERHEAD: usize = 4;
+/// A JID never encodes longer than its user plus the tag, agent, device,
+/// integrator and server-token bytes around it.
+const SHALLOW_JID_OVERHEAD: usize = 12;
+/// Children measured individually before the rest are extrapolated from them.
+const SHALLOW_CHILD_SAMPLE: usize = 32;
+/// Ceiling on the shallow reserve. An estimate this far out is a bug in the
+/// estimator, and past it one `Vec` growth is cheaper than trusting the guess.
+const SHALLOW_MAX_CAPACITY: usize = 4 * 1024 * 1024;
+
+/// Decode node bytes: the buffer without the format byte, which is what the
+/// receive path holds after [`unpack`](crate::util::unpack) and what
+/// `OwnedNodeRef` stores. For a buffer that still carries the format byte, as
+/// [`marshal`] writes it, use [`unmarshal_packed_ref`].
 pub fn unmarshal_ref(data: &[u8]) -> Result<NodeRef<'_>> {
     let mut decoder = Decoder::new(data);
     let node = decoder.read_node_ref()?;
@@ -26,6 +42,17 @@ pub fn unmarshal_ref(data: &[u8]) -> Result<NodeRef<'_>> {
     } else {
         Err(BinaryError::LeftoverData(decoder.bytes_left()))
     }
+}
+
+/// Decode a packed payload: the format byte plus node bytes, exactly what
+/// [`marshal`] produces and what a frame carries before `unpack`.
+///
+/// Only the uncompressed form is accepted: the returned node borrows from
+/// `data`, and decompressed bytes would have nowhere to live; reach for
+/// [`unpack`](crate::util::unpack) plus [`unmarshal_ref`] there.
+pub fn unmarshal_packed_ref(data: &[u8]) -> Result<NodeRef<'_>> {
+    crate::util::check_plain_payload(data)?;
+    unmarshal_ref(&data[1..])
 }
 
 pub fn marshal_to(node: &Node, writer: &mut impl Write) -> Result<()> {
@@ -66,17 +93,41 @@ pub fn marshal_auto(node: &Node) -> Result<Vec<u8>> {
 /// This avoids output buffer growth/copies and can be beneficial for large/variable payloads.
 pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
     let plan = build_marshaled_node_plan(node);
-    let mut payload = vec![0; plan.size];
-    let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
-    encoder.write_node(node)?;
-    let written = encoder.bytes_written();
+    // Reserved, not zero-filled. `vec![0; plan.size]` memset every byte the
+    // encoder is about to overwrite, which for the large payloads this path
+    // exists for is a second full pass over the output. Appending into a `Vec`
+    // reserved to the exact plan size writes each byte once; the plan is still
+    // what decides the buffer's size, so a plan that undershoots grows the
+    // `Vec` and is caught by the length check below rather than silently
+    // truncating.
+    let mut payload = Vec::with_capacity(plan.size);
+    {
+        let mut encoder = Encoder::new_vec_with_hints(&mut payload, Some(&plan.hints))?;
+        encoder.write_node(node)?;
+    }
     // Real checks, not debug_asserts: replayed hints are trusted in release,
     // so a plan/encode traversal divergence must fail the marshal instead of
     // shipping corrupt bytes. Two integer compares per stanza.
-    if written != payload.len() || !plan.hints.fully_consumed() {
-        return Err(crate::error::BinaryError::PlanMismatch);
+    if payload.len() != plan.size || !plan.hints.fully_consumed() {
+        return Err(BinaryError::PlanMismatch);
     }
     Ok(payload)
+}
+
+/// Serialize a `Node` in one pass, into a buffer reserved from a shallow size
+/// estimate.
+///
+/// The reserve comes from the node's own byte lengths, which bound the
+/// encoding from above: a key, a token value, a JID and a packed id all encode
+/// shorter than they measure, so the sum overshoots by a modest constant and
+/// the write allocates exactly once. An undershoot — a tree whose sampled
+/// children are unrepresentative — costs a `Vec` growth, never a wrong
+/// encoding, which is what lets the estimate sample rather than walk.
+///
+/// Against [`marshal_exact`]: one traversal instead of two, at the price of a
+/// buffer that is a little larger than the payload.
+pub fn marshal_shallow(node: &Node) -> Result<Vec<u8>> {
+    marshal_with_capacity(node, shallow_capacity_node(node))
 }
 
 /// Zero-copy serialization of a `NodeRef` directly into a writer.
@@ -116,13 +167,15 @@ pub fn marshal_ref_auto(node: &NodeRef<'_>) -> Result<Vec<u8>> {
 /// This avoids output buffer growth/copies and preserves zero-copy input semantics.
 pub fn marshal_ref_exact(node: &NodeRef<'_>) -> Result<Vec<u8>> {
     let plan = build_marshaled_node_ref_plan(node);
-    let mut payload = vec![0; plan.size];
-    let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
-    encoder.write_node(node)?;
-    let written = encoder.bytes_written();
+    // Reserved rather than zero-filled, for the reason marshal_exact gives.
+    let mut payload = Vec::with_capacity(plan.size);
+    {
+        let mut encoder = Encoder::new_vec_with_hints(&mut payload, Some(&plan.hints))?;
+        encoder.write_node(node)?;
+    }
     // Same invariant enforcement as marshal_exact.
-    if written != payload.len() || !plan.hints.fully_consumed() {
-        return Err(crate::error::BinaryError::PlanMismatch);
+    if payload.len() != plan.size || !plan.hints.fully_consumed() {
+        return Err(BinaryError::PlanMismatch);
     }
     Ok(payload)
 }
@@ -139,6 +192,75 @@ fn marshal_ref_with_capacity(node: &NodeRef<'_>, capacity: usize) -> Result<Vec<
     let mut payload = Vec::with_capacity(capacity);
     marshal_ref_to_vec(node, &mut payload)?;
     Ok(payload)
+}
+
+/// Upper bound on a node's encoded size, from the lengths it already carries.
+///
+/// Breadth is sampled, depth is not. Sampling bounds the walk exactly where the
+/// tree is wide — the fan-out shapes this exists for — while a chain of narrow
+/// nodes is walked in full, because there the estimate costs no more than the
+/// encoder's own recursion over the same nodes and a depth cutoff would guess
+/// at whatever payload sits below it.
+fn shallow_capacity_node(node: &Node) -> usize {
+    let mut estimate = 0;
+    accumulate_shallow_estimate(node, &mut estimate);
+    estimate.min(SHALLOW_MAX_CAPACITY)
+}
+
+/// What a raw string of `len` bytes costs on the wire: the `BINARY_8`/`_20`/
+/// `_32` tag and its length field. Every other encoding of the same string —
+/// a token, a packed id, a JID — is shorter, which is what makes the sum of
+/// these an upper bound rather than a guess.
+#[inline]
+fn shallow_string_estimate(len: usize) -> usize {
+    const BINARY_20_LIMIT: usize = 1 << 20;
+    let header = if len < 256 {
+        2
+    } else if len < BINARY_20_LIMIT {
+        4
+    } else {
+        5
+    };
+    len + header
+}
+
+#[inline]
+fn shallow_value_estimate(value: &NodeValue) -> usize {
+    match value {
+        NodeValue::String(text) => shallow_string_estimate(text.len()),
+        NodeValue::Jid(jid) => jid.user.len() + SHALLOW_JID_OVERHEAD,
+    }
+}
+
+fn accumulate_shallow_estimate(node: &Node, estimate: &mut usize) {
+    *estimate += SHALLOW_NODE_OVERHEAD + shallow_string_estimate(node.tag.len());
+    for (key, value) in node.attrs.iter() {
+        *estimate += shallow_string_estimate(key.len()) + shallow_value_estimate(value);
+    }
+
+    match &node.content {
+        Some(NodeContent::Bytes(bytes)) => *estimate += shallow_string_estimate(bytes.len()),
+        Some(NodeContent::String(text)) => *estimate += shallow_string_estimate(text.len()),
+        Some(NodeContent::Nodes(children)) => {
+            if *estimate >= SHALLOW_MAX_CAPACITY {
+                return;
+            }
+            let sampled = children.len().min(SHALLOW_CHILD_SAMPLE);
+            let before = *estimate;
+            for child in &children[..sampled] {
+                accumulate_shallow_estimate(child, estimate);
+            }
+            // Every child past the sample is charged the sample's mean, rounded
+            // up. A fan-out is homogeneous by construction — one `<to>` per
+            // device — so this lands within the per-node slack; a tree that
+            // hides its bulk past the 32nd child pays one growth for it.
+            let remaining = children.len() - sampled;
+            if remaining > 0 {
+                *estimate += (*estimate - before).div_ceil(sampled) * remaining;
+            }
+        }
+        None => {}
+    }
 }
 
 #[inline]
@@ -169,7 +291,7 @@ fn should_auto_reserve_node_ref(node: &NodeRef<'_>) -> bool {
         return true;
     }
 
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::Bytes(bytes)) => bytes.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
         Some(NodeContentRef::String(text)) => text.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
         Some(NodeContentRef::Nodes(children)) => {
@@ -178,7 +300,7 @@ fn should_auto_reserve_node_ref(node: &NodeRef<'_>) -> bool {
             }
             // Check one level deeper for large nested lists (e.g., <iq> -> <list> -> 812 keys)
             children.iter().any(|child| {
-                matches!(child.content.as_deref(), Some(NodeContentRef::Nodes(gc)) if gc.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD)
+                matches!(child.content.as_ref(), Some(NodeContentRef::Nodes(gc)) if gc.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD)
             })
         }
         None => false,
@@ -227,7 +349,7 @@ fn estimate_capacity_node_ref(node: &NodeRef<'_>) -> usize {
     estimate += node.tag.len();
     estimate += node.attrs.len() * AUTO_ATTR_ESTIMATE;
 
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::Bytes(bytes)) => {
             estimate += bytes.len() + 8;
         }
@@ -238,7 +360,7 @@ fn estimate_capacity_node_ref(node: &NodeRef<'_>) -> usize {
             estimate += children.len() * AUTO_CHILD_ESTIMATE;
             for child in children.iter().take(AUTO_CHILD_SAMPLE_LIMIT) {
                 estimate += child.tag.len() + child.attrs.len() * AUTO_ATTR_ESTIMATE;
-                match child.content.as_deref() {
+                match child.content.as_ref() {
                     Some(NodeContentRef::Bytes(bytes)) => estimate += bytes.len() + 8,
                     Some(NodeContentRef::String(text)) => estimate += text.len() + 8,
                     Some(NodeContentRef::Nodes(grand_children)) => {
@@ -263,7 +385,150 @@ mod tests {
     use crate::jid::Jid;
     use crate::node::{Attrs, NodeContent, NodeValue};
 
-    type TestResult = crate::error::Result<()>;
+    type TestResult = Result<()>;
+
+    /// An interop JID's `integrator` has a wire field only in `INTEROP_JID`.
+    /// Encoded as a `JID_PAIR` it is simply absent, so two interop destinations
+    /// that differ only there went out as the same bytes.
+    ///
+    /// Asserted on the emitted bytes rather than by round-tripping: our decoder
+    /// reads a trailing server that the outbound form does not carry (see
+    /// `write_interop_jid`), so a local encode/decode cycle is the wrong oracle
+    /// here — the two directions of this token genuinely differ.
+    ///
+    /// Every encoder path is covered because `marshal_exact` sizes its output
+    /// buffer from the size estimator before writing into it: an estimator that
+    /// disagrees with the writer surfaces as `PlanMismatch`, not as wrong bytes,
+    /// and `marshal_exact` is what production sends through.
+    #[test]
+    fn interop_jid_carries_its_integrator_onto_the_wire() -> TestResult {
+        use crate::jid::Server;
+
+        fn node_for(jid: &Jid) -> Node {
+            let mut attrs = Attrs::with_capacity(1);
+            attrs.push("jid".to_string(), NodeValue::Jid(jid.clone()));
+            Node::new("iq", attrs, None)
+        }
+
+        fn encode_all(jid: &Jid) -> Vec<(&'static str, Vec<u8>)> {
+            let node = node_for(jid);
+            let r = node.as_node_ref();
+            vec![
+                ("marshal", marshal(&node).expect("marshal")),
+                ("marshal_exact", marshal_exact(&node).expect("exact")),
+                ("marshal_ref", marshal_ref(&r).expect("ref")),
+                (
+                    "marshal_ref_exact",
+                    marshal_ref_exact(&r).expect("ref exact"),
+                ),
+            ]
+        }
+
+        let base = Jid {
+            user: "123456789".into(),
+            server: Server::Interop,
+            agent: 0,
+            device: 7,
+            integrator: 300,
+        };
+
+        // The integrator reaches the bytes: change only it, and the encoding
+        // changes. Under JID_PAIR these were byte-identical.
+        let other = Jid {
+            integrator: 301,
+            ..base.clone()
+        };
+        for ((path, a), (_, b)) in encode_all(&base).into_iter().zip(encode_all(&other)) {
+            assert_ne!(a, b, "{path}: the integrator must reach the wire");
+            assert!(
+                a.contains(&crate::token::INTEROP_JID),
+                "{path}: must use the INTEROP_JID token"
+            );
+            // Big-endian device and integrator, adjacent, as WA Web writes them.
+            assert!(
+                a.windows(4).any(|w| w == [0x00, 0x07, 0x01, 0x2C]),
+                "{path}: device 7 and integrator 300 as u16 BE"
+            );
+        }
+
+        // Every path agrees byte for byte, so the exact-size plan matches the
+        // writer. When it does not, `marshal_exact` fails outright.
+        let encodings = encode_all(&base);
+        let (_, first) = &encodings[0];
+        for (path, bytes) in &encodings[1..] {
+            assert_eq!(bytes, first, "{path}: must agree with marshal");
+        }
+
+        // A zero-integrator interop JID keeps the JID_PAIR form we have always
+        // sent. That form carries user and server only — it drops the device —
+        // which is pre-existing and deliberately untouched here.
+        let plain = Jid {
+            integrator: 0,
+            ..base.clone()
+        };
+        let bytes = marshal(&node_for(&plain))?;
+        assert!(
+            !bytes.contains(&crate::token::INTEROP_JID),
+            "no integrator, no INTEROP_JID token"
+        );
+        let decoded = unmarshal_packed_ref(&bytes)?;
+        let back = decoded
+            .attrs
+            .iter()
+            .find(|(k, _)| &**k == "jid")
+            .and_then(|(_, v)| v.to_jid())
+            .expect("jid attr");
+        assert_eq!(back.server, Server::Interop);
+        assert_eq!(back.device, 0, "JID_PAIR carries no device");
+
+        Ok(())
+    }
+
+    /// The two round-trips real code performs — through the wire, and through the
+    /// store, which holds JIDs as text — have to agree: a JID that survives one
+    /// must equal a JID that survives the other, or `stored_jid == wire_jid`
+    /// silently flips depending on where each side came from.
+    #[test]
+    fn ad_jid_round_trips_equal_through_the_wire_and_through_text() -> TestResult {
+        use crate::jid::Server;
+        use std::str::FromStr;
+
+        for server in [Server::Pn, Server::Lid, Server::Hosted, Server::HostedLid] {
+            let original = Jid {
+                user: "123456789012345".into(),
+                server,
+                agent: 0,
+                device: 7,
+                integrator: 0,
+            };
+
+            let mut attrs = Attrs::with_capacity(1);
+            attrs.push("jid".to_string(), NodeValue::Jid(original.clone()));
+            let node = Node::new("iq", attrs, None);
+
+            let bytes = marshal(&node)?;
+            let decoded = unmarshal_packed_ref(&bytes)?;
+            let from_wire = decoded
+                .attrs
+                .iter()
+                .find(|(k, _)| &**k == "jid")
+                .and_then(|(_, v)| v.to_jid())
+                .expect("jid attr survives the round-trip");
+
+            assert_eq!(
+                from_wire, original,
+                "{server:?}: encode -> decode must be idempotent"
+            );
+
+            let from_text = Jid::from_str(&from_wire.to_string()).expect("renders parseably");
+            assert_eq!(
+                from_wire, from_text,
+                "{server:?}: a wire-decoded JID must equal the same JID read back as text"
+            );
+        }
+
+        Ok(())
+    }
 
     fn fixture_node() -> Node {
         let mut attrs = Attrs::with_capacity(4);
@@ -440,6 +705,48 @@ mod tests {
         marshal_to(&node, &mut payload_writer)?;
 
         assert_eq!(payload_exact, payload_writer);
+        Ok(())
+    }
+
+    /// The exact-size paths reserve their output instead of zero-filling it, so
+    /// nothing initializes the bytes the encoder does not reach: a plan that
+    /// overshoots can no longer leave a tail of zeros that happens to look like
+    /// a valid encoding, and one that undershoots grows the buffer instead of
+    /// erroring inside the writer. Both now surface only through the length
+    /// check, which the other exact tests exercise on a small fixture; this one
+    /// runs a payload past every growth step a `Vec` would take on the way to
+    /// it, where a divergence has room to show up as wrong bytes.
+    #[test]
+    fn exact_paths_match_the_streaming_writer_on_a_large_payload() -> TestResult {
+        let mut attrs = Attrs::with_capacity(2);
+        attrs.push("id".to_string(), "ABC123");
+        attrs.push(
+            "to".to_string(),
+            NodeValue::Jid("15551234567@s.whatsapp.net".parse::<Jid>().unwrap()),
+        );
+        let children: Vec<Node> = (0..512)
+            .map(|i| {
+                let mut child_attrs = Attrs::with_capacity(1);
+                child_attrs.push("i".to_string(), i.to_string());
+                Node::new(
+                    "item",
+                    child_attrs,
+                    Some(NodeContent::Bytes(vec![(i % 251) as u8; 64])),
+                )
+            })
+            .collect();
+        let node = Node::new("message", attrs, Some(NodeContent::Nodes(children)));
+        let node_ref = node.as_node_ref();
+
+        let mut streamed = Vec::new();
+        marshal_to(&node, &mut streamed)?;
+        assert!(
+            streamed.len() > 32 * 1024,
+            "fixture must outgrow the small-payload paths"
+        );
+
+        assert_eq!(marshal_exact(&node)?, streamed, "marshal_exact");
+        assert_eq!(marshal_ref_exact(&node_ref)?, streamed, "marshal_ref_exact");
         Ok(())
     }
 

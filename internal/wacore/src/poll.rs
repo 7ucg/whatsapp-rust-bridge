@@ -1,6 +1,6 @@
 //! Poll vote encryption/decryption.
 //!
-//! Thin wrapper over [`secret_enc_addon`] specialised for the
+//! Thin wrapper over [`secret_enc_addon`](crate::secret_enc_addon) specialised for the
 //! `PollVoteMessage` proto and the `"Poll Vote"` use-case.
 
 use anyhow::{Result, anyhow, ensure};
@@ -36,7 +36,8 @@ pub fn compute_option_hash(option_name: &str) -> [u8; 32] {
 /// HKDF-SHA256: info = stanzaId || pollCreator || voter || "Poll Vote", no salt.
 ///
 /// Kept as a public API for backwards compatibility; new code should call
-/// [`secret_enc_addon::derive_use_case_secret`] with `ModificationType::PollVote`.
+/// [`secret_enc_addon::derive_use_case_secret`](crate::secret_enc_addon::derive_use_case_secret)
+/// with `ModificationType::PollVote`.
 pub fn derive_vote_encryption_key(
     message_secret: &[u8],
     stanza_id: &str,
@@ -47,36 +48,6 @@ pub fn derive_vote_encryption_key(
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )
-}
-
-/// Encrypt a poll vote with a pre-derived 32-byte key, symmetric to
-/// [`decrypt_poll_vote`]. Returns `(payload_with_tag, iv)`.
-///
-/// Kept for callers that built their own key via [`derive_vote_encryption_key`].
-/// New code should prefer [`encrypt_poll_vote_with_secret`], which derives
-/// the key in a single step from the parent poll's `messageSecret`.
-pub fn encrypt_poll_vote(
-    selected_option_hashes: &[Vec<u8>],
-    encryption_key: &[u8; 32],
-    stanza_id: &str,
-    voter_jid: &str,
-) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
-    use crate::libsignal::crypto::aes_256_gcm_encrypt;
-    use rand::Rng;
-
-    let plaintext = encode_selected_options(selected_option_hashes);
-
-    let mut iv = [0u8; GCM_IV_SIZE];
-    rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
-
-    // poll_creator_jid is not part of the AAD; supply an empty placeholder.
-    let aad = build_aad(&poll_vote_addon_ctx(stanza_id, "", voter_jid));
-
-    let mut payload = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
-    aes_256_gcm_encrypt(encryption_key, &iv, &aad, &plaintext, &mut payload)
-        .map_err(|e| anyhow!("AES-GCM encrypt failed: {e}"))?;
-
-    Ok((payload, iv))
 }
 
 /// Encrypt a poll vote given the parent poll's `messageSecret`. Returns

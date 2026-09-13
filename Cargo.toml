@@ -12,35 +12,52 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.94"
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+unused_qualifications = "warn"
+
 [workspace.dependencies]
 # Shared dependencies
-aes = "0.9.1"
-aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc", "bytes"] }
+aes = "0.9.2"
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "bytes"] }
 anyhow = { version = "1.0", default-features = false }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
-zerocopy = { version = "0.8.52", default-features = false, features = ["derive"] }
+zerocopy = { version = "0.8.55", default-features = false, features = ["derive"] }
 async-lock = { version = "3", default-features = false }
-async-trait = "0.1.89"
-base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-buffa = { version = "0.9.0", default-features = false, features = ["json"] }
-buffa-build = { version = "0.9.0", default-features = false }
-buffa-descriptor = { version = "0.9.0", default-features = false }
+async-trait = "0.1.91"
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+buffa = { version = "0.9.2", default-features = false, features = ["json"] }
+buffa-build = { version = "0.9.2", default-features = false }
+buffa-descriptor = { version = "0.9.2", default-features = false }
 bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
 bon = { version = "3.9.3", default-features = false, features = ["std"] }
 cbc = { version = "0.2", features = ["alloc"] }
 chrono = { version = "0.4", default-features = false }
-compact_str = { version = "0.9", default-features = false }
+compact_str = { version = "0.10", default-features = false }
 ctr = { version = "0.10", default-features = false }
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
-diesel = { version = "2.3.10", default-features = false, features = ["sqlite", "r2d2", "32-column-tables"] }
+diesel = { version = "2.3.11", default-features = false, features = ["sqlite", "r2d2", "32-column-tables"] }
 diesel_migrations = { version = "2.3.2", default-features = false, features = ["sqlite"] }
 env_logger = { version = "0.11", default-features = false }
 event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
-hashbrown = { version = "0.15.5", default-features = false, features = ["equivalent"] }
+hashbrown = { version = "0.17.1", default-features = false }
 heck = "0.5"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.13.0", default-features = false }
@@ -55,23 +72,25 @@ serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
+smallvec = "1.15"
 smoothutf8 = { version = "0.2.3", default-features = false }
 subtle = { version = "2.6", default-features = false }
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", default-features = false }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 uuid = { version = "1", default-features = false }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 
 # Internal workspace crates
-wacore = { path = "internal/wacore", default-features = false, version = "0.6.0" }
-wacore-appstate = { path = "internal/wacore/appstate", default-features = false, version = "0.6.0" }
-wacore-binary = { path = "internal/wacore/binary", default-features = false, version = "0.6.0" }
-wacore-derive = { path = "internal/wacore/derive", version = "0.6.0" }
-wacore-libsignal = { path = "internal/wacore/libsignal", version = "0.6.0" }
-wacore-noise = { path = "internal/wacore/noise", version = "0.6.0" }
+wacore = { path = "internal/wacore", default-features = false, version = "0.7.0" }
+wacore-appstate = { path = "internal/wacore/appstate", default-features = false, version = "0.7.0" }
+wacore-binary = { path = "internal/wacore/binary", default-features = false, version = "0.7.0" }
+wacore-derive = { path = "internal/wacore/derive", version = "0.7.0" }
+wacore-libsignal = { path = "internal/wacore/libsignal", version = "0.7.0" }
+wacore-noise = { path = "internal/wacore/noise", version = "0.7.0" }
 waproto = { path = "internal/waproto", version = "0.6.0" }
 yoke = { version = "0.8", features = ["derive"] }
-zlib-rs = { version = "0.6.5", default-features = false, features = ["std", "rust-allocator"] }
+zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [package]
 name = "whatsapp-rust-bridge"
@@ -125,7 +144,7 @@ md-5 = "0.10"
 buffa = { workspace = true }
 rand = { version = "0.10", features = ["thread_rng"] }
 rand_core = { version = "0.9", features = ["os_rng"] }
-compact_str = { version = "0.9", default-features = false }
+compact_str = { version = "0.10", default-features = false }
 serde = { version = "1.0.228", default-features = false, features = [
   "derive",
   "alloc",

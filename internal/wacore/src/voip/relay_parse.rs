@@ -330,6 +330,11 @@ pub fn merge_relay_data(base: RelayData, patch: RelayData) -> RelayData {
     }
 }
 
+/// The port a web client's relay media rides on. Only relays answering here route a web client's
+/// media in both directions; one on 3478 completes the handshake and carries our uplink but never
+/// forwards the peer's stream back (issue #1098).
+pub const WEB_CLIENT_RELAY_PORT: u16 = 3480;
+
 /// FNA relays (is_fna=1, auth_token_id=0) are inbound-only; not for outbound relaylatency.
 pub fn is_outbound_relay_candidate(endpoint: &RelayEndpoint) -> bool {
     !endpoint.is_fna && endpoint.auth_token_id != 0
@@ -349,10 +354,15 @@ pub fn get_outbound_relay_endpoints(relay_data: &RelayData) -> Vec<RelayEndpoint
     out
 }
 
-/// The relay endpoint to connect the MEDIA transport to. `auth_token_id` only gates relaylatency
-/// probes, so an offer that carries every endpoint with `auth_token_id=0` has no relaylatency
-/// candidate yet must still connect for media. Prefer a relaylatency candidate, else any non-FNA
-/// endpoint, else the first; otherwise the call is dropped with no media.
+/// The relay endpoint to connect the MEDIA transport to.
+///
+/// Prefer an endpoint on [`WEB_CLIENT_RELAY_PORT`], or the call goes silently one-way: the other
+/// endpoints connect and carry our uplink without ever delivering the peer's media.
+///
+/// Below that: `auth_token_id` only gates relaylatency probes, so an offer that carries every
+/// endpoint with `auth_token_id=0` has no relaylatency candidate yet must still connect for media.
+/// Prefer a relaylatency candidate, else any non-FNA endpoint, else the first; otherwise the call is
+/// dropped with no media.
 ///
 /// At each tier prefer a USABLE endpoint -- one with an IPv4 address to dial AND a token we hold --
 /// so a preferred-but-unusable endpoint doesn't drop a call that a later fallback endpoint in the
@@ -369,11 +379,22 @@ pub fn get_media_relay_endpoint(relay_data: &RelayData) -> Option<&RelayEndpoint
                 .get(e.token_id as usize)
                 .is_some_and(|t| !t.is_empty())
     };
+    // Judged on the IPv4 address the transport actually dials, not on any address the endpoint
+    // happens to carry: an IPv6-only 3480 entry would not change where we connect.
+    let on_web_client_port = |e: &RelayEndpoint| {
+        get_primary_ipv4_address(e).is_some_and(|(_, port)| port == WEB_CLIENT_RELAY_PORT)
+    };
     let pick = |usable_only: bool| {
         relay_data
             .endpoints
             .iter()
-            .find(|e| is_outbound_relay_candidate(e) && (!usable_only || usable(e)))
+            .find(|e| on_web_client_port(e) && (!usable_only || usable(e)))
+            .or_else(|| {
+                relay_data
+                    .endpoints
+                    .iter()
+                    .find(|e| is_outbound_relay_candidate(e) && (!usable_only || usable(e)))
+            })
             .or_else(|| {
                 relay_data
                     .endpoints
@@ -609,6 +630,101 @@ mod tests {
         let selected =
             get_media_relay_endpoint(&rd).expect("the real-token endpoint must be picked");
         assert_eq!(selected.relay_name, "real");
+    }
+
+    /// Captured from a live outgoing call: the mix that matters is one endpoint on
+    /// [`WEB_CLIENT_RELAY_PORT`] against lower-RTT ones on 3478.
+    fn live_outgoing_relay() -> RelayData {
+        let ep = |name: &str, id: u32, fna: bool, token_id: u32, auth: u32, ip: &str, port: u16| {
+            RelayEndpoint {
+                relay_id: id,
+                relay_name: name.into(),
+                token_id,
+                auth_token_id: auth,
+                is_fna: fna,
+                addresses: vec![
+                    RelayAddress {
+                        protocol: 0,
+                        ipv4: Some(ip.into()),
+                        ipv6: None,
+                        port,
+                    },
+                    RelayAddress {
+                        protocol: 0,
+                        ipv4: None,
+                        ipv6: Some("2804:3504:ffff:1:face:b00c:3333:4df0".into()),
+                        port,
+                    },
+                ],
+                ..RelayEndpoint::default()
+            }
+        };
+        RelayData {
+            relay_tokens: vec![vec![0xA0], vec![0xA1], vec![0xA2]],
+            auth_tokens: vec![vec![0xB0], vec![0xB1]],
+            endpoints: vec![
+                ep(
+                    "fimp3c01",
+                    0,
+                    true,
+                    0,
+                    0,
+                    "170.78.54.98",
+                    WEB_CLIENT_RELAY_PORT,
+                ),
+                ep("for2c01", 1, false, 1, 1, "57.144.129.57", 3478),
+                ep("bsb1c01", 2, false, 2, 1, "57.144.137.57", 3478),
+            ],
+            ..RelayData::default()
+        }
+    }
+
+    /// Selecting by tier alone picks the lowest-RTT non-FNA endpoint, which is the one-way silent
+    /// case from issue #1098.
+    #[test]
+    fn media_relay_prefers_the_web_client_port_endpoint() {
+        let rd = live_outgoing_relay();
+        let selected = get_media_relay_endpoint(&rd).expect("an endpoint must be selectable");
+        assert_eq!(
+            selected.relay_name, "fimp3c01",
+            "must dial the relay listening on the web client port, not the lowest-RTT non-FNA one"
+        );
+        assert_eq!(
+            get_primary_ipv4_address(selected),
+            Some(("170.78.54.98".to_string(), WEB_CLIENT_RELAY_PORT))
+        );
+    }
+
+    /// The preference must not override usability: an endpoint on the web client port whose token we
+    /// don't hold is undialable, so a usable endpoint elsewhere in the block still wins.
+    #[test]
+    fn web_client_port_preference_yields_to_usability() {
+        let mut rd = live_outgoing_relay();
+        // Point the 3480 endpoint at a token index the block never sent.
+        rd.endpoints[0].token_id = 9;
+        let selected = get_media_relay_endpoint(&rd).expect("a usable endpoint must be selectable");
+        assert_eq!(selected.relay_name, "for2c01");
+    }
+
+    /// No endpoint on the web client port (some blocks carry none): selection must fall back to the
+    /// previous behavior rather than failing the call.
+    #[test]
+    fn falls_back_when_no_endpoint_uses_the_web_client_port() {
+        let mut rd = live_outgoing_relay();
+        rd.endpoints.remove(0);
+        let selected = get_media_relay_endpoint(&rd).expect("an endpoint must still be selectable");
+        assert_eq!(selected.relay_name, "for2c01");
+    }
+
+    /// An endpoint is only "on the web client port" if the address we would actually dial (IPv4) uses
+    /// it; a block whose IPv6 alone sits on 3480 must not be picked on that basis, since the transport
+    /// dials IPv4.
+    #[test]
+    fn web_client_port_is_judged_by_the_dialed_ipv4_address() {
+        let mut rd = live_outgoing_relay();
+        rd.endpoints[0].addresses[0].port = 3478; // IPv4 moved off 3480, IPv6 left on it
+        let selected = get_media_relay_endpoint(&rd).expect("an endpoint must be selectable");
+        assert_eq!(selected.relay_name, "for2c01");
     }
 
     #[test]

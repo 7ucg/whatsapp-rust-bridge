@@ -12,10 +12,22 @@ use crate::protocol::{
 };
 
 /// A unique identifier selecting among this client's known signed pre-keys.
-#[derive(
-    Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, derive_more::From, derive_more::Into,
-)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct SignedPreKeyId(u32);
+
+impl From<u32> for SignedPreKeyId {
+    #[inline]
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<SignedPreKeyId> for u32 {
+    #[inline]
+    fn from(id: SignedPreKeyId) -> Self {
+        id.0
+    }
+}
 
 impl fmt::Display for SignedPreKeyId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -66,8 +78,8 @@ pub trait GenericSignedPreKey {
         Self: Sized,
     {
         let timestamp = timestamp.epoch_millis();
-        let public_key = key_pair.get_public().serialize();
-        let private_key = key_pair.get_private().serialize();
+        let public_key = key_pair.get_public().to_record_bytes();
+        let private_key = key_pair.get_private().to_record_bytes();
         let signature = signature.to_vec();
         Self::from_storage(SignedPreKeyRecordStructure {
             id: Some(id.into()),
@@ -84,14 +96,26 @@ pub trait GenericSignedPreKey {
         ))
     }
 
+    /// Adopt a stored structure, normalizing its public key the way
+    /// [`deserialize`](Self::deserialize) does.
+    ///
+    /// See `PreKeyRecord::from_storage` for why a store read moves the structure
+    /// in instead of rebuilding it from parsed keys.
+    fn from_stored_structure(mut storage: SignedPreKeyRecordStructure) -> Self
+    where
+        Self: Sized,
+    {
+        super::normalize_stored_public_key(&mut storage.public_key);
+        Self::from_storage(storage)
+    }
+
     fn deserialize(data: &[u8]) -> Result<Self>
     where
         Self: Sized,
     {
-        Ok(Self::from_storage(
-            waproto::codec::signed_pre_key_record_decode(data)
-                .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?,
-        ))
+        let storage = waproto::codec::signed_pre_key_record_decode(data)
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        Ok(Self::from_stored_structure(storage))
     }
 
     fn id(&self) -> Result<Self::Id> {
@@ -110,15 +134,21 @@ pub trait GenericSignedPreKey {
         ))
     }
 
-    fn signature(&self) -> Result<Vec<u8>> {
+    /// Borrow the stored signature. Prefer this over
+    /// [`signature`](Self::signature) wherever the bytes are only read.
+    fn signature_bytes(&self) -> Result<&[u8]> {
         self.get_storage()
             .signature
-            .clone()
+            .as_deref()
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)
     }
 
+    fn signature(&self) -> Result<Vec<u8>> {
+        self.signature_bytes().map(<[u8]>::to_vec)
+    }
+
     fn public_key(&self) -> Result<<Self::KeyPair as KeyPairSerde>::PublicKey> {
-        <Self::KeyPair as KeyPairSerde>::PublicKey::deserialize(
+        <Self::KeyPair as KeyPairSerde>::PublicKey::from_record_bytes(
             self.get_storage()
                 .public_key
                 .as_ref()
@@ -127,7 +157,7 @@ pub trait GenericSignedPreKey {
     }
 
     fn key_pair(&self) -> Result<Self::KeyPair> {
-        Self::KeyPair::from_public_and_private(
+        Self::KeyPair::from_record_public_and_private(
             self.get_storage()
                 .public_key
                 .as_ref()
@@ -140,9 +170,18 @@ pub trait GenericSignedPreKey {
     }
 }
 
+/// How a key is encoded *inside a record structure*, which for public keys is
+/// not `PublicKey::serialize`.
+///
+/// The methods are deliberately not named `serialize`/`deserialize`: the record
+/// encoding is WhatsApp's raw 32-byte DJB key, while the inherent
+/// `PublicKey::serialize` produces Signal's 33-byte type-tagged form. Two
+/// same-named functions differing by one leading byte is the trap this trait
+/// exists to keep out of the record types — see the `PreKeyRecord` doc comment
+/// for why 32 is the form that must be persisted.
 pub trait KeySerde {
-    fn serialize(&self) -> Vec<u8>;
-    fn deserialize<T: AsRef<[u8]>>(bytes: T) -> Result<Self>
+    fn to_record_bytes(&self) -> Vec<u8>;
+    fn from_record_bytes<T: AsRef<[u8]>>(bytes: T) -> Result<Self>
     where
         Self: Sized;
 }
@@ -150,7 +189,7 @@ pub trait KeySerde {
 pub trait KeyPairSerde {
     type PublicKey: KeySerde;
     type PrivateKey: KeySerde;
-    fn from_public_and_private(public_key: &[u8], private_key: &[u8]) -> Result<Self>
+    fn from_record_public_and_private(public_key: &[u8], private_key: &[u8]) -> Result<Self>
     where
         Self: Sized;
     fn get_public(&self) -> &Self::PublicKey;
@@ -158,21 +197,21 @@ pub trait KeyPairSerde {
 }
 
 impl KeySerde for PublicKey {
-    fn serialize(&self) -> Vec<u8> {
-        self.serialize().to_vec()
+    fn to_record_bytes(&self) -> Vec<u8> {
+        self.public_key_bytes().to_vec()
     }
 
-    fn deserialize<T: AsRef<[u8]>>(bytes: T) -> Result<Self> {
-        Ok(Self::deserialize(bytes.as_ref())?)
+    fn from_record_bytes<T: AsRef<[u8]>>(bytes: T) -> Result<Self> {
+        Ok(Self::from_stored_public_key_bytes(bytes.as_ref())?)
     }
 }
 
 impl KeySerde for PrivateKey {
-    fn serialize(&self) -> Vec<u8> {
+    fn to_record_bytes(&self) -> Vec<u8> {
         self.serialize().to_vec()
     }
 
-    fn deserialize<T: AsRef<[u8]>>(bytes: T) -> Result<Self> {
+    fn from_record_bytes<T: AsRef<[u8]>>(bytes: T) -> Result<Self> {
         Ok(Self::deserialize(bytes.as_ref())?)
     }
 }
@@ -181,8 +220,11 @@ impl KeyPairSerde for KeyPair {
     type PublicKey = PublicKey;
     type PrivateKey = PrivateKey;
 
-    fn from_public_and_private(public_key: &[u8], private_key: &[u8]) -> Result<Self> {
-        Ok(KeyPair::from_public_and_private(public_key, private_key)?)
+    fn from_record_public_and_private(public_key: &[u8], private_key: &[u8]) -> Result<Self> {
+        Ok(KeyPair::new(
+            PublicKey::from_record_bytes(public_key)?,
+            PrivateKey::from_record_bytes(private_key)?,
+        ))
     }
 
     fn get_public(&self) -> &PublicKey {

@@ -1,16 +1,46 @@
 use std::io::Write;
 
-#[cfg(feature = "simd")]
-use core::simd::Select;
-#[cfg(feature = "simd")]
-use core::simd::prelude::*;
-#[cfg(feature = "simd")]
-use core::simd::{Simd, u8x16};
-
 use crate::error::{BinaryError, Result};
 use crate::jid::{self, Jid, JidRef};
 use crate::node::{Node, NodeContent, NodeContentRef, NodeRef, NodeValue, ValueRef};
 use crate::token;
+
+/// Marks a byte no packed encoding accepts. `validate_hex`/`validate_nibble`
+/// gate every caller, so a hit means the caller skipped that check.
+const PACK_INVALID: u8 = 0xFF;
+
+/// ASCII to nibble, the inverse of the decoder's `HEX_PAIRS`. Index 0 maps to
+/// 15 because that is the pad an odd-length string writes as its second half.
+static HEX_ENC: [u8; 256] = {
+    let mut table = [PACK_INVALID; 256];
+    let mut c = b'0';
+    while c <= b'9' {
+        table[c as usize] = c - b'0';
+        c += 1;
+    }
+    let mut c = b'A';
+    while c <= b'F' {
+        table[c as usize] = 10 + (c - b'A');
+        c += 1;
+    }
+    table[0] = 15;
+    table
+};
+
+/// ASCII to nibble for `NIBBLE_8`: digits plus the two punctuation characters
+/// a phone number can carry.
+static NIBBLE_ENC: [u8; 256] = {
+    let mut table = [PACK_INVALID; 256];
+    let mut c = b'0';
+    while c <= b'9' {
+        table[c as usize] = c - b'0';
+        c += 1;
+    }
+    table[b'-' as usize] = 10;
+    table[b'.' as usize] = 11;
+    table[0] = 15;
+    table
+};
 
 pub trait ByteWriter {
     fn write_u8(&mut self, value: u8) -> Result<()>;
@@ -61,48 +91,6 @@ impl ByteWriter for VecByteWriter<'_> {
     #[inline]
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         self.buffer.extend_from_slice(bytes);
-        Ok(())
-    }
-}
-
-pub(crate) struct SliceByteWriter<'a> {
-    buffer: &'a mut [u8],
-    position: usize,
-}
-
-impl<'a> SliceByteWriter<'a> {
-    fn new(buffer: &'a mut [u8]) -> Self {
-        Self {
-            buffer,
-            position: 0,
-        }
-    }
-
-    #[inline]
-    fn bytes_written(&self) -> usize {
-        self.position
-    }
-}
-
-impl ByteWriter for SliceByteWriter<'_> {
-    #[inline]
-    fn write_u8(&mut self, value: u8) -> Result<()> {
-        if self.position >= self.buffer.len() {
-            return Err(BinaryError::UnexpectedEof);
-        }
-        self.buffer[self.position] = value;
-        self.position += 1;
-        Ok(())
-    }
-
-    #[inline]
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let end = self.position + bytes.len();
-        if end > self.buffer.len() {
-            return Err(BinaryError::UnexpectedEof);
-        }
-        self.buffer[self.position..end].copy_from_slice(bytes);
-        self.position = end;
         Ok(())
     }
 }
@@ -188,7 +176,7 @@ impl EncodeNode for NodeRef<'_> {
     }
 
     fn encode_content<'a, W: ByteWriter>(&self, encoder: &mut Encoder<'a, W>) -> Result<()> {
-        if let Some(content) = self.content.as_deref() {
+        if let Some(content) = self.content.as_ref() {
             match content {
                 NodeContentRef::String(s) => encoder.write_string(s)?,
                 NodeContentRef::Bytes(b) => encoder.write_bytes_with_len(b)?,
@@ -206,13 +194,31 @@ impl EncodeNode for NodeRef<'_> {
 
 // u8 offsets keep StringHint small — the hint tape stores one per string —
 // and always fit: classify_string_hint only treats strings <= 48 bytes as
-// JID candidates.
+// JID candidates. The tape is one hint per string of the whole node, so a
+// byte added here is a byte times every string in the payload: keep the
+// resolved server and derive everything derivable from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedJidMeta {
     user_end: u8,
     server_start: u8,
-    domain_type: u8,
     device: Option<u8>,
+    /// The resolved server, when the suffix is one we know. `JID_PAIR` writes
+    /// this rather than the caller's substring, so a string-valued attribute
+    /// (`.attr("to", "…@c.us")`) is spelled on the wire exactly as the
+    /// equivalent `Jid` would be. `None` keeps an unknown suffix verbatim,
+    /// which is the only way it can survive the round trip.
+    server: Option<jid::Server>,
+}
+
+impl ParsedJidMeta {
+    /// The AD_JID domain byte, from the resolved server rather than a second
+    /// stored copy of the same fact — `device` is `Some` only for the servers
+    /// [`server_supports_ad_jid`] accepts, which are exactly the ones
+    /// [`server_to_domain_type`] maps.
+    #[inline]
+    fn domain_type(self) -> u8 {
+        self.server.map_or(0, server_to_domain_type)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,7 +297,7 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         (user_combined, None)
     };
 
-    let user_end = if let Some(underscore_idx) = user_agent.find('_')
+    let mut user_end = if let Some(underscore_idx) = user_agent.find('_')
         && user_agent[underscore_idx + 1..].parse::<u8>().is_ok()
     {
         underscore_idx
@@ -299,16 +305,23 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         user_agent.len()
     };
 
-    let server_kind = jid::Server::try_from(server).ok();
-    let domain_type = match server_kind {
-        Some(jid::Server::Pn) => 0,
-        Some(jid::Server::Lid) => 1,
-        Some(jid::Server::Hosted) => 128,
-        Some(jid::Server::HostedLid) => 129,
-        _ => 0,
-    };
+    let server_kind = jid::Server::parse_known(server);
+    // A dotted agent is inert on the phone and hosted namespaces, so a parsed
+    // `Jid` drops it from the rendered form (`renders_agent`). Drop it here too,
+    // or the two public attribute paths address different users: `read_jid_pair`
+    // takes the user verbatim and never reads a `.2` back as an agent. `@lid`
+    // is excluded because a dot there is part of the user, and the servers that
+    // do render an agent keep it for the same reason -- it is theirs.
+    if matches!(
+        server_kind,
+        Some(jid::Server::Pn | jid::Server::Hosted | jid::Server::HostedLid)
+    ) && let Some(dot_idx) = user_agent[..user_end].rfind('.')
+        && user_agent[dot_idx + 1..user_end].parse::<u8>().is_ok()
+    {
+        user_end = dot_idx;
+    }
 
-    // Single source of truth: only servers whose `domain_type` the decoder
+    // Single source of truth: only servers whose domain byte the decoder
     // round-trips back can use AD_JID. For everyone else drop the device
     // and fall through to JID_PAIR (which preserves the server name).
     let device = server_kind
@@ -316,9 +329,9 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         .and(device);
 
     Some(ParsedJidMeta {
+        server: server_kind,
         user_end: u8::try_from(user_end).ok()?,
         server_start: u8::try_from(server_start).ok()?,
-        domain_type,
         device,
     })
 }
@@ -339,11 +352,12 @@ fn split_jid_from_meta(input: &str, meta: ParsedJidMeta) -> (&str, &str) {
 ///   128 = hosted
 ///   129 = hosted.lid
 ///
-/// WARNING: This must stay in sync with the string-path mapping in
-/// `classify_string_hint` / `parse_jid_meta` and the inverse mapping in
-/// `decoder.rs read_ad_jid`. Writing `jid.agent` unconditionally here
-/// (instead of only as a fallback) was the root cause of a regression
-/// where LID group messages were silently rejected by the server (error 421).
+/// WARNING: This must stay in sync with the inverse mapping in
+/// `decoder.rs read_ad_jid`. The string path no longer keeps its own copy of
+/// this mapping — `ParsedJidMeta::domain_type` calls this. Writing `jid.agent`
+/// unconditionally here (instead of only as a fallback) was the root cause of a
+/// regression where LID group messages were silently rejected by the server
+/// (error 421).
 #[inline]
 fn server_to_domain_type(server: jid::Server) -> u8 {
     match server {
@@ -353,6 +367,23 @@ fn server_to_domain_type(server: jid::Server) -> u8 {
         jid::Server::HostedLid => 129,
         _ => 0,
     }
+}
+
+/// Whether this JID needs the dedicated `INTEROP_JID` token to survive the
+/// round-trip.
+///
+/// An interop JID carries an `integrator` that no other wire form has a field
+/// for: `JID_PAIR` writes only user and server, so encoding one that way silently
+/// drops it. WA Web has a matching branch (`WA/Wap.js`, the `JID_INTEROP` arm of
+/// its JID writer) and its decoder reads the field back, as does ours.
+///
+/// Restricted to a non-zero integrator on purpose. An interop JID without one
+/// loses nothing through `JID_PAIR`, and that is the form we have always sent —
+/// this fixes the case that was lossy without changing the bytes for the case
+/// that was not.
+#[inline]
+fn needs_interop_jid(server: jid::Server, integrator: u16) -> bool {
+    server == jid::Server::Interop && integrator != 0
 }
 
 /// AD_JID round-trips back to a server via `domain_type` only for the four
@@ -488,7 +519,7 @@ fn node_ref_encoded_size_with_cache(node: &NodeRef<'_>, hints: &mut StringHintCa
         };
     }
 
-    size += match node.content.as_deref() {
+    size += match node.content.as_ref() {
         Some(NodeContentRef::String(s)) => string_encoded_size_with_cache(s, hints),
         Some(NodeContentRef::Bytes(b)) => bytes_with_len_encoded_size(b.len()),
         Some(NodeContentRef::Nodes(nodes)) => {
@@ -531,7 +562,11 @@ fn parsed_jid_encoded_size_with_cache(
     meta: ParsedJidMeta,
     hints: &mut StringHintCache,
 ) -> usize {
-    let (user, server) = split_jid_from_meta(jid, meta);
+    let (user, raw_server) = split_jid_from_meta(jid, meta);
+    // The same canonicalisation `write_jid_from_meta` applies. Sizing the
+    // caller's substring while the writer emits the resolved spelling is not a
+    // bad estimate, it is an `UnexpectedEof` on the send.
+    let server = meta.server.map_or(raw_server, |s| s.as_str());
     if meta.device.is_some() {
         3 + string_encoded_size_with_cache(user, hints)
     } else {
@@ -544,32 +579,45 @@ fn parsed_jid_encoded_size_with_cache(
     }
 }
 
+/// Byte count for one encoded JID.
+///
+/// Must mirror `write_jid_ref`/`write_jid_owned` branch for branch: the exact
+/// marshal sizes its output slice from this and then writes into it, so a plan
+/// that disagrees with the writer is not a bad estimate — it is an
+/// `UnexpectedEof` on a send. Both JID flavours route through here so the two
+/// cannot drift apart.
+#[inline]
+fn jid_encoded_size_with_cache(
+    user: &str,
+    server: jid::Server,
+    device: u16,
+    integrator: u16,
+    hints: &mut StringHintCache,
+) -> usize {
+    if needs_interop_jid(server, integrator) {
+        // token + user + u16 device + u16 integrator; no server, see
+        // `write_interop_jid`.
+        return 1 + string_encoded_size_with_cache(user, hints) + 2 + 2;
+    }
+    if device > 0 && server_supports_ad_jid(server) {
+        return 3 + string_encoded_size_with_cache(user, hints);
+    }
+    let user_size = if user.is_empty() {
+        1
+    } else {
+        string_encoded_size_with_cache(user, hints)
+    };
+    1 + user_size + string_encoded_size_with_cache(server.as_str(), hints)
+}
+
 #[inline]
 fn owned_jid_encoded_size_with_cache(jid: &Jid, hints: &mut StringHintCache) -> usize {
-    if jid.device > 0 && server_supports_ad_jid(jid.server) {
-        3 + string_encoded_size_with_cache(&jid.user, hints)
-    } else {
-        let user_size = if jid.user.is_empty() {
-            1
-        } else {
-            string_encoded_size_with_cache(&jid.user, hints)
-        };
-        1 + user_size + string_encoded_size_with_cache(jid.server.as_str(), hints)
-    }
+    jid_encoded_size_with_cache(&jid.user, jid.server, jid.device, jid.integrator, hints)
 }
 
 #[inline]
 fn jid_ref_encoded_size_with_cache(jid: &JidRef<'_>, hints: &mut StringHintCache) -> usize {
-    if jid.device > 0 && server_supports_ad_jid(jid.server) {
-        3 + string_encoded_size_with_cache(&jid.user, hints)
-    } else {
-        let user_size = if jid.user.is_empty() {
-            1
-        } else {
-            string_encoded_size_with_cache(&jid.user, hints)
-        };
-        1 + user_size + string_encoded_size_with_cache(jid.server.as_str(), hints)
-    }
+    jid_encoded_size_with_cache(&jid.user, jid.server, jid.device, jid.integrator, hints)
 }
 
 #[inline]
@@ -605,39 +653,38 @@ impl<W: Write> Encoder<'static, IoByteWriter<W>> {
             writer: IoByteWriter::new(writer),
             string_hints: None,
         };
-        enc.write_u8(0)?;
+        enc.write_u8(crate::util::FORMAT_PLAIN)?;
         Ok(enc)
     }
 }
 
 impl<'v> Encoder<'static, VecByteWriter<'v>> {
     pub fn new_vec(buffer: &'v mut Vec<u8>) -> Result<Self> {
-        buffer.clear();
-        let mut enc = Self {
-            writer: VecByteWriter::new(buffer),
-            string_hints: None,
-        };
-        enc.write_u8(0)?;
-        Ok(enc)
+        Self::new_vec_with_hints(buffer, None)
     }
 }
 
-impl<'a> Encoder<'a, SliceByteWriter<'a>> {
-    pub(crate) fn new_slice(
-        buffer: &'a mut [u8],
+impl<'a, 'v> Encoder<'a, VecByteWriter<'v>> {
+    /// Append into `buffer`, replaying a plan's string hints.
+    ///
+    /// The exact-size marshallers reach for this rather than writing into a
+    /// pre-sized `&mut [u8]` so their output buffer can be reserved instead of
+    /// zero-filled: a `Vec` only ever grown by writes needs no initial value
+    /// for the bytes the encoder is about to overwrite, while a slice has to
+    /// be fully initialized before the encoder can borrow it. The exact-size
+    /// invariant is enforced the same way either side, by comparing the
+    /// written length against the plan.
+    pub(crate) fn new_vec_with_hints(
+        buffer: &'v mut Vec<u8>,
         string_hints: Option<&'a StringHintCache>,
     ) -> Result<Self> {
+        buffer.clear();
         let mut enc = Self {
-            writer: SliceByteWriter::new(buffer),
+            writer: VecByteWriter::new(buffer),
             string_hints,
         };
-        enc.write_u8(0)?;
+        enc.write_u8(crate::util::FORMAT_PLAIN)?;
         Ok(enc)
-    }
-
-    #[inline]
-    pub(crate) fn bytes_written(&self) -> usize {
-        self.writer.bytes_written()
     }
 }
 
@@ -740,10 +787,11 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
 
     #[inline(always)]
     fn write_jid_from_meta(&mut self, jid: &str, meta: ParsedJidMeta) -> Result<()> {
-        let (user, server) = split_jid_from_meta(jid, meta);
+        let (user, raw_server) = split_jid_from_meta(jid, meta);
+        let server = meta.server.map_or(raw_server, |s| s.as_str());
         if let Some(device) = meta.device {
             self.write_u8(token::AD_JID)?;
-            self.write_u8(meta.domain_type)?;
+            self.write_u8(meta.domain_type())?;
             self.write_u8(device)?;
             self.write_string(user)?;
         } else {
@@ -760,7 +808,33 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
 
     /// Write a JidRef directly without converting to string first.
     /// This avoids the allocation that would occur with `jid.to_string()`.
+    /// `INTEROP_JID`: token, user, `u16` device, `u16` integrator — and no server.
+    ///
+    /// Mirrors WA Web's outbound writer (`WA/Wap.js`, the `JID_INTEROP` arm):
+    /// `writeUint8(S), te(user), writeUint16(device), writeUint16(integrator)`.
+    ///
+    /// Its inbound decoder reads a fourth value after those — the server — and so
+    /// does ours. That asymmetry is deliberate here rather than a bug being
+    /// copied: the fourth read describes what the *server sends us*, not what it
+    /// accepts from us, and the writer above is what actually runs against the
+    /// real server. Emitting a server the server does not expect would not merely
+    /// mis-parse the JID: the extra token would be read as the next value in the
+    /// stanza, desynchronising everything after it.
+    ///
+    /// The consequence is that this output does not round-trip through our own
+    /// `read_interop_jid`. That is a property of the protocol's two directions,
+    /// not a defect to fix by making both ends agree locally.
+    fn write_interop_jid(&mut self, user: &str, device: u16, integrator: u16) -> Result<()> {
+        self.write_u8(token::INTEROP_JID)?;
+        self.write_string(user)?;
+        self.write_u16_be(device)?;
+        self.write_u16_be(integrator)
+    }
+
     pub fn write_jid_ref(&mut self, jid: &JidRef<'_>) -> Result<()> {
+        if needs_interop_jid(jid.server, jid.integrator) {
+            return self.write_interop_jid(&jid.user, jid.device, jid.integrator);
+        }
         if jid.device > 0 && server_supports_ad_jid(jid.server) {
             // AD_JID format: domain_type, device, user
             let device = u8::try_from(jid.device).map_err(|_| {
@@ -786,6 +860,9 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
     /// Write an owned Jid directly without converting to string first.
     /// This avoids the allocation that would occur with `jid.to_string()`.
     pub fn write_jid_owned(&mut self, jid: &Jid) -> Result<()> {
+        if needs_interop_jid(jid.server, jid.integrator) {
+            return self.write_interop_jid(&jid.user, jid.device, jid.integrator);
+        }
         if jid.device > 0 && server_supports_ad_jid(jid.server) {
             // AD_JID format: domain_type, device, user
             let device = u8::try_from(jid.device).map_err(|_| {
@@ -808,32 +885,6 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         Ok(())
     }
 
-    #[inline(always)]
-    fn pack_nibble(value: u8) -> u8 {
-        match value {
-            b'-' => 10,
-            b'.' => 11,
-            0 => 15,
-            c if c.is_ascii_digit() => c - b'0',
-            _ => panic!("Invalid char for nibble packing: {value}"),
-        }
-    }
-
-    #[inline(always)]
-    fn pack_hex(value: u8) -> u8 {
-        match value {
-            c if c.is_ascii_digit() => c - b'0',
-            c if (b'A'..=b'F').contains(&c) => 10 + (c - b'A'),
-            0 => 15,
-            _ => panic!("Invalid char for hex packing: {value}"),
-        }
-    }
-
-    #[inline(always)]
-    fn pack_byte_pair(packer: fn(u8) -> u8, part1: u8, part2: u8) -> u8 {
-        (packer(part1) << 4) | packer(part2)
-    }
-
     fn write_packed_bytes(&mut self, value: &str, data_type: u8) -> Result<()> {
         if value.len() > token::PACKED_MAX as usize {
             panic!("String too long to be packed: {}", value.len());
@@ -847,67 +898,49 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         }
         self.write_u8(rounded_len)?;
 
-        #[allow(unused_mut)]
-        let mut input_bytes = value.as_bytes();
-
-        if data_type == token::NIBBLE_8 {
-            #[cfg(feature = "simd")]
-            {
-                const NIBBLE_LOOKUP: [u8; 16] =
-                    [10, 11, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, 255, 255];
-                let lookup = Simd::from_array(NIBBLE_LOOKUP);
-                let nibble_base = Simd::splat(b'-');
-
-                while input_bytes.len() >= 16 {
-                    let (chunk, rest) = input_bytes.split_at(16);
-                    let input = u8x16::from_slice(chunk);
-                    let indices = input.saturating_sub(nibble_base);
-                    let nibbles = lookup.swizzle_dyn(indices);
-
-                    let (evens, odds) = nibbles.deinterleave(nibbles.rotate_elements_left::<1>());
-                    let packed: Simd<u8, 16> = (evens << Simd::splat(4)) | odds;
-                    let packed_bytes = packed.to_array();
-                    self.write_raw_bytes(&packed_bytes[..8])?;
-
-                    input_bytes = rest;
-                }
-            }
-
-            let mut bytes_iter = input_bytes.iter().copied();
-            while let Some(part1) = bytes_iter.next() {
-                let part2 = bytes_iter.next().unwrap_or(0);
-                self.write_u8(Self::pack_byte_pair(Self::pack_nibble, part1, part2))?;
-            }
+        let input_bytes = value.as_bytes();
+        let table = if data_type == token::NIBBLE_8 {
+            &NIBBLE_ENC
         } else {
-            #[cfg(feature = "simd")]
-            {
-                let ascii_0 = Simd::splat(b'0');
-                let ascii_a = Simd::splat(b'A');
-                let ten = Simd::splat(10);
+            &HEX_ENC
+        };
 
-                while input_bytes.len() >= 16 {
-                    let (chunk, rest) = input_bytes.split_at(16);
-                    let input = u8x16::from_slice(chunk);
+        // Whole pairs first, so the common even-length case carries no
+        // per-iteration "is there a second half" branch. `PACKED_MAX` is 127,
+        // so the buffer covers any string that reaches here.
+        let mut packed = [0u8; 64];
+        let (pairs, tail) = input_bytes.as_chunks::<2>();
 
-                    let digit_vals = input - ascii_0;
-                    let letter_vals = input - ascii_a + ten;
-                    let is_letter = input.simd_ge(ascii_a);
-                    let nibbles = is_letter.select(letter_vals, digit_vals);
+        // The validity test is an OR accumulator checked once below, not a
+        // branch per pair. Legal table entries are 0..=15 and `PACK_INVALID`
+        // is 0xFF, so a set high nibble in `seen` means some character was
+        // rejected. Keeping the branch out is what lets LLVM unroll this.
+        let mut seen = 0u8;
+        for (slot, pair) in packed.iter_mut().zip(pairs) {
+            let hi = table[pair[0] as usize];
+            let lo = table[pair[1] as usize];
+            seen |= hi | lo;
+            *slot = (hi << 4) | lo;
+        }
 
-                    let (evens, odds) = nibbles.deinterleave(nibbles.rotate_elements_left::<1>());
-                    let packed: Simd<u8, 16> = (evens << Simd::splat(4)) | odds;
-                    let packed_bytes = packed.to_array();
-                    self.write_raw_bytes(&packed_bytes[..8])?;
+        // Odd length: the low nibble is the 0 pad, which both tables map to 15.
+        let odd = if let [last] = tail {
+            let hi = table[*last as usize];
+            let lo = table[0];
+            seen |= hi | lo;
+            Some((hi << 4) | lo)
+        } else {
+            None
+        };
 
-                    input_bytes = rest;
-                }
-            }
+        // Checked before anything reaches the writer. `validate_hex` and
+        // `validate_nibble` gate every caller, so this is the same unreachable
+        // case the `match` ladders this replaced used to panic on.
+        assert!(seen & 0xF0 == 0, "invalid char for packing");
 
-            let mut bytes_iter = input_bytes.iter().copied();
-            while let Some(part1) = bytes_iter.next() {
-                let part2 = bytes_iter.next().unwrap_or(0);
-                self.write_u8(Self::pack_byte_pair(Self::pack_hex, part1, part2))?;
-            }
+        self.write_raw_bytes(&packed[..pairs.len()])?;
+        if let Some(byte) = odd {
+            self.write_u8(byte)?;
         }
         Ok(())
     }
@@ -947,7 +980,162 @@ mod tests {
     use crate::node::Attrs;
     use std::io::Cursor;
 
-    type TestResult = crate::error::Result<()>;
+    type TestResult = Result<()>;
+
+    /// The `match` ladders `HEX_ENC`/`NIBBLE_ENC` replaced, kept here as the
+    /// specification they are checked against. `None` is the case the old code
+    /// panicked on and the tables mark with `PACK_INVALID`.
+    fn reference_hex(value: u8) -> Option<u8> {
+        match value {
+            c if c.is_ascii_digit() => Some(c - b'0'),
+            c if (b'A'..=b'F').contains(&c) => Some(10 + (c - b'A')),
+            0 => Some(15),
+            _ => None,
+        }
+    }
+
+    fn reference_nibble(value: u8) -> Option<u8> {
+        match value {
+            b'-' => Some(10),
+            b'.' => Some(11),
+            0 => Some(15),
+            c if c.is_ascii_digit() => Some(c - b'0'),
+            _ => None,
+        }
+    }
+
+    /// Exhaustive over the byte domain, so the tables cannot drift from the
+    /// ladders they were derived from: same accepted set, same nibble for
+    /// every accepted byte, same rejected set.
+    #[test]
+    fn encode_tables_match_the_ladders_they_replaced() {
+        for byte in 0u8..=255 {
+            let i = byte as usize;
+            assert_eq!(
+                reference_hex(byte),
+                (HEX_ENC[i] != PACK_INVALID).then_some(HEX_ENC[i]),
+                "hex table disagrees at {byte:#04x}"
+            );
+            assert_eq!(
+                reference_nibble(byte),
+                (NIBBLE_ENC[i] != PACK_INVALID).then_some(NIBBLE_ENC[i]),
+                "nibble table disagrees at {byte:#04x}"
+            );
+        }
+    }
+
+    /// The hint tape holds one `StringHint` per string in the payload, so its
+    /// width is multiplied by every tag, attribute key, attribute value and
+    /// string content of the node: a 2048-child stanza records ~12k hints, and
+    /// one byte added here is 16 KiB of peak allocation once the `SmallVec`
+    /// rounds up. Adding a field that duplicates something already derivable
+    /// (the AD_JID domain byte, from the resolved server) cost exactly that
+    /// before it was derived instead. Pinned so the next field has to justify
+    /// itself. Budget: at most five bytes per string on the tape, so a
+    /// repack that shrinks an entry is fine and only growth fails.
+    /// Rebaseline per
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
+    #[test]
+    fn the_hint_tape_stays_five_bytes_wide() {
+        assert!(
+            size_of::<StringHint>() <= 5,
+            "StringHint got wider than 5 B (now {} B); the tape is one per string, so this is \
+             peak memory times every string in the payload",
+            size_of::<StringHint>()
+        );
+        assert!(
+            size_of::<ParsedJidMeta>() <= 5,
+            "ParsedJidMeta got wider than 5 B (now {} B)",
+            size_of::<ParsedJidMeta>()
+        );
+    }
+
+    /// The legacy spelling must not reach the wire by any encoding path, not
+    /// just the message send. `write_jid_owned`/`write_jid_ref` write
+    /// `server.as_str()` for a JID_PAIR with no guard, and `c.us` is not in the
+    /// token dictionary (`s.whatsapp.net` is), so emitting it would put a raw
+    /// string on the wire where WA Web sends a token -- and a server spelling
+    /// WA Web never sends at all, since its whole JID layer (`WAJids`) knows
+    /// only `s.whatsapp.net`. There is no guard because there is nothing left
+    /// to guard against: no `Server` renders it. This holds the bytes to that.
+    #[test]
+    fn the_legacy_spelling_never_reaches_the_wire() -> TestResult {
+        use crate::jid::{Jid, parse_jid_ref};
+
+        fn encode(jid: &Jid) -> Result<Vec<u8>> {
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_jid_owned(jid)?;
+            Ok(buffer)
+        }
+
+        for (raw, modern) in [
+            ("5511999998888@c.us", "5511999998888@s.whatsapp.net"),
+            // AD_JID form: same domain byte, so the bytes match there too.
+            ("5511999998888:3@c.us", "5511999998888:3@s.whatsapp.net"),
+            // A dotted agent is inert on a phone user and encodes nothing.
+            ("5511999998888.2@c.us", "5511999998888@s.whatsapp.net"),
+        ] {
+            let legacy: Jid = raw.parse().unwrap();
+            let modern: Jid = modern.parse().unwrap();
+            let bytes = encode(&legacy)?;
+            assert_eq!(bytes, encode(&modern)?, "{raw} must encode as {modern}");
+            assert!(
+                !bytes.windows(4).any(|w| w == b"c.us"),
+                "{raw} put the legacy spelling on the wire: {bytes:?}"
+            );
+
+            // The string path: a caller that hands a JID as a node attribute
+            // (`.attr("to", "…@c.us")`) never builds a `Jid`, and the JID_PAIR
+            // branch there writes the server substring straight out of the
+            // input.
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_string(raw)?;
+            assert!(
+                !buffer.windows(4).any(|w| w == b"c.us"),
+                "the string path leaked the legacy spelling of {raw}: {buffer:?}"
+            );
+
+            // A dotted agent in a string attribute must drop out the same way
+            // it does for a parsed `Jid`, or the two public paths address
+            // different users: `read_jid_pair` reads the user verbatim and
+            // never parses a `.2` back into an agent.
+            let dotted = format!("{}.2@c.us", legacy.user);
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_string(&dotted)?;
+            assert_eq!(
+                buffer,
+                encode(&modern.to_non_ad())?,
+                "{dotted} must encode as the bare user, like the parsed Jid does"
+            );
+
+            // Plan and write must agree on the canonical spelling too: the
+            // exact marshal sizes its buffer from the estimator and then writes
+            // into it, so a mismatch is an `UnexpectedEof`, not a loose bound.
+            let node = NodeBuilder::new("message").attr("to", raw).build();
+            let exact = crate::marshal::marshal_exact(&node)?;
+            assert_eq!(
+                exact,
+                crate::marshal::marshal(&node)?,
+                "plan and writer disagree for {raw}"
+            );
+            assert!(
+                !exact.windows(4).any(|w| w == b"c.us"),
+                "a string-valued attribute leaked the legacy spelling of {raw}"
+            );
+
+            // The borrowed writer is a separate copy of the same branch.
+            let rendered = legacy.to_string();
+            let borrowed = parse_jid_ref(&rendered).unwrap();
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_jid_ref(&borrowed)?;
+            assert_eq!(buffer, bytes);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_encode_node() -> TestResult {
@@ -1641,6 +1829,38 @@ mod tests {
             .get("from")
             .expect("from attr must survive the round-trip");
         assert_eq!(from.to_string(), "12345@call");
+        Ok(())
+    }
+
+    /// The AD form spends a single byte on the device, so a PN/LID device past
+    /// 255 has nowhere to go and the encoder says so instead of truncating it
+    /// into a different device. Interop carries its own `u16` device field and
+    /// is unaffected, which is why the limit cannot live on `Jid` itself.
+    #[test]
+    fn ad_jid_device_is_one_byte_wide_unlike_interop() -> TestResult {
+        let encode = |jid: Jid| -> Result<()> {
+            let node = NodeBuilder::new("msg").attr("from", jid).build();
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_node(&node)
+        };
+
+        encode(Jid::pn_device("5511987650001", 255)).expect("255 is the widest AD device");
+        let err = encode(Jid::pn_device("5511987650001", 256))
+            .expect_err("256 does not fit the AD device byte");
+        assert!(
+            err.to_string().contains("out of range"),
+            "the error must name the device, got {err}"
+        );
+
+        let interop = Jid {
+            user: "5511987650001".into(),
+            server: jid::Server::Interop,
+            agent: 0,
+            device: 65535,
+            integrator: 7,
+        };
+        encode(interop).expect("interop spends a full u16 on the device");
         Ok(())
     }
 

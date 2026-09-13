@@ -42,6 +42,24 @@ pub(crate) struct RangeDecoder<'a> {
 }
 
 impl<'a> RangeDecoder<'a> {
+    /// ec_dec words after the buffer pointer, for comparison with guest snapshots.
+    #[cfg(test)]
+    pub(crate) fn oracle_state(&self) -> [u32; 11] {
+        [
+            self.storage,
+            self.end_offs,
+            self.end_window,
+            self.nend_bits as u32,
+            self.nbits_total as u32,
+            self.offs,
+            self.rng,
+            self.val,
+            self.ext,
+            self.rem as u32,
+            self.err as u32,
+        ]
+    }
+
     /// RFC 6716 `ec_dec_init`.
     pub(crate) fn new(buf: &'a [u8]) -> Self {
         let mut d = RangeDecoder {
@@ -337,6 +355,13 @@ impl<'a> RangeDecoder<'a> {
     pub(crate) fn tell(&self) -> i32 {
         self.nbits_total - ilog(self.rng)
     }
+
+    /// Bytes the payload actually holds. Paired with [`tell`] this is how a caller checks that a
+    /// stream ended where it claimed to: reads past either end silently return zero here, so an
+    /// impossible length is only visible by comparing the two.
+    pub(crate) fn storage(&self) -> u32 {
+        self.storage
+    }
 }
 
 /// Opus/CELT range ENCODER (`ec_enc`), the exact inverse of `RangeDecoder`, used by the mlow
@@ -629,7 +654,7 @@ mod tests {
     use serde_json::Value;
 
     fn vectors() -> Value {
-        serde_json::from_str(include_str!("testdata/rc_vectors.json"))
+        crate::voip::mlow::fixture::decode(include_bytes!("testdata/rc_vectors.cbor.zst"))
             .expect("rc_vectors.json must parse")
     }
 

@@ -52,10 +52,26 @@ mod imp {
     pub fn retry_refused() {
         counter!("wa_retry_refused_total").increment(1);
     }
+    /// Failed attempts to obtain key material for one device, by reason
+    /// (`no_bundle`/`session_setup`/`session_lookup`/`rejected_406`/
+    /// `refused_batch`/`fetch_failed`/`encrypt`/...). Each one is a recipient
+    /// that gets nothing — usually while the send carries on to everyone else,
+    /// and also when the failure aborts the send outright. This is the rate to
+    /// watch after a session-repair change.
+    pub fn unkeyable_device(reason: &'static str, count: u64) {
+        counter!("wa_unkeyable_device_total", "reason" => reason).increment(count);
+    }
     /// Base-key collision that forced a fresh session (same base key after a
     /// re-key, so the session was deleted and recreated).
     pub fn base_key_collision() {
         counter!("wa_base_key_collision_total").increment(1);
+    }
+    /// A stored Signal session blob could not be decoded and was reported as
+    /// absent so the no-session recovery can replace it. Steady state is zero:
+    /// a non-zero rate means rows are being written in a shape this build
+    /// cannot read back.
+    pub fn session_record_quarantined() {
+        counter!("wa_session_record_quarantined_total").increment(1);
     }
     /// IQ request completed, by result (`ok`/`timeout`/`error`). Emitted at the
     /// single request chokepoint, so it covers both raw and spec-based IQs.
@@ -146,9 +162,19 @@ mod imp {
             "Retries refused at the MAX_RETRY loop guard"
         );
         describe_counter!(
+            "wa_unkeyable_device_total",
+            Unit::Count,
+            "Failed device keying attempts, by reason"
+        );
+        describe_counter!(
             "wa_base_key_collision_total",
             Unit::Count,
             "Base-key collisions that forced a fresh session"
+        );
+        describe_counter!(
+            "wa_session_record_quarantined_total",
+            Unit::Count,
+            "Undecodable session rows reported as absent for recovery"
         );
         describe_counter!(
             "wa_iq_total",
@@ -226,7 +252,11 @@ mod imp {
     #[inline]
     pub fn retry_refused() {}
     #[inline]
+    pub fn unkeyable_device(_reason: &'static str, _count: u64) {}
+    #[inline]
     pub fn base_key_collision() {}
+    #[inline]
+    pub fn session_record_quarantined() {}
     #[inline]
     pub fn iq(_result: &'static str) {}
     #[inline]

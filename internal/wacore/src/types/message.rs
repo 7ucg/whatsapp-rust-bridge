@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wacore_binary::{Jid, JidExt, MessageId, MessageServerId};
-use waproto::whatsapp as wa;
+use wacore_binary::{CompactString, Jid, JidExt, MessageId, MessageServerId};
 
 use crate::WireEnum;
+use smallvec::SmallVec;
 
 /// Identifies a specific message within a chat.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -15,6 +15,26 @@ pub struct ChatMessageId {
 impl ChatMessageId {
     pub fn new(chat: Jid, id: MessageId) -> Self {
         Self { chat, id }
+    }
+}
+
+/// Identifies a message *and who sent it*.
+///
+/// Message ids come from the sending client and are not unique across senders,
+/// so `(chat, id)` names a message only when the sender is already known from
+/// context. WA Web says the same in `MsgKey`, which serializes as
+/// `[fromMe, remote, id, participant]`: two participants of one group using the
+/// same id are two messages, and folding them into one drops the second.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SenderMessageId {
+    pub chat: Jid,
+    pub id: MessageId,
+    pub sender: Jid,
+}
+
+impl SenderMessageId {
+    pub fn new(chat: Jid, id: MessageId, sender: Jid) -> Self {
+        Self { chat, id, sender }
     }
 }
 
@@ -45,6 +65,50 @@ pub enum PushPriority {
     High,
     #[wire = "high_force"]
     HighForce,
+}
+
+// The wire vocabulary these three enums carry is generated from the whatspec
+// enum catalog, so a variant added upstream arrives on the next sync instead of
+// being noticed by hand. Re-exported here because this is where the types that
+// use them live, and moving the path would break consumers for no gain.
+pub use crate::types::wire_enums::{EncMediaType, PollType, StanzaMessageType};
+
+/// Whether an envelope's declared type agrees with the server's request to
+/// hide decryption failures for it.
+///
+/// WhatsApp Web crosses `decrypt-fail="hide"` on any `<enc>` with the
+/// envelope's `type` and refuses to nack a stanza whose combination it calls
+/// incoherent. The two legs are different lists: with hiding requested only a
+/// reaction or a poll vote qualifies, without it the four content types do.
+/// `pay` and `event` fall outside both.
+///
+/// This answers the question and nothing more. It drives no decision in this
+/// client: what gets acknowledged, retried or nacked is unchanged by it, and a
+/// caller that wants the official gate has to apply it itself.
+///
+/// An absent or [`Unknown`](StanzaMessageType::Unknown) type is never coherent,
+/// because neither leg's list can contain it.
+pub fn envelope_is_coherent(
+    stanza_type: Option<&StanzaMessageType>,
+    poll_type: Option<PollType>,
+    decrypt_fail_mode: crate::types::events::DecryptFailMode,
+) -> bool {
+    let Some(stanza_type) = stanza_type else {
+        return false;
+    };
+    match decrypt_fail_mode {
+        crate::types::events::DecryptFailMode::Hide => matches!(
+            (stanza_type, poll_type),
+            (StanzaMessageType::Reaction, _) | (StanzaMessageType::Poll, Some(PollType::Vote))
+        ),
+        crate::types::events::DecryptFailMode::Show => matches!(
+            stanza_type,
+            StanzaMessageType::Text
+                | StanzaMessageType::Media
+                | StanzaMessageType::MediaNotify
+                | StanzaMessageType::Poll
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -119,10 +183,6 @@ pub struct MessageSource {
 }
 
 impl MessageSource {
-    pub fn is_incoming_broadcast(&self) -> bool {
-        (!self.is_from_me || self.broadcast_list_owner.is_some()) && self.chat.is_broadcast_list()
-    }
-
     /// Our own outgoing DM to a user or bot, echoed back to this device
     /// (`is_from_me` with a `recipient`). The server's offline queue only
     /// releases these on a `<receipt type="sender">`, so they must not be
@@ -272,10 +332,19 @@ pub struct MsgBotInfo {
     pub edit_sender_timestamp_ms: Option<DateTime<Utc>>,
 }
 
+/// The `<reporting>` payloads: a 16 or 20 byte tag, a 16 byte token. Both fit
+/// inline, so a message that carries reporting data does not pay a heap
+/// allocation per payload for bytes this client only stores and hands back.
+pub type ReportingBytes = SmallVec<[u8; 20]>;
+
+/// The short `<meta>` attributes are `CompactString`: a message id is 22 wire
+/// characters and the rest are short keywords ("add_on", "default"), so all of
+/// them live in the 24 inline bytes and parsing a `<meta>` child allocates
+/// nothing for them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MsgMetaInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_id: Option<MessageId>,
+    pub target_id: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_sender: Option<Jid>,
     /// `<meta target_chat_jid="…">` — present when the bot reply addresses a
@@ -283,27 +352,38 @@ pub struct MsgMetaInfo {
     /// lookup; see WA Web `decryptMsmsgBotMessage`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_chat: Option<Jid>,
+    /// `<meta thread_msg_id="…">`: the message this one threads under, for a
+    /// stanza the server routes into an existing thread.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deprecated_lid_session: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread_message_id: Option<MessageId>,
+    pub thread_message_id: Option<CompactString>,
+    /// `<meta thread_msg_sender_jid="…">`: who authored
+    /// [`thread_message_id`](Self::thread_message_id). Absent whenever that is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_message_sender_jid: Option<Jid>,
+    /// `<meta polltype="…">`: which stage of a poll's lifecycle the envelope
+    /// carries.
+    ///
+    /// Read only when the envelope declares [`StanzaMessageType::Poll`], so a
+    /// `<meta polltype>` on any other type is ignored rather than recorded. An
+    /// unrecognized value is `None`, indistinguishable from the attribute being
+    /// absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_type: Option<PollType>,
     /// `<meta content_type=...>` attr. Server marks reactions/edits as
     /// `"add_on"`; mirrors `WAWebHandleMsgParser` b()'s metadata read.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
+    pub content_type: Option<CompactString>,
     /// `<meta appdata=...>` attr. `"default"` is the only observed value.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub appdata: Option<String>,
+    pub appdata: Option<CompactString>,
     /// `<reporting><reporting_tag>` content bytes (16 or 20). Pre-requisite
     /// for the server-side report-abuse flow.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reporting_tag: Option<Vec<u8>>,
+    pub reporting_tag: Option<ReportingBytes>,
     /// `<reporting><reporting_token>` content bytes (16). Pre-requisite
     /// for the server-side report-abuse flow.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reporting_token: Option<Vec<u8>>,
+    pub reporting_token: Option<ReportingBytes>,
     /// `v` attr on `<reporting_token>`. WA Web defaults to 1 when missing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reporting_token_version: Option<i64>,
@@ -314,24 +394,53 @@ pub struct MessageInfo {
     pub source: MessageSource,
     pub id: MessageId,
     pub server_id: MessageServerId,
-    pub r#type: String,
-    pub push_name: String,
+    /// The envelope's `type` attribute. `None` when the stanza carried none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<StanzaMessageType>,
+    /// The sender's `notify` display name. Inline up to 24 bytes, which
+    /// covers most names, so a message does not allocate for it.
+    pub push_name: CompactString,
     #[serde(serialize_with = "chrono::serde::ts_seconds::serialize")]
     pub timestamp: DateTime<Utc>,
     pub category: MessageCategory,
     pub multicast: bool,
-    pub media_type: String,
+    /// The `mediatype` the stanza's `<enc>` nodes declared, aggregated to one
+    /// value per message.
+    ///
+    /// A fan-out stanza carries one `<enc>` per device and the attribute is a
+    /// property of the message, not of a device copy, so the first `<enc>` that
+    /// carries one wins in the order the client enumerates them: the direct
+    /// `<enc>` children first, then this device's under `<participants><to>`.
+    /// Divergent values across a fan-out are not reconciled and the later ones
+    /// are dropped; a consumer that needs per-node values reads them from
+    /// [`DecryptedPayload`](crate::types::events::DecryptedPayload).
+    ///
+    /// Those fan-out nodes are a wider source than WA Web's parser, which maps
+    /// only the direct `<enc>` children. The two agree on every stanza seen so
+    /// far, since the attribute describes the message and every device copy
+    /// repeats it, so the wider read only fills the field on a stanza whose
+    /// direct children carry nothing.
+    ///
+    /// `None` when no `<enc>` carried the attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<EncMediaType>,
     pub edit: EditAttribute,
+    /// The `<bot>` child. Boxed: most messages carry none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bot_info: Option<MsgBotInfo>,
-    pub meta_info: MsgMetaInfo,
+    pub bot_info: Option<Box<MsgBotInfo>>,
+    /// The `<meta>` and `<reporting>` children, `None` when the stanza carries
+    /// neither. Boxed: it is 280 bytes of mostly-absent fields, and every
+    /// `MessageInfo` is retained per message through the commit batch and
+    /// every consumer that keeps a message.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub verified_name: Option<wa::VerifiedNameCertificate>,
+    pub meta_info: Option<Box<MsgMetaInfo>>,
+    /// Decoded `<verified_name>` child cert of business senders; the display
+    /// name is in `.name`. Boxed: most messages carry none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_sent_meta: Option<DeviceSentMeta>,
-    /// Ephemeral duration in seconds, extracted from `contextInfo.expiration`.
+    pub verified_name: Option<Box<crate::stanza::business::VerifiedName>>,
+    /// Set on a self-fanout of an own outgoing message. Boxed: rare.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ephemeral_expiration: Option<u32>,
+    pub device_sent_meta: Option<Box<DeviceSentMeta>>,
     /// Whether this message was delivered during offline sync.
     pub is_offline: bool,
     /// Set when this message was recovered via PDO rather than normal decryption.
@@ -357,11 +466,6 @@ pub struct MessageInfo {
     /// goes to the right routing target).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_recipient_pn: Option<Jid>,
-    /// Parent post key when the dispatched message is a decrypted CAG channel
-    /// comment (`enc_comment_message`). The inner `Message` proto has no slot
-    /// for the threading link, so it surfaces here.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment_target: Option<wa::MessageKey>,
     /// Broadcast-contact-list recipients from `<participants><to jid>` on an
     /// incoming broadcast/status stanza. Populated only for broadcasts; used to
     /// validate a `deviceSentMessage.phash` (WA Web `validateBclHash`). Empty
@@ -370,7 +474,130 @@ pub struct MessageInfo {
     pub bcl_participants: Vec<Jid>,
 }
 
+impl crate::stats::HeapSize for MessageSource {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        self.chat.heap_bytes()
+            + self.sender.heap_bytes()
+            + [
+                &self.sender_alt,
+                &self.recipient_alt,
+                &self.broadcast_list_owner,
+                &self.recipient,
+            ]
+            .iter()
+            .filter_map(|jid| jid.as_ref())
+            .map(HeapSize::heap_bytes)
+            .sum::<usize>()
+    }
+}
+
+impl crate::stats::HeapSize for MsgBotInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        self.edit_target_id.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
+}
+
+impl crate::stats::HeapSize for MsgMetaInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        let spilled = |bytes: &Option<ReportingBytes>| {
+            bytes
+                .as_ref()
+                .filter(|b| b.spilled())
+                .map_or(0, |b| b.capacity())
+        };
+        [
+            &self.target_id,
+            &self.thread_message_id,
+            &self.content_type,
+            &self.appdata,
+        ]
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .map(HeapSize::heap_bytes)
+        .sum::<usize>()
+            + [
+                &self.target_sender,
+                &self.target_chat,
+                &self.thread_message_sender_jid,
+            ]
+            .iter()
+            .filter_map(|jid| jid.as_ref())
+            .map(HeapSize::heap_bytes)
+            .sum::<usize>()
+            + spilled(&self.reporting_tag)
+            + spilled(&self.reporting_token)
+    }
+}
+
+impl crate::stats::HeapSize for DeviceSentMeta {
+    fn heap_bytes(&self) -> usize {
+        self.destination_jid.heap_bytes() + self.phash.heap_bytes()
+    }
+}
+
+/// Every allocation the message owns, the boxed sub-structs and the fallback
+/// enum payloads included. All of them are absent on the overwhelming majority
+/// of messages, but a buffer that retains whole messages
+/// (`offline_receipt_buffer`) is exactly where a report that skipped them would
+/// read quietest while it grows.
+impl crate::stats::HeapSize for MessageInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        fn boxed<T: HeapSize>(value: &Option<Box<T>>) -> usize {
+            value
+                .as_ref()
+                .map_or(0, |v| size_of::<T>() + v.heap_bytes())
+        }
+        self.source.heap_bytes()
+            + self.id.heap_bytes()
+            + self.push_name.heap_bytes()
+            + match &self.category {
+                MessageCategory::Other(value) => value.heap_bytes(),
+                _ => 0,
+            }
+            + match &self.edit {
+                EditAttribute::Unknown(value) => value.heap_bytes(),
+                _ => 0,
+            }
+            + boxed(&self.bot_info)
+            + boxed(&self.meta_info)
+            + boxed(&self.verified_name)
+            + boxed(&self.device_sent_meta)
+            + self
+                .unavailable_request_id
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.verified_level.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self
+                .peer_recipient_pn
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.bcl_participants.capacity() * size_of::<Jid>()
+            + self
+                .bcl_participants
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+    }
+}
+
+/// What [`MessageInfo::meta`] hands out for a stanza that carried no `<meta>`
+/// or `<reporting>` child: every field `None`, shared by every such message.
+static EMPTY_META: std::sync::LazyLock<MsgMetaInfo> =
+    std::sync::LazyLock::new(MsgMetaInfo::default);
+
 impl MessageInfo {
+    /// The `<meta>` and `<reporting>` data, or an all-`None` one when the
+    /// stanza carried neither. Readers that only look at a field go through
+    /// here; [`meta_info`](Self::meta_info) itself is `None` in that case so
+    /// the common message does not allocate it.
+    pub fn meta(&self) -> &MsgMetaInfo {
+        self.meta_info.as_deref().unwrap_or(&EMPTY_META)
+    }
+
     /// WA Web: expired status messages (>24h) are silently dropped — no retry receipts,
     /// no undecryptable events. Matches `WAWebMsgProcessingDecryptionHandler.E()`.
     pub fn is_expired_status(&self) -> bool {
@@ -384,11 +611,85 @@ mod tests {
     use super::*;
     use buffa::MessageField;
 
+    /// The stanza parser reads `edit` as a borrowed attribute and parses it
+    /// directly. That is only safe while the borrowed and owned constructors
+    /// agree on every input, including the `Unknown` fallback that is the one
+    /// case actually needing an allocation.
+    #[test]
+    fn edit_attribute_parses_identically_from_borrowed_and_owned() {
+        for wire in ["", "1", "2", "3", "7", "8", "0", "99", "revogação", " 7"] {
+            assert_eq!(
+                EditAttribute::from(wire),
+                EditAttribute::from(wire.to_owned()),
+                "mismatch for {wire:?}"
+            );
+        }
+        assert_eq!(EditAttribute::from("7"), EditAttribute::SenderRevoke);
+        // An unrecognized value must keep its exact wire bytes so the resend
+        // path can echo them back verbatim.
+        assert_eq!(
+            EditAttribute::from("99"),
+            EditAttribute::Unknown("99".to_owned())
+        );
+    }
+
+    /// The fallback enum payloads and the boxed sub-structs are the only places
+    /// a `MessageInfo` can hold an allocation the report would otherwise miss.
+    #[test]
+    fn message_info_heap_bytes_counts_the_fallback_strings_and_boxed_metadata() {
+        use crate::stanza::business::VerifiedName;
+        use crate::stats::HeapSize;
+
+        let baseline = MessageInfo::default().heap_bytes();
+
+        let category = "some-category";
+        let edit = "99";
+        let business = "Fictitious Business";
+        let certificate = vec![0u8; 64];
+        let target_id = "a-target-id-longer-than-twenty-four-bytes";
+        let destination = "19045550180@s.whatsapp.net";
+
+        let mut info = MessageInfo {
+            category: MessageCategory::Other(category.to_owned()),
+            edit: EditAttribute::Unknown(edit.to_owned()),
+            ..Default::default()
+        };
+        info.verified_name = Some(Box::new(VerifiedName {
+            name: Some(business.to_owned()),
+            serial: None,
+            issuer: None,
+            certificate: Some(certificate.clone()),
+        }));
+        info.meta_info = Some(Box::new(MsgMetaInfo {
+            target_id: Some(target_id.into()),
+            ..Default::default()
+        }));
+        info.device_sent_meta = Some(Box::new(DeviceSentMeta {
+            destination_jid: destination.to_owned(),
+            phash: String::new(),
+        }));
+
+        let expected = baseline
+            + category.len()
+            + edit.len()
+            + size_of::<VerifiedName>()
+            + business.len()
+            + certificate.capacity()
+            + size_of::<MsgMetaInfo>()
+            + target_id.len()
+            + size_of::<DeviceSentMeta>()
+            + destination.len();
+        assert_eq!(info.heap_bytes(), expected);
+    }
+
     #[test]
     fn message_info_serde_omits_only_absent_optional_fields() {
         let mut info = MessageInfo::default();
         info.source.sender_alt = Some("15550000001@lid".parse().unwrap());
-        info.meta_info.target_id = Some("TARGET".to_owned());
+        info.meta_info = Some(Box::new(MsgMetaInfo {
+            target_id: Some("TARGET".into()),
+            ..Default::default()
+        }));
         info.unavailable_request_id = Some("REQUEST".to_owned());
 
         let serialized = serde_json::to_value(info).expect("serialize message info");
@@ -412,7 +713,6 @@ mod tests {
         assert!(!root.contains_key("bot_info"));
         assert!(!root.contains_key("verified_name"));
         assert!(!root.contains_key("device_sent_meta"));
-        assert!(!root.contains_key("ephemeral_expiration"));
         assert_eq!(
             root.get("timestamp").and_then(|value| value.as_i64()),
             Some(0)
@@ -727,5 +1027,52 @@ mod tests {
             EditAttribute::infer_from_message(&wrapped_pin),
             Some(EditAttribute::PinInChat)
         );
+    }
+
+    /// The full cross product of envelope type against the hide flag, so a
+    /// change to either leg's list shows up as a diff here rather than as a
+    /// quiet behaviour change. `pay` and `event` are listed explicitly: they
+    /// are the two types that fall outside both legs.
+    #[test]
+    fn coherence_covers_both_legs_of_the_rule() {
+        use crate::types::events::DecryptFailMode::{Hide, Show};
+        use StanzaMessageType as T;
+
+        let cases: &[(T, Option<PollType>, bool, bool)] = &[
+            // (type, polltype, coherent when hidden, coherent when shown)
+            (T::Text, None, false, true),
+            (T::Media, None, false, true),
+            (T::MediaNotify, None, false, true),
+            (T::Pay, None, false, false),
+            (T::Poll, None, false, true),
+            (T::Poll, Some(PollType::Vote), true, true),
+            (T::Poll, Some(PollType::Creation), false, true),
+            (T::Reaction, None, true, false),
+            (T::Reaction, Some(PollType::Vote), true, false),
+            (T::Event, None, false, false),
+            (T::Unknown("archive".to_owned()), None, false, false),
+        ];
+
+        for (stanza_type, poll_type, when_hidden, when_shown) in cases {
+            assert_eq!(
+                envelope_is_coherent(Some(stanza_type), *poll_type, Hide),
+                *when_hidden,
+                "hide leg disagrees for {stanza_type:?} / {poll_type:?}"
+            );
+            assert_eq!(
+                envelope_is_coherent(Some(stanza_type), *poll_type, Show),
+                *when_shown,
+                "show leg disagrees for {stanza_type:?} / {poll_type:?}"
+            );
+        }
+    }
+
+    /// Neither leg's list can hold a type that was never on the wire.
+    #[test]
+    fn an_absent_envelope_type_is_never_coherent() {
+        use crate::types::events::DecryptFailMode::{Hide, Show};
+        assert!(!envelope_is_coherent(None, None, Hide));
+        assert!(!envelope_is_coherent(None, Some(PollType::Vote), Hide));
+        assert!(!envelope_is_coherent(None, None, Show));
     }
 }
